@@ -44,7 +44,11 @@ gaps:
   # Whether to scale the gaps with the DPI of the monitor.
   scale_with_dpi: true
 
-  # Gap between adjacent windows.
+  # Gap between adjacent windows. Supports a single value (e.g. '20px')
+  # or separate horizontal/vertical values:
+  # inner_gap:
+  #   horizontal: '14px'
+  #   vertical: '0px'
   inner_gap: '20px'
 
   # Gap between windows and the screen edge.

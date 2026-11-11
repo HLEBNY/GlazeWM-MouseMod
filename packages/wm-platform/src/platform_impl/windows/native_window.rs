@@ -5,7 +5,7 @@ use tracing::warn;
 use windows::{
   core::PWSTR,
   Win32::{
-    Foundation::{CloseHandle, BOOL, HWND, LPARAM, POINT, RECT},
+    Foundation::{CloseHandle, BOOL, HWND, LPARAM, POINT, RECT, WPARAM},
     Graphics::Dwm::{
       DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR,
       DWMWA_CLOAKED, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS,
@@ -22,20 +22,23 @@ use windows::{
       },
       WindowsAndMessaging::{
         EnumWindows, GetAncestor, GetClassNameW, GetDesktopWindow,
-        GetForegroundWindow, GetLayeredWindowAttributes, GetShellWindow,
-        GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
-        GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-        IsZoomed, SendNotifyMessageW, SetForegroundWindow,
+        GetForegroundWindow, GetGUIThreadInfo, GetLayeredWindowAttributes,
+        GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowPlacement,
+        GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+        IsWindow, IsWindowVisible, IsZoomed, SendMessageTimeoutW,
+        SendNotifyMessageW, SetForegroundWindow,
         SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPlacement,
-        SetWindowPos, ShowWindowAsync, WindowFromPoint, GA_ROOT,
-        GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOP,
-        HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA,
-        LWA_COLORKEY, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS,
-        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE,
-        SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
-        SWP_SHOWWINDOW, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
-        SW_SHOWNA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_STYLE,
-        WM_CLOSE, WPF_ASYNCWINDOWPLACEMENT, WS_DLGFRAME, WS_EX_LAYERED,
+        SetWindowPos, ShowWindowAsync, WindowFromPoint, GA_PARENT, GA_ROOT,
+        GUITHREADINFO, GUI_INMOVESIZE, GWL_EXSTYLE, GWL_STYLE, GW_OWNER,
+        HTCAPTION, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
+        LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LWA_COLORKEY,
+        SET_WINDOW_POS_FLAGS, SMTO_ABORTIFHUNG, SMTO_BLOCK,
+        SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+        SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING,
+        SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_MAXIMIZE,
+        SW_MINIMIZE, SW_RESTORE, SW_SHOWNA, WINDOWPLACEMENT,
+        WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_NCHITTEST,
+        WPF_ASYNCWINDOWPLACEMENT, WS_DLGFRAME, WS_EX_LAYERED,
         WS_THICKFRAME,
       },
     },
@@ -460,6 +463,124 @@ impl NativeWindow {
         Ok(())
       }
     }
+  }
+
+  /// Implements [`NativeWindowWindowsExt::normal_frame_size`].
+  pub(crate) fn normal_frame_size(&self) -> crate::Result<(i32, i32)> {
+    let mut placement = WINDOWPLACEMENT {
+      #[allow(clippy::cast_possible_truncation)]
+      length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+      ..Default::default()
+    };
+
+    unsafe { GetWindowPlacement(self.hwnd(), &raw mut placement) }?;
+
+    Ok((
+      placement.rcNormalPosition.right - placement.rcNormalPosition.left,
+      placement.rcNormalPosition.bottom - placement.rcNormalPosition.top,
+    ))
+  }
+
+  /// Implements [`NativeWindowWindowsExt::move_without_resize`].
+  pub(crate) fn move_without_resize(
+    &self,
+    x: i32,
+    y: i32,
+  ) -> crate::Result<()> {
+    unsafe {
+      SetWindowPos(
+        self.hwnd(),
+        HWND_TOP,
+        x,
+        y,
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+      )
+    }?;
+
+    Ok(())
+  }
+
+  /// Implements [`NativeWindowWindowsExt::is_caption_at_point`].
+  pub(crate) fn is_caption_at_point(&self, point: &Point) -> bool {
+    const HTCAPTION_HIT: usize = HTCAPTION as usize;
+    #[allow(clippy::cast_sign_loss)]
+    const HTTRANSPARENT_HIT: usize = HTTRANSPARENT as isize as usize;
+    const MAX_ANCESTOR_STEPS: usize = 16;
+
+    let pt = POINT {
+      x: point.x,
+      y: point.y,
+    };
+    let target_hwnd = unsafe { WindowFromPoint(pt) };
+    if target_hwnd.0 == 0 {
+      return false;
+    }
+
+    let root_hwnd = unsafe { GetAncestor(target_hwnd, GA_ROOT) };
+    if root_hwnd != self.hwnd() {
+      return false;
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let packed_point = (i32::from(point.y as i16) << 16)
+      | (i32::from(point.x as i16) & 0xFFFF);
+    let lparam = LPARAM(packed_point as isize);
+
+    let mut current = target_hwnd;
+    for _ in 0..MAX_ANCESTOR_STEPS {
+      let mut hit: usize = 0;
+      let res = unsafe {
+        SendMessageTimeoutW(
+          current,
+          WM_NCHITTEST,
+          WPARAM(0),
+          lparam,
+          SMTO_ABORTIFHUNG | SMTO_BLOCK,
+          30,
+          Some(&raw mut hit),
+        )
+      };
+
+      if res.0 == 0 {
+        return false;
+      }
+
+      if hit == HTCAPTION_HIT {
+        return true;
+      }
+
+      if hit != HTTRANSPARENT_HIT || current == root_hwnd {
+        return false;
+      }
+
+      let parent = unsafe { GetAncestor(current, GA_PARENT) };
+      if parent.0 == 0 || parent == current {
+        return false;
+      }
+      current = parent;
+    }
+
+    false
+  }
+
+  /// Implements [`NativeWindowWindowsExt::is_in_native_movesize`].
+  pub(crate) fn is_in_native_movesize(&self) -> bool {
+    let thread_id =
+      unsafe { GetWindowThreadProcessId(self.hwnd(), None) };
+    if thread_id == 0 {
+      return false;
+    }
+
+    let mut info = GUITHREADINFO {
+      #[allow(clippy::cast_possible_truncation)]
+      cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+      ..Default::default()
+    };
+
+    unsafe { GetGUIThreadInfo(thread_id, &raw mut info) }.is_ok()
+      && info.flags.contains(GUI_INMOVESIZE)
   }
 
   /// Implements [`NativeWindowWindowsExt::set_cloaked`].

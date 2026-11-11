@@ -153,14 +153,8 @@ async fn start_wm(
   // Start listening for platform events after populating initial state.
   let mut window_listener = WindowListener::new(dispatcher)?;
   let mut display_listener = DisplayListener::new(dispatcher)?;
-  let mut mouse_listener = MouseListener::new(
-    if config.value.general.focus_follows_cursor {
-      &[MouseEventKind::Move, MouseEventKind::LeftButtonUp]
-    } else {
-      &[MouseEventKind::LeftButtonUp]
-    },
-    dispatcher,
-  )?;
+  let mut mouse_listener =
+    MouseListener::new(enabled_mouse_events(&config), dispatcher)?;
   let mut keybinding_listener = KeybindingListener::new(
     &config
       .active_keybinding_configs(&[], false)
@@ -262,13 +256,8 @@ async fn start_wm(
               .collect::<Vec<_>>(),
           );
 
-          mouse_listener.set_enabled_events(
-            if config.value.general.focus_follows_cursor {
-              &[MouseEventKind::Move, MouseEventKind::LeftButtonUp]
-            } else {
-              &[MouseEventKind::LeftButtonUp]
-            },
-          )?;
+          mouse_listener
+            .set_enabled_events(enabled_mouse_events(&config))?;
         }
 
         if let Err(err) = ipc_server.process_event(wm_event) {
@@ -381,5 +370,33 @@ fn update_path_env() {
     tracing::warn!(
       "Failed to query login shell for PATH. Keeping existing PATH."
     );
+  }
+}
+
+fn enabled_mouse_events(config: &UserConfig) -> &'static [MouseEventKind] {
+  #[cfg(target_os = "windows")]
+  {
+    if config.value.general.focus_follows_cursor {
+      &[
+        MouseEventKind::Move,
+        MouseEventKind::DragMove,
+        MouseEventKind::LeftButtonDown,
+        MouseEventKind::LeftButtonUp,
+      ]
+    } else {
+      &[
+        MouseEventKind::DragMove,
+        MouseEventKind::LeftButtonDown,
+        MouseEventKind::LeftButtonUp,
+      ]
+    }
+  }
+  #[cfg(not(target_os = "windows"))]
+  {
+    if config.value.general.focus_follows_cursor {
+      &[MouseEventKind::Move, MouseEventKind::LeftButtonUp]
+    } else {
+      &[MouseEventKind::LeftButtonUp]
+    }
   }
 }

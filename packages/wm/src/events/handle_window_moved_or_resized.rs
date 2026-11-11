@@ -16,9 +16,12 @@ use crate::{
   },
   events::handle_window_moved_or_resized_end,
   models::{Monitor, NonTilingWindow, WindowContainer},
-  traits::{CommonGetters, WindowGetters},
+  traits::{
+    CommonGetters, PositionGetters, TilingSizeGetters, WindowGetters,
+    MIN_TILING_SIZE,
+  },
   user_config::UserConfig,
-  wm_state::WmState,
+  wm_state::{LiveResizeState, WmState},
 };
 
 #[allow(clippy::too_many_lines)]
@@ -65,6 +68,21 @@ pub fn handle_window_moved_or_resized(
           !state.dispatcher.is_mouse_down(&MouseButton::Left)
         }
       };
+
+      #[cfg(target_os = "windows")]
+      {
+        let is_maximized = try_warn!(window.native().is_maximized());
+        window.update_native_properties(|properties| {
+          properties.is_maximized = is_maximized;
+        });
+
+        if !is_maximized {
+          let shadow_borders = try_warn!(window.native().shadow_borders());
+          window.update_native_properties(|properties| {
+            properties.shadow_borders = shadow_borders;
+          });
+        }
+      }
 
       if is_drag_end {
         return handle_window_moved_or_resized_end(&window, state, config);
@@ -507,7 +525,131 @@ fn update_drag_state(
         }
       }
     }
+  } else if !is_move {
+    update_live_resize(
+      window,
+      frame_position,
+      &active_drag.initial_position,
+      state,
+    )?;
   }
+
+  Ok(())
+}
+
+/// Applies real-time proportional resize updates to adjacent tiling
+/// containers and queues neighboring windows for immediate redraw while
+/// leaving the actively dragged window untouched.
+pub fn update_live_resize(
+  window: &WindowContainer,
+  frame_position: &Rect,
+  initial_position: &Rect,
+  state: &mut WmState,
+) -> anyhow::Result<()> {
+  let Ok(tiling_window) = window.as_tiling_window() else {
+    return Ok(());
+  };
+
+  let live_state = match &mut state.live_resize_state {
+    Some(existing) if existing.window_id == tiling_window.id() => {
+      if !existing.dragged_left && !existing.dragged_right {
+        existing.dragged_left =
+          frame_position.left != initial_position.left;
+        existing.dragged_right =
+          frame_position.right != initial_position.right;
+      }
+      if !existing.dragged_top && !existing.dragged_bottom {
+        existing.dragged_top =
+          frame_position.top != initial_position.top;
+        existing.dragged_bottom =
+          frame_position.bottom != initial_position.bottom;
+      }
+      existing
+    }
+    slot => {
+      *slot = Some(LiveResizeState {
+        window_id: tiling_window.id(),
+        dragged_left: frame_position.left != initial_position.left,
+        dragged_right: frame_position.right != initial_position.right,
+        dragged_top: frame_position.top != initial_position.top,
+        dragged_bottom: frame_position.bottom != initial_position.bottom,
+      });
+      slot.as_mut().context("Missing live resize state.")?
+    }
+  };
+
+  let edges = [
+    (true, true, live_state.dragged_left && !live_state.dragged_right),
+    (true, false, live_state.dragged_right && !live_state.dragged_left),
+    (false, true, live_state.dragged_top && !live_state.dragged_bottom),
+    (false, false, live_state.dragged_bottom && !live_state.dragged_top),
+  ];
+
+  let visual_frame =
+    frame_position.apply_delta(&window.border_delta().inverse(), None);
+
+  for (is_horizontal, is_prev_edge, is_active) in edges {
+    if !is_active {
+      continue;
+    }
+
+    let Some((container, neighbor, parent)) = tiling_window
+      .resizable_container_and_neighbor(is_horizontal, is_prev_edge)?
+    else {
+      continue;
+    };
+
+    let curr_rect = container.to_rect()?;
+    let delta_px = match (is_horizontal, is_prev_edge) {
+      (true, true) => curr_rect.left - visual_frame.left,
+      (true, false) => visual_frame.right - curr_rect.right,
+      (false, true) => curr_rect.top - visual_frame.top,
+      (false, false) => visual_frame.bottom - curr_rect.bottom,
+    };
+
+    if delta_px == 0 {
+      continue;
+    }
+
+    let (h_gap, v_gap) = container.inner_gaps()?;
+    let parent_rect = parent.to_rect()?;
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    let sibling_count = container.tiling_siblings().count() as i32;
+    let available_px = if is_horizontal {
+      parent_rect.width() - h_gap * sibling_count
+    } else {
+      parent_rect.height() - v_gap * sibling_count
+    };
+
+    if available_px <= 0 {
+      continue;
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    let delta_size = delta_px as f32 / available_px as f32;
+    let total_pair = container.tiling_size() + neighbor.tiling_size();
+    if total_pair <= MIN_TILING_SIZE * 2.0 {
+      continue;
+    }
+
+    let new_size = (container.tiling_size() + delta_size)
+      .clamp(MIN_TILING_SIZE, total_pair - MIN_TILING_SIZE);
+    let new_neighbor_size = total_pair - new_size;
+
+    if (new_size - container.tiling_size()).abs() > 0.0005 {
+      container.set_tiling_size(new_size);
+      neighbor.set_tiling_size(new_neighbor_size);
+
+      let dragged_id = tiling_window.id();
+      state.pending_sync.queue_containers_to_redraw(
+        parent
+          .descendants()
+          .filter(|c| c.is_tiling_window() && c.id() != dragged_id),
+      );
+    }
+  }
+
+  state.pending_sync.dequeue_container_from_redraw(window.clone());
 
   Ok(())
 }

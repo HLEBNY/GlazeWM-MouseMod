@@ -34,14 +34,50 @@ pub struct BindingModeConfig {
   pub keybindings: Vec<KeybindingConfig>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum InnerGapConfig {
+  Uniform(LengthValue),
+  Axes {
+    #[serde(default = "default_zero_length")]
+    horizontal: LengthValue,
+    #[serde(default = "default_zero_length")]
+    vertical: LengthValue,
+  },
+}
+
+impl InnerGapConfig {
+  #[must_use]
+  pub fn as_axes(&self) -> (&LengthValue, &LengthValue) {
+    match self {
+      Self::Uniform(value) => (value, value),
+      Self::Axes {
+        horizontal,
+        vertical,
+      } => (horizontal, vertical),
+    }
+  }
+}
+
+impl Default for InnerGapConfig {
+  fn default() -> Self {
+    Self::Uniform(LengthValue::from_px(0))
+  }
+}
+
+fn default_zero_length() -> LengthValue {
+  LengthValue::from_px(0)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, rename_all(serialize = "camelCase"))]
 pub struct GapsConfig {
   /// Whether to scale the gaps with the DPI of the monitor.
   pub scale_with_dpi: bool,
 
-  /// Gap between adjacent windows.
-  pub inner_gap: LengthValue,
+  /// Gap between adjacent windows. Can be either a single length value
+  /// (e.g. `'20px'`) or separate `horizontal` and `vertical` values.
+  pub inner_gap: InnerGapConfig,
 
   /// Gap between windows and the screen edge.
   pub outer_gap: RectDelta,
@@ -55,7 +91,7 @@ impl Default for GapsConfig {
   fn default() -> Self {
     GapsConfig {
       scale_with_dpi: true,
-      inner_gap: LengthValue::from_px(0),
+      inner_gap: InnerGapConfig::default(),
       outer_gap: RectDelta::new(
         LengthValue::from_px(0),
         LengthValue::from_px(0),

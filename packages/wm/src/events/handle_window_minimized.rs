@@ -41,6 +41,7 @@ pub fn handle_window_minimized(
       // TODO: Investigate other code paths where the drag state should be
       // cleared (e.g. most commands that call `update_window_state`).
       window.set_active_drag(None);
+      state.clear_window_drag_state(window.id());
 
       // Focus should be reassigned after a window has been minimized.
       if let Some(focus_target) = state.focus_target_after_removal(&window)

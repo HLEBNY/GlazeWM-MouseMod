@@ -14,7 +14,7 @@ use crate::{platform_impl, Rect};
 #[cfg(target_os = "macos")]
 use crate::{platform_impl::AXUIElementExt, ThreadBound};
 #[cfg(target_os = "windows")]
-use crate::{Color, CornerStyle, Delta, OpacityValue, RectDelta};
+use crate::{Color, CornerStyle, Delta, OpacityValue, Point, RectDelta};
 
 /// Unique identifier of a window.
 ///
@@ -323,6 +323,37 @@ pub trait NativeWindowWindowsExt {
     &self,
     opacity_delta: &Delta<OpacityValue>,
   ) -> crate::Result<()>;
+
+  /// Gets the normal (unmaximized/unminimized) size of the window via
+  /// `GetWindowPlacement`.
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on Windows.
+  fn normal_frame_size(&self) -> crate::Result<(i32, i32)>;
+
+  /// Repositions the window without changing its size or z-order.
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on Windows.
+  fn move_without_resize(&self, x: i32, y: i32) -> crate::Result<()>;
+
+  /// Returns whether `point` lies on the draggable caption (`HTCAPTION`)
+  /// area of this window.
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on Windows.
+  fn is_caption_at_point(&self, point: &Point) -> bool;
+
+  /// Returns whether the window's thread is currently in a native `Win32`
+  /// move/size modal loop (`GUI_INMOVESIZE`).
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on Windows.
+  fn is_in_native_movesize(&self) -> bool;
 }
 
 #[cfg(target_os = "windows")]
@@ -427,6 +458,22 @@ impl NativeWindowWindowsExt for NativeWindow {
     opacity_delta: &Delta<OpacityValue>,
   ) -> crate::Result<()> {
     self.inner.adjust_transparency(opacity_delta)
+  }
+
+  fn normal_frame_size(&self) -> crate::Result<(i32, i32)> {
+    self.inner.normal_frame_size()
+  }
+
+  fn move_without_resize(&self, x: i32, y: i32) -> crate::Result<()> {
+    self.inner.move_without_resize(x, y)
+  }
+
+  fn is_caption_at_point(&self, point: &Point) -> bool {
+    self.inner.is_caption_at_point(point)
+  }
+
+  fn is_in_native_movesize(&self) -> bool {
+    self.inner.is_in_native_movesize()
   }
 }
 

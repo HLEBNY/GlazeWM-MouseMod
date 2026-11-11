@@ -74,12 +74,12 @@ fn set_tiling_window_length(
       container_to_resize.inner_gaps()?;
 
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    let sibling_count =
+      container_to_resize.tiling_siblings().count() as i32;
     let parent_length = if is_width_resize {
-      parent.to_rect()?.width()
-        - horizontal_gap * window.tiling_siblings().count() as i32
+      parent.to_rect()?.width() - horizontal_gap * sibling_count
     } else {
-      parent.to_rect()?.height()
-        - vertical_gap * window.tiling_siblings().count() as i32
+      parent.to_rect()?.height() - vertical_gap * sibling_count
     };
 
     // Convert the target length to a tiling size.

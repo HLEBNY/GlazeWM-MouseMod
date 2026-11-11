@@ -206,6 +206,10 @@ impl MouseListener {
           mask |= 1u64 << u64::from(CGEventType::LeftMouseDragged.0);
           mask |= 1u64 << u64::from(CGEventType::RightMouseDragged.0);
         }
+        MouseEventKind::DragMove => {
+          mask |= 1u64 << u64::from(CGEventType::LeftMouseDragged.0);
+          mask |= 1u64 << u64::from(CGEventType::RightMouseDragged.0);
+        }
         MouseEventKind::LeftButtonDown => {
           mask |= 1u64 << u64::from(CGEventType::LeftMouseDown.0);
         }
@@ -317,11 +321,13 @@ impl MouseListener {
         button: MouseButton::Right,
         pressed_buttons: data.pressed_buttons,
       },
-      MouseEventKind::Move => MouseEvent::Move {
-        position,
-        pressed_buttons: data.pressed_buttons,
-        window_below_cursor,
-      },
+      MouseEventKind::Move | MouseEventKind::DragMove => {
+        MouseEvent::Move {
+          position,
+          pressed_buttons: data.pressed_buttons,
+          window_below_cursor,
+        }
+      }
     };
 
     if should_emit {

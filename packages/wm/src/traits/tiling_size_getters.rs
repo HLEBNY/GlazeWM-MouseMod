@@ -31,13 +31,11 @@ pub trait TilingSizeGetters: CommonGetters {
       1.
     };
 
+    let (horizontal_gap, vertical_gap) = gaps_config.inner_gap.as_axes();
+
     Ok((
-      gaps_config
-        .inner_gap
-        .to_px(monitor_rect.height(), Some(scale_factor)),
-      gaps_config
-        .inner_gap
-        .to_px(monitor_rect.width(), Some(scale_factor)),
+      horizontal_gap.to_px(monitor_rect.width(), Some(scale_factor)),
+      vertical_gap.to_px(monitor_rect.height(), Some(scale_factor)),
     ))
   }
 
@@ -79,6 +77,54 @@ pub trait TilingSizeGetters: CommonGetters {
     };
 
     Ok(container_to_resize)
+  }
+
+  /// Walks ancestors to find the deepest container, its adjacent tiling
+  /// neighbor, and their shared direction parent along the dragged axis
+  /// and edge side (`is_prev_edge` = left/top edge; `false` =
+  /// right/bottom).
+  fn resizable_container_and_neighbor(
+    &self,
+    is_horizontal: bool,
+    is_prev_edge: bool,
+  ) -> anyhow::Result<
+    Option<(TilingContainer, TilingContainer, DirectionContainer)>,
+  > {
+    let target_direction = if is_horizontal {
+      TilingDirection::Horizontal
+    } else {
+      TilingDirection::Vertical
+    };
+
+    for ancestor in self.self_and_ancestors() {
+      let Ok(tiling_container) = ancestor.as_tiling_container() else {
+        continue;
+      };
+
+      let Some(parent) = tiling_container.direction_container() else {
+        break;
+      };
+
+      if parent.tiling_direction() != target_direction {
+        continue;
+      }
+
+      let neighbor = if is_prev_edge {
+        tiling_container
+          .prev_siblings()
+          .find_map(|s| s.as_tiling_container().ok())
+      } else {
+        tiling_container
+          .next_siblings()
+          .find_map(|s| s.as_tiling_container().ok())
+      };
+
+      if let Some(neighbor) = neighbor {
+        return Ok(Some((tiling_container, neighbor, parent)));
+      }
+    }
+
+    Ok(None)
   }
 }
 

@@ -394,7 +394,8 @@ fn reposition_window(
     {
       use wm_platform::{
         SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-        SWP_NOCOPYBITS, SWP_NOSENDCHANGING, WS_MAXIMIZEBOX,
+        SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSENDCHANGING, SWP_NOSIZE,
+        WS_MAXIMIZEBOX,
       };
 
       // Restore window if it's minimized/maximized and shouldn't be. This
@@ -436,11 +437,28 @@ fn reposition_window(
           if fullscreen.maximized
             && window.native().has_window_style(WS_MAXIMIZEBOX) =>
         {
-          if !window.native().is_maximized()? {
+          let is_same_monitor =
+            window.monitor().is_some_and(|monitor| {
+              monitor.to_rect().is_ok_and(|monitor_rect| {
+                monitor_rect.contains_point(
+                  &window.native_properties().frame.center_point(),
+                )
+              })
+            });
+
+          if window.native().is_maximized()? {
+            if is_same_monitor {
+              swp_flags |= SWP_NOMOVE | SWP_NOSIZE;
+              window.native().set_window_pos(z_order, &rect, swp_flags)?;
+            } else {
+              window.native().restore(Some(&rect))?;
+              window.native().set_window_pos(z_order, &rect, swp_flags)?;
+              window.native().maximize()?;
+            }
+          } else {
+            window.native().set_window_pos(z_order, &rect, swp_flags)?;
             window.native().maximize()?;
           }
-
-          window.native().set_window_pos(z_order, &rect, swp_flags)?;
         }
         _ => {
           swp_flags |= SWP_FRAMECHANGED;

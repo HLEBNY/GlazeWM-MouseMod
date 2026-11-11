@@ -1,6 +1,7 @@
 use anyhow::Context;
 use wm_common::{
-  try_warn, FullscreenStateConfig, TilingDirection, WindowState,
+  try_warn, ActiveDragOperation, FullscreenStateConfig, TilingDirection,
+  WindowState,
 };
 use wm_platform::{LengthValue, Point, Rect};
 
@@ -9,7 +10,7 @@ use crate::{
     container::{move_container_within_tree, wrap_in_split_container},
     window::{set_window_size, update_window_state},
   },
-  events::update_floating_window_position,
+  events::{update_floating_window_position, update_live_resize},
   models::{
     DirectionContainer, NonTilingWindow, SplitContainer, TilingContainer,
     WindowContainer,
@@ -120,15 +121,35 @@ pub fn handle_window_moved_or_resized_end(
       );
 
       let frame = window.native_properties().frame;
+      let is_live_resize = active_drag.operation
+        == Some(ActiveDragOperation::Resize)
+        && state
+          .live_resize_state
+          .as_ref()
+          .is_some_and(|resize| resize.window_id == window.id());
 
-      // Update the window's size based on the new frame position. This
-      // means we use the actual window dimensions as the source of truth.
-      set_window_size(
-        window.clone().into(),
-        Some(LengthValue::from_px(frame.width())),
-        Some(LengthValue::from_px(frame.height())),
-        state,
-      )?;
+      if is_live_resize {
+        let container: WindowContainer = window.clone().into();
+        update_live_resize(
+          &container,
+          &frame,
+          &active_drag.initial_position,
+          state,
+        )?;
+        state.clear_window_drag_state(window.id());
+      } else {
+        state.clear_window_drag_state(window.id());
+
+        // Update the window's size based on the new frame position. This
+        // means we use the actual window dimensions as the source of
+        // truth.
+        set_window_size(
+          window.clone().into(),
+          Some(LengthValue::from_px(frame.width())),
+          Some(LengthValue::from_px(frame.height())),
+          state,
+        )?;
+      }
 
       window.set_active_drag(None);
 

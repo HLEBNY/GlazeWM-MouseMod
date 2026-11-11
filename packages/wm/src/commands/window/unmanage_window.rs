@@ -19,6 +19,8 @@ pub fn unmanage_window(
   // Create iterator of parent, grandparent, and great-grandparent.
   let ancestors = window.ancestors().take(3).collect::<Vec<_>>();
 
+  state.clear_window_drag_state(window.id());
+
   // Get container to switch focus to after the window has been removed.
   let focus_target = state.focus_target_after_removal(&window.clone());
 

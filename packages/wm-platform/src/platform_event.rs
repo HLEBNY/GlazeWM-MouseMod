@@ -156,7 +156,7 @@ impl PressedButtons {
       MouseEventKind::LeftButtonUp => self.left = false,
       MouseEventKind::RightButtonDown => self.right = true,
       MouseEventKind::RightButtonUp => self.right = false,
-      MouseEventKind::Move => {}
+      MouseEventKind::Move | MouseEventKind::DragMove => {}
     }
   }
 }

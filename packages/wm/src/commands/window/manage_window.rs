@@ -1,7 +1,13 @@
 use anyhow::Context;
 use tracing::info;
-use wm_common::{try_warn, WindowRuleEvent, WindowState, WmEvent};
+use wm_common::{
+  try_warn, FullscreenStateConfig, InitialWindowState, WindowRuleEvent,
+  WindowState, WmEvent,
+};
+#[cfg(not(target_os = "windows"))]
 use wm_platform::{NativeWindow, RectDelta};
+#[cfg(target_os = "windows")]
+use wm_platform::{NativeWindow, NativeWindowWindowsExt, Rect, RectDelta};
 
 use crate::{
   commands::{
@@ -187,16 +193,46 @@ fn create_window(
     .centered;
 
   // Calculate where window should be placed when floating is enabled. Use
-  // the original width/height of the window and optionally position it in
-  // the center of the workspace.
+  // the original width/height of the window (or its normal placement size
+  // when already maximized on Windows) and optionally center it.
   let is_same_workspace = nearest_workspace.id() == target_workspace.id();
   let floating_placement = {
+    let base_frame = {
+      #[cfg(target_os = "windows")]
+      if native_properties.is_maximized {
+        if let Ok((norm_w, norm_h)) = native_window.normal_frame_size() {
+          let sb = &native_properties.shadow_borders;
+          let w =
+            norm_w - sb.left.to_px(0, None) - sb.right.to_px(0, None);
+          let h =
+            norm_h - sb.top.to_px(0, None) - sb.bottom.to_px(0, None);
+          if w >= 250 && h >= 140 {
+            Rect::from_xy(
+              native_properties.frame.left,
+              native_properties.frame.top,
+              w,
+              h,
+            )
+            .translate_to_center(&target_workspace.to_rect()?)
+          } else {
+            native_properties.frame.clone()
+          }
+        } else {
+          native_properties.frame.clone()
+        }
+      } else {
+        native_properties.frame.clone()
+      }
+      #[cfg(not(target_os = "windows"))]
+      {
+        native_properties.frame.clone()
+      }
+    };
+
     let placement = if !is_same_workspace || prefers_centered {
-      native_properties
-        .frame
-        .translate_to_center(&target_workspace.to_rect()?)
+      base_frame.translate_to_center(&target_workspace.to_rect()?)
     } else {
-      native_properties.frame.clone()
+      base_frame
     };
 
     // Clamp the window size to be within the workspace's outer gaps. 10px
@@ -269,6 +305,16 @@ fn window_state_to_create(
 ) -> anyhow::Result<WindowState> {
   if native_properties.is_minimized {
     return Ok(WindowState::Minimized);
+  }
+
+  if native_properties.is_maximized
+    && config.value.window_behavior.initial_state
+      == InitialWindowState::Floating
+  {
+    return Ok(WindowState::Fullscreen(FullscreenStateConfig {
+      maximized: true,
+      ..config.value.window_behavior.state_defaults.fullscreen
+    }));
   }
 
   let nearest_workspace = nearest_monitor

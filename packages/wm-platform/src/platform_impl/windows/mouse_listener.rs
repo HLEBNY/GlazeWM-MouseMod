@@ -75,6 +75,14 @@ impl MouseListener {
 
   /// Implements [`MouseListener::enable`].
   pub(crate) fn enable(&mut self, enabled: bool) -> crate::Result<()> {
+    if !enabled {
+      let mut callback_data = self
+        .callback_data
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+      callback_data.pressed = PressedButtons::default();
+    }
+
     if self.callback_id.is_some() {
       let handle = self.dispatcher.message_window_handle();
       self.dispatcher.dispatch_sync(move || {
@@ -213,18 +221,37 @@ impl MouseListener {
       }
     };
 
-    if !enabled_events.contains(&event_kind) {
+    callback_data.pressed.update(event_kind);
+
+    let is_dragging = callback_data.pressed.contains(&MouseButton::Left)
+      || callback_data.pressed.contains(&MouseButton::Right);
+
+    let is_event_enabled = match event_kind {
+      MouseEventKind::Move => {
+        enabled_events.contains(&MouseEventKind::Move)
+          || (is_dragging
+            && enabled_events.contains(&MouseEventKind::DragMove))
+      }
+      _ => enabled_events.contains(&event_kind),
+    };
+
+    if !is_event_enabled {
       return Ok(());
     }
 
-    // Throttle mouse move events so that there's a minimum of 50ms between
-    // each emission. State change events (button down/up) always get
-    // emitted.
+    // Throttle passive mouse move events to 50ms, while drag moves run
+    // at 8ms (~120 Hz) for smooth window tracking. State change events
+    // (button down/up) always get emitted.
     let should_emit = match event_kind {
       MouseEventKind::Move => {
-        callback_data.last_move_emission.is_none_or(|timestamp| {
-          timestamp.elapsed() >= Duration::from_millis(50)
-        })
+        let interval = if is_dragging {
+          Duration::from_millis(8)
+        } else {
+          Duration::from_millis(50)
+        };
+        callback_data
+          .last_move_emission
+          .is_none_or(|timestamp| timestamp.elapsed() >= interval)
       }
       _ => true,
     };
@@ -232,8 +259,6 @@ impl MouseListener {
     if !should_emit {
       return Ok(());
     }
-
-    callback_data.pressed.update(event_kind);
 
     let mouse_event = match event_kind {
       MouseEventKind::LeftButtonDown => MouseEvent::ButtonDown {
@@ -256,11 +281,13 @@ impl MouseListener {
         button: MouseButton::Right,
         pressed_buttons: callback_data.pressed,
       },
-      MouseEventKind::Move => MouseEvent::Move {
-        position: Self::cursor_pos()?,
-        pressed_buttons: callback_data.pressed,
-        window_below_cursor: None,
-      },
+      MouseEventKind::Move | MouseEventKind::DragMove => {
+        MouseEvent::Move {
+          position: Self::cursor_pos()?,
+          pressed_buttons: callback_data.pressed,
+          window_below_cursor: None,
+        }
+      }
     };
 
     let _ = callback_data.event_tx.send(mouse_event);

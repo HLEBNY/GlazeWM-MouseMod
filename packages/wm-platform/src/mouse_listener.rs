@@ -6,6 +6,7 @@ use crate::{platform_event::MouseEvent, platform_impl, Dispatcher};
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MouseEventKind {
   Move,
+  DragMove,
   LeftButtonDown,
   LeftButtonUp,
   RightButtonDown,

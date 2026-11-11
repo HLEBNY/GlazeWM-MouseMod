@@ -27,6 +27,32 @@ use crate::{
   user_config::UserConfig,
 };
 
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug)]
+pub struct PendingMaximizeDrag {
+  pub window_id: Uuid,
+  pub start_cursor: Point,
+  pub max_frame: Rect,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug)]
+pub struct ManualWindowDrag {
+  pub window_id: Uuid,
+  pub cursor_offset_x: i32,
+  pub cursor_offset_y: i32,
+}
+
+#[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct LiveResizeState {
+  pub window_id: Uuid,
+  pub dragged_left: bool,
+  pub dragged_right: bool,
+  pub dragged_top: bool,
+  pub dragged_bottom: bool,
+}
+
 pub struct WmState {
   /// Root node of the container tree. Monitors are the children of the
   /// root node, followed by workspaces, then split containers/windows.
@@ -67,6 +93,19 @@ pub struct WmState {
   /// Whether the OS focused window is the same as the WM focused window.
   pub is_focus_synced: bool,
 
+  /// Candidate titlebar press on a maximized window awaiting drag
+  /// threshold.
+  #[cfg(target_os = "windows")]
+  pub pending_maximize_drag: Option<PendingMaximizeDrag>,
+
+  /// Active manual window drag started by dragging a maximized window's
+  /// titlebar when native Windows Snap is disabled.
+  #[cfg(target_os = "windows")]
+  pub active_manual_drag: Option<ManualWindowDrag>,
+
+  /// Active live tiling resize state tracking latched drag edges.
+  pub live_resize_state: Option<LiveResizeState>,
+
   /// Whether the initial state has been populated.
   has_initialized: bool,
 
@@ -94,9 +133,45 @@ impl WmState {
       ignored_windows: Vec::new(),
       is_paused: false,
       is_focus_synced: false,
+      #[cfg(target_os = "windows")]
+      pending_maximize_drag: None,
+      #[cfg(target_os = "windows")]
+      active_manual_drag: None,
+      live_resize_state: None,
       has_initialized: false,
       event_tx,
       exit_tx,
+    }
+  }
+
+  /// Clears any pending or active drag tracking state associated with
+  /// `window_id`.
+  pub fn clear_window_drag_state(&mut self, window_id: Uuid) {
+    #[cfg(target_os = "windows")]
+    {
+      if self
+        .pending_maximize_drag
+        .as_ref()
+        .is_some_and(|drag| drag.window_id == window_id)
+      {
+        self.pending_maximize_drag = None;
+      }
+
+      if self
+        .active_manual_drag
+        .as_ref()
+        .is_some_and(|drag| drag.window_id == window_id)
+      {
+        self.active_manual_drag = None;
+      }
+    }
+
+    if self
+      .live_resize_state
+      .as_ref()
+      .is_some_and(|resize| resize.window_id == window_id)
+    {
+      self.live_resize_state = None;
     }
   }
 
