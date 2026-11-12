@@ -2,11 +2,16 @@ use anyhow::Context;
 use tracing::{info, warn};
 use wm_common::WindowState;
 
+use super::{
+  clear_workspace_voids, first_void_slot, normalize_workspace_voids,
+  replace_tiling_slot, vacate_tiling_slot,
+};
 use crate::{
   commands::container::{
-    move_container_within_tree, replace_container, resize_tiling_container,
+    attach_container, detach_container, move_container_within_tree,
+    replace_container, resize_tiling_container, set_focused_descendant,
   },
-  models::{Container, InsertionTarget, WindowContainer},
+  models::{Container, InsertionTarget, VoidSlot, WindowContainer},
   traits::{CommonGetters, TilingSizeGetters, WindowGetters},
   user_config::UserConfig,
   wm_state::WmState,
@@ -31,11 +36,12 @@ pub fn update_window_state(
 
   match target_state {
     WindowState::Tiling => set_tiling(&window, state, config),
-    _ => set_non_tiling(window, target_state, state),
+    _ => set_non_tiling(window, target_state, state, config),
   }
 }
 
 /// Updates the state of a window to be `WindowState::Tiling`.
+#[allow(clippy::too_many_lines)]
 fn set_tiling(
   window: &WindowContainer,
   state: &mut WmState,
@@ -48,15 +54,84 @@ fn set_tiling(
 
   let workspace =
     window.workspace().context("Window has no workspace.")?;
+  let was_focused = window.has_focus(None);
 
   // Check whether insertion target is still valid.
   let insertion_target =
     window.insertion_target().filter(|insertion_target| {
-      insertion_target
-        .target_parent
-        .workspace()
-        .is_some_and(|workspace| workspace.is_displayed())
+      !insertion_target.target_parent.is_detached()
+        && insertion_target
+          .target_parent
+          .workspace()
+          .is_some_and(|target_ws| target_ws.id() == workspace.id())
     });
+
+  // Check if the previous slot (or any void in the workspace) is an empty
+  // `VoidSlot` ready to receive this window.
+  let target_void = insertion_target
+    .as_ref()
+    .and_then(|target| {
+      let children = target.target_parent.children();
+      let candidate = children
+        .get(target.target_index)
+        .or_else(|| {
+          target
+            .target_index
+            .checked_sub(1)
+            .and_then(|i| children.get(i))
+        });
+      candidate.and_then(|c| c.as_void().cloned())
+    })
+    .or_else(|| first_void_slot(&workspace));
+
+  let tiling_window = window.to_tiling(config.value.gaps.clone());
+
+  if let Some(void_slot) = target_void {
+    detach_container(window.into())?;
+    replace_tiling_slot(&void_slot.into(), &tiling_window.clone().into())?;
+    normalize_workspace_voids(&workspace)?;
+
+    if was_focused {
+      set_focused_descendant(&tiling_window.clone().into(), None);
+    }
+
+    state
+      .pending_sync
+      .queue_containers_to_redraw(workspace.tiling_children())
+      .queue_workspace_to_reorder(workspace);
+
+    return Ok(tiling_window.into());
+  }
+
+  // Hotkey entry onto an empty workspace defaults to half-screen paired
+  // with a `VoidSlot`.
+  if workspace.tiling_children().next().is_none()
+    && window.active_drag().is_none()
+  {
+    detach_container(window.into())?;
+    let void_slot = VoidSlot::new(config.value.gaps.clone());
+    attach_container(
+      &tiling_window.clone().into(),
+      &workspace.clone().into(),
+      Some(0),
+    )?;
+    attach_container(
+      &void_slot.into(),
+      &workspace.clone().into(),
+      Some(1),
+    )?;
+
+    if was_focused {
+      set_focused_descendant(&tiling_window.clone().into(), None);
+    }
+
+    state
+      .pending_sync
+      .queue_containers_to_redraw(workspace.tiling_children())
+      .queue_workspace_to_reorder(workspace);
+
+    return Ok(tiling_window.into());
+  }
 
   // Get the position in the tree to insert the new tiling window. This
   // will be the window's previous tiling position if it has one, or
@@ -79,8 +154,6 @@ fn set_tiling(
     })
     // Default to inserting at the end of the workspace.
     .unwrap_or((workspace.clone().into(), workspace.child_count()));
-
-  let tiling_window = window.to_tiling(config.value.gaps.clone());
 
   // Replace the original window with the created tiling window.
   replace_container(
@@ -118,10 +191,12 @@ fn set_tiling(
 
 /// Updates the state of a window to be either `WindowState::Floating`,
 /// `WindowState::Fullscreen`, or `WindowState::Minimized`.
+#[allow(clippy::too_many_lines)]
 fn set_non_tiling(
   window: WindowContainer,
   target_state: WindowState,
   state: &mut WmState,
+  config: &UserConfig,
 ) -> anyhow::Result<WindowContainer> {
   // A window can only be updated to a minimized state if it is
   // natively minimized.
@@ -163,33 +238,51 @@ fn set_non_tiling(
     }
     WindowContainer::TilingWindow(window) => {
       let parent = window.parent().context("No parent")?;
+      let was_focused = window.has_focus(None);
+      let is_active_drag = window.active_drag().is_some();
 
       let non_tiling_window = window.to_non_tiling(
         target_state.clone(),
         Some(InsertionTarget {
-          target_parent: parent.clone(),
+          target_parent: parent,
           target_index: window.index(),
           prev_tiling_size: window.tiling_size(),
           prev_sibling_count: window.tiling_siblings().count(),
         }),
       );
 
-      // Non-tiling windows should always be direct children of the
-      // workspace.
-      if parent != workspace.clone().into() {
-        move_container_within_tree(
-          &window.clone().into(),
-          &workspace.clone().into(),
-          workspace.child_count(),
-          state,
-        )?;
+      // Vacate the tiling slot BEFORE attaching `non_tiling_window`
+      // (both share the same container ID).
+      let origin_void_id = vacate_tiling_slot(
+        &window,
+        &workspace,
+        is_active_drag,
+        state,
+        config,
+      )?;
+
+      if is_active_drag {
+        if let Some(mut drag) = non_tiling_window.active_drag() {
+          drag.origin_void_id = origin_void_id;
+          non_tiling_window.set_active_drag(Some(drag));
+        }
       }
 
-      replace_container(
+      // Non-tiling windows should always be direct children of the
+      // workspace.
+      attach_container(
         &non_tiling_window.clone().into(),
         &workspace.clone().into(),
-        window.index(),
+        Some(workspace.child_count()),
       )?;
+
+      if was_focused {
+        set_focused_descendant(&non_tiling_window.clone().into(), None);
+      }
+
+      if workspace.tiling_windows().next().is_none() {
+        clear_workspace_voids(&workspace)?;
+      }
 
       state
         .pending_sync

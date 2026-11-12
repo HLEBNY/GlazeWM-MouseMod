@@ -1,12 +1,17 @@
 use anyhow::Context;
-use wm_common::{TilingDirection, WindowState};
+use wm_common::{TilingDirection, WindowState, WmEvent};
 use wm_platform::{Direction, Rect};
 
+use super::{
+  first_void_slot, normalize_workspace_voids, replace_tiling_slot,
+  swap_tiling_containers, vacate_tiling_slot,
+};
 use crate::{
   commands::container::{
-    flatten_child_split_containers, flatten_split_container,
-    move_container_within_tree, resize_tiling_container,
-    set_focused_descendant, wrap_in_split_container,
+    attach_container, flatten_child_split_containers,
+    flatten_split_container, move_container_within_tree,
+    resize_tiling_container, set_focused_descendant,
+    wrap_in_split_container,
   },
   models::{
     DirectionContainer, Monitor, NonTilingWindow, SplitContainer,
@@ -41,6 +46,7 @@ pub fn move_window_in_direction(
           &non_tiling_window.into(),
           direction,
           state,
+          config,
         ),
         _ => Ok(()),
       }
@@ -94,6 +100,7 @@ fn move_tiling_window(
       &window_to_move.into(),
       direction,
       state,
+      config,
     );
   }
 
@@ -199,17 +206,45 @@ fn move_to_sibling_container(
           .pending_sync
           .queue_container_to_redraw(target_parent)
           .queue_containers_to_redraw(parent.tiling_children());
+      } else if let Some(void_slot) = sibling_split
+        .descendants()
+        .find_map(|c| c.as_void().cloned())
+      {
+        let workspace =
+          window_to_move.workspace().context("No workspace.")?;
+        swap_tiling_containers(
+          &window_to_move.into(),
+          &void_slot.into(),
+        )?;
+        normalize_workspace_voids(&workspace)?;
+        state
+          .pending_sync
+          .queue_containers_to_redraw(parent.tiling_children());
       }
+    }
+    TilingContainer::Void(void_slot) => {
+      let workspace =
+        window_to_move.workspace().context("No workspace.")?;
+      swap_tiling_containers(
+        &window_to_move.into(),
+        &void_slot.into(),
+      )?;
+      normalize_workspace_voids(&workspace)?;
+      state
+        .pending_sync
+        .queue_containers_to_redraw(parent.tiling_children());
     }
   }
 
   Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn move_to_workspace_in_direction(
   window_to_move: &WindowContainer,
   direction: &Direction,
   state: &mut WmState,
+  config: &UserConfig,
 ) -> anyhow::Result<()> {
   let parent = window_to_move.parent().context("No parent.")?;
   let workspace = window_to_move.workspace().context("No workspace.")?;
@@ -220,6 +255,8 @@ fn move_to_workspace_in_direction(
     .and_then(|monitor| monitor.displayed_workspace());
 
   if let Some(target_workspace) = target_workspace {
+    let was_focused = window_to_move.has_focus(None);
+
     // Since the window is crossing monitors, adjustments might need to be
     // made because of DPI.
     if monitor.has_dpi_difference(&target_workspace.clone().into())? {
@@ -245,19 +282,57 @@ fn move_to_workspace_in_direction(
     };
 
     // Focus should be reassigned within the original workspace after the
-    // window is moved out. For example, if the focus order is 1. tiling
-    // window and 2. fullscreen window, then we'd want to retain focus on a
-    // tiling window on move.
-    let focus_target = state.focus_target_after_removal(window_to_move);
+    // window is moved out.
+    let focus_target_id = state
+      .focus_target_after_removal(window_to_move)
+      .map(|target| target.id());
 
-    move_container_within_tree(
-      &window_to_move.clone().into(),
-      &target_workspace.clone().into(),
-      target_index,
-      state,
-    )?;
+    match window_to_move {
+      WindowContainer::TilingWindow(tiling_window) => {
+        let target_void = first_void_slot(&target_workspace);
 
-    if let Some(focus_target) = focus_target {
+        vacate_tiling_slot(
+          tiling_window,
+          &workspace,
+          false,
+          state,
+          config,
+        )?;
+
+        if let Some(void_slot) = target_void {
+          replace_tiling_slot(
+            &void_slot.into(),
+            &tiling_window.clone().into(),
+          )?;
+          normalize_workspace_voids(&target_workspace)?;
+        } else {
+          attach_container(
+            &tiling_window.clone().into(),
+            &target_workspace.clone().into(),
+            Some(target_index),
+          )?;
+        }
+
+        if was_focused {
+          set_focused_descendant(&tiling_window.clone().into(), None);
+          state.emit_event(WmEvent::FocusedContainerMoved {
+            focused_container: tiling_window.to_dto()?,
+          });
+        }
+      }
+      WindowContainer::NonTilingWindow(_) => {
+        move_container_within_tree(
+          &window_to_move.clone().into(),
+          &target_workspace.clone().into(),
+          target_index,
+          state,
+        )?;
+      }
+    }
+
+    if let Some(focus_target) =
+      focus_target_id.and_then(|id| state.container_by_id(id))
+    {
       set_focused_descendant(
         &focus_target,
         Some(&workspace.clone().into()),
@@ -268,7 +343,7 @@ fn move_to_workspace_in_direction(
       .pending_sync
       .queue_container_to_redraw(window_to_move.clone())
       .queue_containers_to_redraw(target_workspace.tiling_children())
-      .queue_containers_to_redraw(parent.tiling_children())
+      .queue_containers_to_redraw(workspace.tiling_children())
       .queue_cursor_jump()
       .queue_workspace_to_reorder(target_workspace);
   }

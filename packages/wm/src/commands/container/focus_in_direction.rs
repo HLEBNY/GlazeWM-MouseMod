@@ -100,28 +100,31 @@ fn tiling_focus_target(
       continue;
     }
 
-    // Get the next/prev tiling sibling depending on the tiling direction.
-    let focus_target = match direction {
-      Direction::Up | Direction::Left => origin_or_ancestor
-        .prev_siblings()
-        .find_map(|c| c.as_tiling_container().ok()),
-      _ => origin_or_ancestor
-        .next_siblings()
-        .find_map(|c| c.as_tiling_container().ok()),
-    };
+    // Get the next/prev focusable tiling sibling depending on direction,
+    // skipping empty void slots.
+    let siblings: Box<dyn Iterator<Item = Container> + '_> =
+      match direction {
+        Direction::Up | Direction::Left => {
+          Box::new(origin_or_ancestor.prev_siblings())
+        }
+        _ => Box::new(origin_or_ancestor.next_siblings()),
+      };
 
-    match focus_target {
-      Some(target) => {
-        // Return once a suitable focus target is found.
-        return Ok(match target {
-          TilingContainer::TilingWindow(_) => Some(target.into()),
-          TilingContainer::Split(split) => split
-            .descendant_in_direction(&direction.inverse())
-            .map(Into::into),
-        });
-      }
-      None => origin_or_ancestor = parent.into(),
+    let focus_target = siblings
+      .filter_map(|c| c.as_tiling_container().ok())
+      .find_map(|target| match target {
+        TilingContainer::TilingWindow(_) => Some(target.into()),
+        TilingContainer::Split(split) => split
+          .descendant_in_direction(&direction.inverse())
+          .map(Into::into),
+        TilingContainer::Void(_) => None,
+      });
+
+    if let Some(target) = focus_target {
+      return Ok(Some(target));
     }
+
+    origin_or_ancestor = parent.into();
   }
 
   Ok(None)

@@ -17,11 +17,12 @@ pub fn flatten_child_split_containers(
   parent: &Container,
 ) -> anyhow::Result<()> {
   if let Ok(parent) = parent.as_direction_container() {
-    // Get children that are either tiling windows or split containers.
+    // Get children that are tiling containers (tiling windows, split
+    // containers, or void slots).
     let tiling_children = parent
       .children()
       .into_iter()
-      .filter(|child| child.is_tiling_window() || child.is_split())
+      .filter(|child| child.as_tiling_container().is_ok())
       .collect::<Vec<_>>();
 
     if tiling_children.len() == 1 {

@@ -50,6 +50,7 @@ use windows::{
 use crate::platform_impl::Application;
 use crate::{
   platform_impl, Display, DisplayDevice, MouseButton, NativeWindow, Point,
+  Rect, WindowId,
 };
 
 /// Type alias for a closure to be executed by the event loop.
@@ -632,6 +633,52 @@ impl Dispatcher {
     }
 
     Ok(())
+  }
+
+  /// Returns `true` if this `Dispatcher` is backed by a live event loop
+  /// (and `false` for `Dispatcher::mock()` in unit tests).
+  #[must_use]
+  pub fn has_event_loop(&self) -> bool {
+    self.source.is_some()
+  }
+
+  /// Shows or updates the Aero snap preview overlay behind the given
+  /// window.
+  pub fn show_snap_overlay(
+    &self,
+    rect: &Rect,
+    behind_window_id: Option<WindowId>,
+  ) {
+    if self.source.is_none() {
+      return;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+      let generation = platform_impl::next_snap_overlay_generation();
+      let rect = rect.clone();
+      let behind_hwnd = behind_window_id.map(|id| id.0);
+      let _ = self.dispatch_async(move || {
+        platform_impl::show_snap_overlay(&rect, behind_hwnd, generation);
+      });
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = (rect, behind_window_id);
+  }
+
+  /// Hides the Aero snap preview overlay.
+  pub fn hide_snap_overlay(&self) {
+    if self.source.is_none() {
+      return;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+      let generation = platform_impl::next_snap_overlay_generation();
+      let _ = self.dispatch_async(move || {
+        platform_impl::hide_snap_overlay(generation);
+      });
+    }
   }
 
   /// Removes focus from the current window and focuses the desktop.

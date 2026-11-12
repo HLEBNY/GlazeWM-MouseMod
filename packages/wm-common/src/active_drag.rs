@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use wm_platform::Rect;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -16,6 +17,10 @@ pub struct ActiveDrag {
   ///
   /// Used to calculate movement distance.
   pub initial_position: Rect,
+
+  /// Optional `VoidSlot` ID created when dragging a tiling window out of
+  /// its slot during this drag.
+  pub origin_void_id: Option<Uuid>,
 }
 
 #[derive(Debug, Copy, Clone, Deserialize, PartialEq, Serialize)]

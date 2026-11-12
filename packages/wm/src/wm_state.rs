@@ -146,6 +146,8 @@ impl WmState {
   /// Clears any pending or active drag tracking state associated with
   /// `window_id`.
   pub fn clear_window_drag_state(&mut self, window_id: Uuid) {
+    let mut cleared_move_drag = false;
+
     #[cfg(target_os = "windows")]
     {
       if self
@@ -162,6 +164,7 @@ impl WmState {
         .is_some_and(|drag| drag.window_id == window_id)
       {
         self.active_manual_drag = None;
+        cleared_move_drag = true;
       }
     }
 
@@ -171,6 +174,17 @@ impl WmState {
       .is_some_and(|resize| resize.window_id == window_id)
     {
       self.live_resize_state = None;
+    }
+
+    if self
+      .window_by_id(window_id)
+      .is_some_and(|window| window.active_drag().is_some())
+    {
+      cleared_move_drag = true;
+    }
+
+    if cleared_move_drag {
+      self.dispatcher.hide_snap_overlay();
     }
   }
 
@@ -752,7 +766,10 @@ impl WmState {
   /// windows in WM state.
   ///
   /// See: <https://github.com/glzr-io/glazewm/issues/1219>
-  pub fn cleanup_invalid_windows(&mut self) -> anyhow::Result<()> {
+  pub fn cleanup_invalid_windows(
+    &mut self,
+    config: &UserConfig,
+  ) -> anyhow::Result<()> {
     let invalid_windows = self
       .windows()
       .into_iter()
@@ -760,7 +777,7 @@ impl WmState {
 
     for window in invalid_windows {
       tracing::info!("Removing invalid window: {}", window);
-      unmanage_window(window, self)?;
+      unmanage_window(window, self, config)?;
     }
 
     // Prune ignored windows that are no longer valid.
@@ -772,6 +789,11 @@ impl WmState {
 
 impl Drop for WmState {
   fn drop(&mut self) {
+    self.dispatcher.hide_snap_overlay();
+    if !self.dispatcher.has_event_loop() {
+      return;
+    }
+
     let managed_windows = self.windows();
 
     for window in &managed_windows {

@@ -15,40 +15,58 @@ pub trait TilingDirectionGetters: CommonGetters {
   /// direction. For example, for `Direction::Right`, get the right-most
   /// container.
   ///
-  /// Any non-tiling containers are ignored.
+  /// Any non-tiling containers and `VoidSlot`s are skipped.
   fn descendant_in_direction(
     &self,
     direction: &Direction,
   ) -> Option<TilingWindow> {
-    let child = self.child_in_direction(direction)?;
-
-    // Traverse further down if the child is a split container.
-    match child {
-      TilingContainer::Split(split_child) => {
-        split_child.descendant_in_direction(direction)
-      }
-      TilingContainer::TilingWindow(window) => Some(window),
-    }
-  }
-
-  fn child_in_direction(
-    &self,
-    direction: &Direction,
-  ) -> Option<TilingContainer> {
-    // When the tiling direction is the inverse of the direction, return
-    // the last focused tiling child.
     if self.tiling_direction()
       != TilingDirection::from_direction(direction)
     {
-      return self
-        .child_focus_order()
-        .find_map(|c| c.as_tiling_container().ok());
+      for child in self.child_focus_order() {
+        let Ok(child) = child.as_tiling_container() else {
+          continue;
+        };
+        if let Some(window) =
+          descendant_window_from_tiling(child, direction)
+        {
+          return Some(window);
+        }
+      }
+      return None;
     }
 
-    match direction {
-      Direction::Up | Direction::Left => self.tiling_children().next(),
-      _ => self.tiling_children().last(),
+    let ordered: Box<dyn Iterator<Item = TilingContainer> + '_> =
+      match direction {
+        Direction::Up | Direction::Left => {
+          Box::new(self.tiling_children())
+        }
+        _ => Box::new(
+          self.tiling_children().collect::<Vec<_>>().into_iter().rev(),
+        ),
+      };
+
+    for child in ordered {
+      if let Some(window) = descendant_window_from_tiling(child, direction)
+      {
+        return Some(window);
+      }
     }
+
+    None
+  }
+}
+
+fn descendant_window_from_tiling(
+  child: TilingContainer,
+  direction: &Direction,
+) -> Option<TilingWindow> {
+  match child {
+    TilingContainer::Split(split_child) => {
+      split_child.descendant_in_direction(direction)
+    }
+    TilingContainer::TilingWindow(window) => Some(window),
+    TilingContainer::Void(_) => None,
   }
 }
 

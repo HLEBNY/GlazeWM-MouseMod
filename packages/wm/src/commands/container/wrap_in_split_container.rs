@@ -24,13 +24,22 @@ pub fn wrap_in_split_container(
 
   let starting_focus_index = target_children
     .iter()
+    .filter(|child| !child.is_void())
     .map(CommonGetters::focus_index)
-    .min()
-    .context("Failed to get starting focus index.")?;
+    .min();
 
-  target_parent
-    .borrow_child_focus_order_mut()
-    .insert(starting_focus_index, split_container.id());
+  match starting_focus_index {
+    Some(focus_index) => {
+      target_parent
+        .borrow_child_focus_order_mut()
+        .insert(focus_index, split_container.id());
+    }
+    None => {
+      target_parent
+        .borrow_child_focus_order_mut()
+        .push_back(split_container.id());
+    }
+  }
 
   // Get the total tiling size amongst all children.
   let total_tiling_size = target_children

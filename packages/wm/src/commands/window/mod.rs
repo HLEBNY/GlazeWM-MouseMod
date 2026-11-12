@@ -6,8 +6,10 @@ mod resize_window;
 mod run_window_rules;
 mod set_window_position;
 mod set_window_size;
+mod snap;
 mod unmanage_window;
 mod update_window_state;
+mod void_slots;
 
 pub use ignore_window::*;
 pub use manage_window::*;
@@ -17,5 +19,7 @@ pub use resize_window::*;
 pub use run_window_rules::*;
 pub use set_window_position::*;
 pub use set_window_size::*;
+pub use snap::*;
 pub use unmanage_window::*;
 pub use update_window_state::*;
+pub use void_slots::*;

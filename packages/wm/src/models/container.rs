@@ -16,7 +16,7 @@ use wm_platform::{Direction, NativeWindow, Rect, RectDelta};
 use crate::{
   models::{
     Monitor, NativeWindowProperties, NonTilingWindow, RootContainer,
-    SplitContainer, TilingWindow, Workspace,
+    SplitContainer, TilingWindow, VoidSlot, Workspace,
   },
   traits::*,
   user_config::UserConfig,
@@ -106,6 +106,8 @@ pub enum Container {
   TilingWindow(TilingWindow),
   #[subenum(WindowContainer)]
   NonTilingWindow(NonTilingWindow),
+  #[subenum(TilingContainer)]
+  Void(VoidSlot),
 }
 
 impl PartialEq for Container {

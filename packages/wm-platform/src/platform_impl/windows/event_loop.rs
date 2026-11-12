@@ -198,6 +198,7 @@ impl EventLoop {
     }
 
     tracing::info!("Event loop thread exiting.");
+    super::cleanup_snap_overlay();
     unsafe { DestroyWindow(HWND(self.source.message_window_handle)) }?;
 
     Ok(())

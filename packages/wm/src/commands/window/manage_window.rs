@@ -8,6 +8,9 @@ use wm_common::{
 use wm_platform::NativeWindowWindowsExt;
 use wm_platform::{NativeWindow, Rect, RectDelta};
 
+use super::{
+  first_void_slot, normalize_workspace_voids, replace_tiling_slot,
+};
 use crate::{
   commands::{
     container::{attach_container, set_focused_descendant},
@@ -176,6 +179,7 @@ fn create_window(
 
   // Attach the new window as the first child of the target parent (if
   // provided), otherwise, add as a sibling of the focused container.
+  let has_explicit_parent = target_parent.is_some();
   let (target_parent, target_index) = match target_parent {
     Some(parent) => (parent, 0),
     None => insertion_target(&window_state, state)?,
@@ -251,11 +255,19 @@ fn create_window(
     .into(),
   };
 
-  attach_container(
-    &window_container.clone().into(),
-    &target_parent,
-    Some(target_index),
-  )?;
+  let inserted_into_void = if has_explicit_parent {
+    false
+  } else {
+    try_insert_into_workspace_void(&window_container, &target_workspace)?
+  };
+
+  if !inserted_into_void {
+    attach_container(
+      &window_container.clone().into(),
+      &target_parent,
+      Some(target_index),
+    )?;
+  }
 
   // The OS might spawn the window on a different monitor to the target
   // parent, so adjustments might need to be made because of DPI.
@@ -409,4 +421,26 @@ fn insertion_target(
     focused_workspace.clone().into(),
     focused_workspace.child_count(),
   ))
+}
+
+fn try_insert_into_workspace_void(
+  window_container: &WindowContainer,
+  target_workspace: &Workspace,
+) -> anyhow::Result<bool> {
+  let WindowContainer::TilingWindow(tiling_window) = window_container
+  else {
+    return Ok(false);
+  };
+
+  let Some(void_slot) = first_void_slot(target_workspace) else {
+    return Ok(false);
+  };
+
+  replace_tiling_slot(
+    &void_slot.into(),
+    &tiling_window.clone().into(),
+  )?;
+  normalize_workspace_voids(target_workspace)?;
+
+  Ok(true)
 }

@@ -1,6 +1,7 @@
 use anyhow::Context;
 use wm_common::{WindowState, WmEvent};
 
+use super::vacate_tiling_slot;
 use crate::{
   commands::container::{
     detach_container, flatten_child_split_containers,
@@ -8,6 +9,7 @@ use crate::{
   },
   models::WindowContainer,
   traits::{CommonGetters, WindowGetters},
+  user_config::UserConfig,
   wm_state::WmState,
 };
 
@@ -15,22 +17,29 @@ use crate::{
 pub fn unmanage_window(
   window: WindowContainer,
   state: &mut WmState,
+  config: &UserConfig,
 ) -> anyhow::Result<()> {
-  // Create iterator of parent, grandparent, and great-grandparent.
+  let workspace = window.workspace().context("No workspace.")?;
   let ancestors = window.ancestors().take(3).collect::<Vec<_>>();
 
   state.clear_window_drag_state(window.id());
 
-  // Get container to switch focus to after the window has been removed.
-  let focus_target = state.focus_target_after_removal(&window.clone());
+  // Get container ID to switch focus to after the window has been removed.
+  let focus_target_id = state
+    .focus_target_after_removal(&window.clone())
+    .map(|target| target.id());
 
-  detach_container(window.clone().into())?;
+  match &window {
+    WindowContainer::TilingWindow(tiling_window) => {
+      vacate_tiling_slot(tiling_window, &workspace, false, state, config)?;
+    }
+    WindowContainer::NonTilingWindow(_) => {
+      detach_container(window.clone().into())?;
 
-  // After detaching the container, flatten any redundant split containers.
-  // For example, in the layout V[1 H[2]] where container 1 is detached to
-  // become V[H[2]], this will then need to be flattened to V[2].
-  for ancestor in ancestors.iter().rev() {
-    flatten_child_split_containers(ancestor)?;
+      for ancestor in ancestors.iter().rev() {
+        flatten_child_split_containers(ancestor)?;
+      }
+    }
   }
 
   state.emit_event(WmEvent::WindowUnmanaged {
@@ -39,8 +48,11 @@ pub fn unmanage_window(
     unmanaged_handle: window.native().id().0 as isize,
   });
 
-  // Reassign focus to suitable target.
-  if let Some(focus_target) = focus_target {
+  // Reassign focus to suitable target (re-resolving by ID in case the
+  // target auto-maximized from `TilingWindow` to `NonTilingWindow`).
+  if let Some(focus_target) =
+    focus_target_id.and_then(|id| state.container_by_id(id))
+  {
     set_focused_descendant(&focus_target, None);
     state.pending_sync.queue_focus_change();
     state.unmanaged_or_minimized_timestamp =
@@ -49,14 +61,9 @@ pub fn unmanage_window(
 
   // Sibling containers need to be redrawn if the window was tiling.
   if window.state() == WindowState::Tiling {
-    let ancestor_to_redraw = ancestors
-      .into_iter()
-      .find(|ancestor| !ancestor.is_detached())
-      .context("No ancestor to redraw.")?;
-
     state
       .pending_sync
-      .queue_containers_to_redraw(ancestor_to_redraw.tiling_children());
+      .queue_containers_to_redraw(workspace.tiling_children());
   }
 
   Ok(())

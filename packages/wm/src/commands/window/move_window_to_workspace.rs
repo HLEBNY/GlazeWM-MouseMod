@@ -2,9 +2,15 @@ use anyhow::Context;
 use tracing::info;
 use wm_common::WindowState;
 
+use super::{
+  first_void_slot, normalize_workspace_voids, replace_tiling_slot,
+  vacate_tiling_slot,
+};
 use crate::{
   commands::{
-    container::{move_container_within_tree, set_focused_descendant},
+    container::{
+      attach_container, move_container_within_tree, set_focused_descendant,
+    },
     workspace::activate_workspace,
   },
   models::{WindowContainer, WorkspaceTarget},
@@ -13,6 +19,7 @@ use crate::{
   wm_state::WmState,
 };
 
+#[allow(clippy::too_many_lines)]
 pub fn move_window_to_workspace(
   window: WindowContainer,
   target: WorkspaceTarget,
@@ -73,8 +80,10 @@ pub fn move_window_to_workspace(
       window.set_insertion_target(None);
     }
 
-    // Focus target is `None` if the window is not focused.
-    let focus_target = state.focus_target_after_removal(&window);
+    // Focus target ID is `None` if the window is not focused.
+    let focus_target_id = state
+      .focus_target_after_removal(&window)
+      .map(|target| target.id());
 
     let focus_reset_target = if target_workspace.is_displayed() {
       None
@@ -87,19 +96,39 @@ pub fn move_window_to_workspace(
       .filter_map(|descendant| descendant.as_window_container().ok())
       .find(|descendant| descendant.state() == WindowState::Tiling);
 
-    // Insert the window into the target workspace.
-    match (window.is_tiling_window(), insertion_sibling.is_some()) {
-      (true, true) => {
-        if let Some(insertion_sibling) = insertion_sibling {
-          move_container_within_tree(
-            &window.clone().into(),
-            &insertion_sibling.clone().parent().context("No parent.")?,
-            insertion_sibling.index() + 1,
-            state,
+    let target_void = first_void_slot(&target_workspace);
+
+    match &window {
+      WindowContainer::TilingWindow(tiling_window) => {
+        vacate_tiling_slot(
+          tiling_window,
+          &current_workspace,
+          false,
+          state,
+          config,
+        )?;
+
+        if let Some(void_slot) = target_void {
+          replace_tiling_slot(
+            &void_slot.into(),
+            &tiling_window.clone().into(),
+          )?;
+          normalize_workspace_voids(&target_workspace)?;
+        } else if let Some(insertion_sibling) = insertion_sibling {
+          attach_container(
+            &tiling_window.clone().into(),
+            &insertion_sibling.parent().context("No parent.")?,
+            Some(insertion_sibling.index() + 1),
+          )?;
+        } else {
+          attach_container(
+            &tiling_window.clone().into(),
+            &target_workspace.clone().into(),
+            Some(target_workspace.child_count()),
           )?;
         }
       }
-      _ => {
+      WindowContainer::NonTilingWindow(_) => {
         move_container_within_tree(
           &window.clone().into(),
           &target_workspace.clone().into(),
@@ -122,7 +151,9 @@ pub fn move_window_to_workspace(
     }
 
     // Retain focus within the workspace from where the window was moved.
-    if let Some(focus_target) = focus_target {
+    if let Some(focus_target) =
+      focus_target_id.and_then(|id| state.container_by_id(id))
+    {
       set_focused_descendant(&focus_target, None);
       state.pending_sync.queue_focus_change();
     }

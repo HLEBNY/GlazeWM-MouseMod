@@ -228,6 +228,19 @@ fn redraw_containers(
       WindowState::Fullscreen(config) if config.shown_on_top => {
         WindowZOrder::TopMost
       }
+      WindowState::Fullscreen(config) if !config.shown_on_top => {
+        let focused_descendant = workspace
+          .descendant_focus_order()
+          .next()
+          .and_then(|container| container.as_window_container().ok());
+
+        match focused_descendant {
+          Some(focused) if focused.id() != window.id() => {
+            WindowZOrder::AfterWindow(focused.native().id())
+          }
+          _ => WindowZOrder::Normal,
+        }
+      }
       _ if should_bring_to_front => {
         let focused_descendant = workspace
           .descendant_focus_order()
@@ -572,13 +585,22 @@ fn reposition_maximized_window(
       swp_flags |= SWP_NOMOVE | SWP_NOSIZE;
       window.native().set_window_pos(z_order, rect, swp_flags)?;
     } else {
-      window.native().restore(Some(rect))?;
+      let restore_rect =
+        window.floating_placement().translate_to_center(rect);
+      window.native().restore(Some(&restore_rect))?;
+      swp_flags |= SWP_NOSIZE;
       window.native().set_window_pos(z_order, rect, swp_flags)?;
       window.native().maximize()?;
+      if !matches!(z_order, WindowZOrder::Normal) {
+        window.native().set_z_order(z_order)?;
+      }
     }
   } else {
     window.native().set_window_pos(z_order, rect, swp_flags)?;
     window.native().maximize()?;
+    if !matches!(z_order, WindowZOrder::Normal) {
+      window.native().set_z_order(z_order)?;
+    }
   }
 
   Ok(())

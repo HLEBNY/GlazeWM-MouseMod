@@ -46,12 +46,21 @@ pub fn detach_container(child_to_remove: Container) -> anyhow::Result<()> {
       });
 
     // Adjust size of the siblings based on the freed up space.
-    for sibling in &tiling_siblings {
-      let resize_factor =
-        (sibling.tiling_size() - MIN_TILING_SIZE) / available_size;
+    if available_size > f32::EPSILON {
+      for sibling in &tiling_siblings {
+        let resize_factor =
+          (sibling.tiling_size() - MIN_TILING_SIZE) / available_size;
 
-      let size_delta = resize_factor * child_to_remove.tiling_size();
-      sibling.set_tiling_size(sibling.tiling_size() + size_delta);
+        let size_delta = resize_factor * child_to_remove.tiling_size();
+        sibling.set_tiling_size(sibling.tiling_size() + size_delta);
+      }
+    } else if !tiling_siblings.is_empty() {
+      #[allow(clippy::cast_precision_loss)]
+      let even_delta =
+        child_to_remove.tiling_size() / tiling_siblings.len() as f32;
+      for sibling in &tiling_siblings {
+        sibling.set_tiling_size(sibling.tiling_size() + even_delta);
+      }
     }
   }
 

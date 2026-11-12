@@ -1,0 +1,5153 @@
+diff --git a/packages/wm-common/src/active_drag.rs b/packages/wm-common/src/active_drag.rs
+index 70cd308..6ccaf5c 100644
+--- a/packages/wm-common/src/active_drag.rs
++++ b/packages/wm-common/src/active_drag.rs
+@@ -1,4 +1,5 @@
+ use serde::{Deserialize, Serialize};
++use uuid::Uuid;
+ use wm_platform::Rect;
+ 
+ #[derive(Debug, Clone, Deserialize, Serialize)]
+@@ -16,6 +17,10 @@ pub struct ActiveDrag {
+   ///
+   /// Used to calculate movement distance.
+   pub initial_position: Rect,
++
++  /// Optional `VoidSlot` ID created when dragging a tiling window out of
++  /// its slot during this drag.
++  pub origin_void_id: Option<Uuid>,
+ }
+ 
+ #[derive(Debug, Copy, Clone, Deserialize, PartialEq, Serialize)]
+diff --git a/packages/wm-common/src/dtos/container_dto.rs b/packages/wm-common/src/dtos/container_dto.rs
+index d6faa4e..a5d0db8 100644
+--- a/packages/wm-common/src/dtos/container_dto.rs
++++ b/packages/wm-common/src/dtos/container_dto.rs
+@@ -1,7 +1,8 @@
+ use serde::{Deserialize, Serialize};
+ 
+ use super::{
+-  MonitorDto, RootContainerDto, SplitContainerDto, WindowDto, WorkspaceDto,
++  MonitorDto, RootContainerDto, SplitContainerDto, VoidSlotDto, WindowDto,
++  WorkspaceDto,
+ };
+ 
+ /// User-friendly representation of a container.
+@@ -15,4 +16,5 @@ pub enum ContainerDto {
+   Workspace(WorkspaceDto),
+   Split(SplitContainerDto),
+   Window(WindowDto),
++  Void(VoidSlotDto),
+ }
+diff --git a/packages/wm-common/src/dtos/mod.rs b/packages/wm-common/src/dtos/mod.rs
+index 132a2d7..9d25d0a 100644
+--- a/packages/wm-common/src/dtos/mod.rs
++++ b/packages/wm-common/src/dtos/mod.rs
+@@ -2,6 +2,7 @@ mod container_dto;
+ mod monitor_dto;
+ mod root_container_dto;
+ mod split_container_dto;
++mod void_slot_dto;
+ mod window_dto;
+ mod workspace_dto;
+ 
+@@ -9,5 +10,6 @@ pub use container_dto::*;
+ pub use monitor_dto::*;
+ pub use root_container_dto::*;
+ pub use split_container_dto::*;
++pub use void_slot_dto::*;
+ pub use window_dto::*;
+ pub use workspace_dto::*;
+diff --git a/packages/wm-common/src/dtos/void_slot_dto.rs b/packages/wm-common/src/dtos/void_slot_dto.rs
+new file mode 100644
+index 0000000..6a14e21
+--- /dev/null
++++ b/packages/wm-common/src/dtos/void_slot_dto.rs
+@@ -0,0 +1,17 @@
++use serde::{Deserialize, Serialize};
++use uuid::Uuid;
++
++/// User-friendly representation of a void slot container.
++///
++/// Used for IPC and debug logging.
++#[derive(Clone, Debug, Deserialize, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct VoidSlotDto {
++  pub id: Uuid,
++  pub parent_id: Option<Uuid>,
++  pub tiling_size: f32,
++  pub width: i32,
++  pub height: i32,
++  pub x: i32,
++  pub y: i32,
++}
+diff --git a/packages/wm-platform/src/dispatcher.rs b/packages/wm-platform/src/dispatcher.rs
+index cec90ea..be2b760 100644
+--- a/packages/wm-platform/src/dispatcher.rs
++++ b/packages/wm-platform/src/dispatcher.rs
+@@ -50,6 +50,7 @@ use windows::{
+ use crate::platform_impl::Application;
+ use crate::{
+   platform_impl, Display, DisplayDevice, MouseButton, NativeWindow, Point,
++  Rect, WindowId,
+ };
+ 
+ /// Type alias for a closure to be executed by the event loop.
+@@ -634,6 +635,52 @@ impl Dispatcher {
+     Ok(())
+   }
+ 
++  /// Returns `true` if this `Dispatcher` is backed by a live event loop
++  /// (and `false` for `Dispatcher::mock()` in unit tests).
++  #[must_use]
++  pub fn has_event_loop(&self) -> bool {
++    self.source.is_some()
++  }
++
++  /// Shows or updates the Aero snap preview overlay behind the given
++  /// window.
++  pub fn show_snap_overlay(
++    &self,
++    rect: &Rect,
++    behind_window_id: Option<WindowId>,
++  ) {
++    if self.source.is_none() {
++      return;
++    }
++
++    #[cfg(target_os = "windows")]
++    {
++      let generation = platform_impl::next_snap_overlay_generation();
++      let rect = rect.clone();
++      let behind_hwnd = behind_window_id.map(|id| id.0);
++      let _ = self.dispatch_async(move || {
++        platform_impl::show_snap_overlay(&rect, behind_hwnd, generation);
++      });
++    }
++    #[cfg(not(target_os = "windows"))]
++    let _ = (rect, behind_window_id);
++  }
++
++  /// Hides the Aero snap preview overlay.
++  pub fn hide_snap_overlay(&self) {
++    if self.source.is_none() {
++      return;
++    }
++
++    #[cfg(target_os = "windows")]
++    {
++      let generation = platform_impl::next_snap_overlay_generation();
++      let _ = self.dispatch_async(move || {
++        platform_impl::hide_snap_overlay(generation);
++      });
++    }
++  }
++
+   /// Removes focus from the current window and focuses the desktop.
+   pub fn reset_focus(&self) -> crate::Result<()> {
+     platform_impl::reset_focus(self)
+diff --git a/packages/wm-platform/src/platform_impl/windows/event_loop.rs b/packages/wm-platform/src/platform_impl/windows/event_loop.rs
+index 1f3ab96..5d3c475 100644
+--- a/packages/wm-platform/src/platform_impl/windows/event_loop.rs
++++ b/packages/wm-platform/src/platform_impl/windows/event_loop.rs
+@@ -198,6 +198,7 @@ impl EventLoop {
+     }
+ 
+     tracing::info!("Event loop thread exiting.");
++    super::cleanup_snap_overlay();
+     unsafe { DestroyWindow(HWND(self.source.message_window_handle)) }?;
+ 
+     Ok(())
+diff --git a/packages/wm-platform/src/platform_impl/windows/mod.rs b/packages/wm-platform/src/platform_impl/windows/mod.rs
+index 819e2e9..83927f1 100644
+--- a/packages/wm-platform/src/platform_impl/windows/mod.rs
++++ b/packages/wm-platform/src/platform_impl/windows/mod.rs
+@@ -6,6 +6,7 @@ mod keyboard_hook;
+ mod mouse_listener;
+ mod native_window;
+ mod single_instance;
++mod snap_overlay;
+ mod window_listener;
+ 
+ pub(crate) use display::*;
+@@ -15,4 +16,5 @@ pub(crate) use keyboard_hook::*;
+ pub(crate) use mouse_listener::*;
+ pub(crate) use native_window::*;
+ pub(crate) use single_instance::*;
++pub(crate) use snap_overlay::*;
+ pub(crate) use window_listener::*;
+diff --git a/packages/wm-platform/src/platform_impl/windows/snap_overlay.rs b/packages/wm-platform/src/platform_impl/windows/snap_overlay.rs
+new file mode 100644
+index 0000000..3e1cd35
+--- /dev/null
++++ b/packages/wm-platform/src/platform_impl/windows/snap_overlay.rs
+@@ -0,0 +1,437 @@
++use std::{
++  cell::RefCell,
++  sync::atomic::{AtomicU64, Ordering},
++};
++
++use tracing::warn;
++use windows::{
++  core::w,
++  Win32::{
++    Foundation::{
++      BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE,
++      WPARAM,
++    },
++    Graphics::{
++      Dwm::{
++        DwmSetWindowAttribute, DWMWA_EXCLUDED_FROM_PEEK,
++        DWMWA_TRANSITIONS_FORCEDISABLED,
++      },
++      Gdi::{
++        CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject,
++        GetDC, ReleaseDC, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER,
++        BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
++        DIB_RGB_COLORS, HGDIOBJ,
++      },
++    },
++    System::LibraryLoader::GetModuleHandleW,
++    UI::WindowsAndMessaging::{
++      CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW,
++      SetWindowPos, ShowWindow, UpdateLayeredWindow, HTTRANSPARENT,
++      HWND_TOP, MA_NOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
++      SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, ULW_ALPHA,
++      WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCHITTEST, WNDCLASSW,
++      WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
++      WS_EX_TRANSPARENT, WS_POPUP,
++    },
++  },
++};
++
++use crate::Rect;
++
++const OVERLAY_CLASS_NAME: windows::core::PCWSTR =
++  w!("GlazeWM:SnapOverlay");
++
++static SNAP_OVERLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
++
++#[derive(Default)]
++struct OverlayState {
++  hwnd: Option<isize>,
++  class_registered: bool,
++  is_visible: bool,
++  last_rect: Option<Rect>,
++  last_behind_hwnd: Option<isize>,
++}
++
++thread_local! {
++  static OVERLAY_STATE: RefCell<OverlayState> =
++    RefCell::new(OverlayState::default());
++}
++
++/// Increments and returns the generation counter for snap overlay updates.
++pub(crate) fn next_snap_overlay_generation() -> u64 {
++  SNAP_OVERLAY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
++}
++
++/// Shows or updates the Aero glass snap preview overlay behind
++/// `behind_hwnd`.
++///
++/// Must be called on the Windows event loop thread.
++pub(crate) fn show_snap_overlay(
++  rect: &Rect,
++  behind_hwnd: Option<isize>,
++  generation: u64,
++) {
++  if generation != SNAP_OVERLAY_GENERATION.load(Ordering::Acquire) {
++    return;
++  }
++
++  let width = rect.width();
++  let height = rect.height();
++  if width <= 0 || height <= 0 {
++    hide_snap_overlay_inner();
++    return;
++  }
++
++  OVERLAY_STATE.with(|state| {
++    let mut state = state.borrow_mut();
++
++    let Some(hwnd) = ensure_overlay_window(&mut state) else {
++      return;
++    };
++
++    let needs_redraw = !state.is_visible
++      || state.last_rect.as_ref() != Some(rect);
++
++    if needs_redraw && !paint_layered_overlay(hwnd, rect) {
++      return;
++    }
++
++    if needs_redraw || state.last_behind_hwnd != behind_hwnd {
++      apply_z_order_and_show(hwnd, behind_hwnd);
++    }
++
++    state.is_visible = true;
++    state.last_rect = Some(rect.clone());
++    state.last_behind_hwnd = behind_hwnd;
++  });
++}
++
++/// Hides the Aero snap preview overlay if `generation` is still current.
++///
++/// Must be called on the Windows event loop thread.
++pub(crate) fn hide_snap_overlay(generation: u64) {
++  if generation != SNAP_OVERLAY_GENERATION.load(Ordering::Acquire) {
++    return;
++  }
++
++  hide_snap_overlay_inner();
++}
++
++/// Destroys the snap preview overlay window on event loop shutdown.
++pub(crate) fn cleanup_snap_overlay() {
++  SNAP_OVERLAY_GENERATION.fetch_add(1, Ordering::AcqRel);
++
++  OVERLAY_STATE.with(|state| {
++    let mut state = state.borrow_mut();
++    if let Some(raw_hwnd) = state.hwnd.take() {
++      // SAFETY: `raw_hwnd` was created on this thread.
++      let _ = unsafe { DestroyWindow(HWND(raw_hwnd)) };
++    }
++    state.is_visible = false;
++    state.last_rect = None;
++    state.last_behind_hwnd = None;
++  });
++}
++
++fn hide_snap_overlay_inner() {
++  OVERLAY_STATE.with(|state| {
++    let mut state = state.borrow_mut();
++    if let (Some(raw_hwnd), true) = (state.hwnd, state.is_visible) {
++      // SAFETY: `raw_hwnd` is a valid overlay window on this thread.
++      unsafe {
++        let _ = ShowWindow(HWND(raw_hwnd), SW_HIDE);
++      }
++    }
++    state.is_visible = false;
++    state.last_rect = None;
++    state.last_behind_hwnd = None;
++  });
++}
++
++fn ensure_overlay_window(state: &mut OverlayState) -> Option<HWND> {
++  if let Some(raw_hwnd) = state.hwnd {
++    return Some(HWND(raw_hwnd));
++  }
++
++  // SAFETY: `GetModuleHandleW(None)` retrieves the current process module.
++  let hinstance = unsafe { GetModuleHandleW(None) }
++    .map(HINSTANCE::from)
++    .unwrap_or_default();
++
++  if !state.class_registered {
++    let wnd_class = WNDCLASSW {
++      lpszClassName: OVERLAY_CLASS_NAME,
++      lpfnWndProc: Some(overlay_wnd_proc),
++      hInstance: hinstance,
++      ..Default::default()
++    };
++
++    // SAFETY: `wnd_class` uses a static class name and valid wndproc.
++    unsafe {
++      RegisterClassW(&raw const wnd_class);
++    }
++    state.class_registered = true;
++  }
++
++  let ex_style = WS_EX_LAYERED
++    | WS_EX_TRANSPARENT
++    | WS_EX_TOOLWINDOW
++    | WS_EX_NOACTIVATE;
++
++  // SAFETY: Creating a hidden layered popup overlay on the message thread.
++  let hwnd = unsafe {
++    CreateWindowExW(
++      ex_style,
++      OVERLAY_CLASS_NAME,
++      w!("GlazeWM Snap Overlay"),
++      WS_POPUP,
++      0,
++      0,
++      1,
++      1,
++      None,
++      None,
++      hinstance,
++      None,
++    )
++  };
++
++  if hwnd.0 == 0 {
++    warn!("Failed to create snap preview overlay window.");
++    return None;
++  }
++
++  let enabled = BOOL(1);
++  #[allow(clippy::cast_possible_truncation)]
++  let bool_size = std::mem::size_of::<BOOL>() as u32;
++  // SAFETY: `hwnd` is a valid window and `enabled` lives across the calls.
++  unsafe {
++    let _ = DwmSetWindowAttribute(
++      hwnd,
++      DWMWA_EXCLUDED_FROM_PEEK,
++      std::ptr::from_ref(&enabled).cast(),
++      bool_size,
++    );
++    let _ = DwmSetWindowAttribute(
++      hwnd,
++      DWMWA_TRANSITIONS_FORCEDISABLED,
++      std::ptr::from_ref(&enabled).cast(),
++      bool_size,
++    );
++  }
++
++  state.hwnd = Some(hwnd.0);
++  Some(hwnd)
++}
++
++fn apply_z_order_and_show(hwnd: HWND, behind_hwnd: Option<isize>) {
++  let flags = SWP_NOMOVE
++    | SWP_NOSIZE
++    | SWP_NOACTIVATE
++    | SWP_SHOWWINDOW
++    | SWP_NOOWNERZORDER;
++
++  let insert_after = behind_hwnd.map_or(HWND_TOP, HWND);
++  // SAFETY: `hwnd` is owned by this thread; fallback to `HWND_TOP` if the
++  // target drag window is no longer valid.
++  let positioned = unsafe {
++    SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags)
++  };
++
++  if positioned.is_err() && behind_hwnd.is_some() {
++    // SAFETY: `hwnd` is valid; placing at top of non-topmost band.
++    let _ = unsafe { SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, flags) };
++  }
++}
++
++#[allow(clippy::too_many_lines)]
++fn paint_layered_overlay(hwnd: HWND, rect: &Rect) -> bool {
++  let width = rect.width();
++  let height = rect.height();
++  if width <= 0 || height <= 0 {
++    return false;
++  }
++
++  // SAFETY: `GetDC(None)` acquires the screen DC; released before return.
++  let screen_dc = unsafe { GetDC(None) };
++  if screen_dc.0 == 0 {
++    return false;
++  }
++
++  // SAFETY: `CreateCompatibleDC` returns a memory DC matching the screen.
++  let mem_dc = unsafe { CreateCompatibleDC(screen_dc) };
++  if mem_dc.0 == 0 {
++    // SAFETY: `screen_dc` was acquired above via `GetDC(None)`.
++    unsafe {
++      ReleaseDC(None, screen_dc);
++    }
++    return false;
++  }
++
++  #[allow(clippy::cast_possible_truncation)]
++  let bmi_header_size = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
++  let mut bmi = BITMAPINFO::default();
++  bmi.bmiHeader = BITMAPINFOHEADER {
++    biSize: bmi_header_size,
++    biWidth: width,
++    biHeight: -height,
++    biPlanes: 1,
++    biBitCount: 32,
++    biCompression: BI_RGB.0,
++    ..Default::default()
++  };
++
++  let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
++  // SAFETY: `mem_dc` and `bmi` are initialized; `bits` receives the DIB
++  // pixel buffer pointer on success.
++  let Ok(bitmap) = (unsafe {
++    CreateDIBSection(
++      mem_dc,
++      &raw const bmi,
++      DIB_RGB_COLORS,
++      &raw mut bits,
++      None,
++      0,
++    )
++  }) else {
++    // SAFETY: Releasing acquired DCs on failure.
++    unsafe {
++      DeleteDC(mem_dc);
++      ReleaseDC(None, screen_dc);
++    }
++    return false;
++  };
++
++  if bits.is_null() {
++    // SAFETY: Cleaning up DIB and DCs.
++    unsafe {
++      DeleteObject(bitmap);
++      DeleteDC(mem_dc);
++      ReleaseDC(None, screen_dc);
++    }
++    return false;
++  }
++
++  fill_aero_glass_pixels(bits, width, height);
++
++  // SAFETY: Selecting `bitmap` into `mem_dc` before `UpdateLayeredWindow`.
++  let old_obj: HGDIOBJ = unsafe { SelectObject(mem_dc, bitmap) };
++  let pt_dst = POINT {
++    x: rect.left,
++    y: rect.top,
++  };
++  let size = SIZE {
++    cx: width,
++    cy: height,
++  };
++  let pt_src = POINT { x: 0, y: 0 };
++
++  #[allow(clippy::cast_possible_truncation)]
++  let blend = BLENDFUNCTION {
++    BlendOp: AC_SRC_OVER as u8,
++    BlendFlags: 0,
++    SourceConstantAlpha: u8::MAX,
++    AlphaFormat: AC_SRC_ALPHA as u8,
++  };
++
++  // SAFETY: All handles and pointers stay valid for the Win32 call.
++  let updated = unsafe {
++    UpdateLayeredWindow(
++      hwnd,
++      screen_dc,
++      Some(&raw const pt_dst),
++      Some(&raw const size),
++      mem_dc,
++      Some(&raw const pt_src),
++      COLORREF(0),
++      Some(&raw const blend),
++      ULW_ALPHA,
++    )
++  };
++
++  // SAFETY: Restore previous GDI object and free temporary DIB & DCs.
++  unsafe {
++    SelectObject(mem_dc, old_obj);
++    DeleteObject(bitmap);
++    DeleteDC(mem_dc);
++    ReleaseDC(None, screen_dc);
++  }
++
++  if let Err(err) = updated {
++    warn!("Failed to update snap preview overlay: {err}");
++    return false;
++  }
++
++  true
++}
++
++fn fill_aero_glass_pixels(
++  bits: *mut std::ffi::c_void,
++  width: i32,
++  height: i32,
++) {
++  let Ok(width_usize) = usize::try_from(width) else {
++    return;
++  };
++  let Ok(height_usize) = usize::try_from(height) else {
++    return;
++  };
++  let Some(pixel_count) = width_usize.checked_mul(height_usize) else {
++    return;
++  };
++
++  // SAFETY: `CreateDIBSection` allocated `width * height` 32-bit pixels.
++  let pixels = unsafe {
++    std::slice::from_raw_parts_mut(bits.cast::<u32>(), pixel_count)
++  };
++
++  let denom = height_usize.saturating_sub(1).max(1);
++  for row in 0..height_usize {
++    let dist_y = row.min(height_usize - 1 - row);
++    #[allow(clippy::cast_possible_truncation)]
++    // Colorless clear Aero glass sheen: slightly stronger near top edge.
++    let sheen_alpha = (52usize - (22usize * row) / denom) as u8;
++    let fill_pixel = premultiply_bgra(246, 248, 250, sheen_alpha);
++
++    let row_offset = row * width_usize;
++    for col in 0..width_usize {
++      let dist = dist_y.min(col).min(width_usize - 1 - col);
++      pixels[row_offset + col] = match dist {
++        0 => premultiply_bgra(16, 18, 20, 120),
++        1 => premultiply_bgra(255, 255, 255, 220),
++        2 => premultiply_bgra(236, 240, 244, 105),
++        _ => fill_pixel,
++      };
++    }
++  }
++}
++
++#[inline]
++fn premultiply_bgra(red: u8, green: u8, blue: u8, alpha: u8) -> u32 {
++  let alpha_u32 = u32::from(alpha);
++  #[allow(clippy::cast_possible_truncation)]
++  let premul_red = ((u32::from(red) * alpha_u32 + 127) / 255) as u8;
++  #[allow(clippy::cast_possible_truncation)]
++  let premul_green = ((u32::from(green) * alpha_u32 + 127) / 255) as u8;
++  #[allow(clippy::cast_possible_truncation)]
++  let premul_blue = ((u32::from(blue) * alpha_u32 + 127) / 255) as u8;
++
++  u32::from_le_bytes([premul_blue, premul_green, premul_red, alpha])
++}
++
++unsafe extern "system" fn overlay_wnd_proc(
++  hwnd: HWND,
++  msg: u32,
++  wparam: WPARAM,
++  lparam: LPARAM,
++) -> LRESULT {
++  match msg {
++    WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
++    WM_MOUSEACTIVATE => {
++      #[allow(clippy::cast_possible_wrap)]
++      LRESULT(MA_NOACTIVATE as isize)
++    }
++    WM_ERASEBKGND => LRESULT(1),
++    _ => DefWindowProcW(hwnd, msg, wparam, lparam),
++  }
++}
+diff --git a/packages/wm/src/commands/container/attach_container.rs b/packages/wm/src/commands/container/attach_container.rs
+index ee230f3..c49400e 100644
+--- a/packages/wm/src/commands/container/attach_container.rs
++++ b/packages/wm/src/commands/container/attach_container.rs
+@@ -30,9 +30,11 @@ pub fn attach_container(
+     target_parent.borrow_children_mut().push_back(child.clone());
+   }
+ 
+-  target_parent
+-    .borrow_child_focus_order_mut()
+-    .push_back(child.id());
++  if !child.is_void() {
++    target_parent
++      .borrow_child_focus_order_mut()
++      .push_back(child.id());
++  }
+ 
+   *child.borrow_parent_mut() = Some(target_parent.clone());
+ 
+diff --git a/packages/wm/src/commands/container/detach_container.rs b/packages/wm/src/commands/container/detach_container.rs
+index 5c173c7..65ce9c9 100644
+--- a/packages/wm/src/commands/container/detach_container.rs
++++ b/packages/wm/src/commands/container/detach_container.rs
+@@ -46,12 +46,21 @@ pub fn detach_container(child_to_remove: Container) -> anyhow::Result<()> {
+       });
+ 
+     // Adjust size of the siblings based on the freed up space.
+-    for sibling in &tiling_siblings {
+-      let resize_factor =
+-        (sibling.tiling_size() - MIN_TILING_SIZE) / available_size;
++    if available_size > f32::EPSILON {
++      for sibling in &tiling_siblings {
++        let resize_factor =
++          (sibling.tiling_size() - MIN_TILING_SIZE) / available_size;
+ 
+-      let size_delta = resize_factor * child_to_remove.tiling_size();
+-      sibling.set_tiling_size(sibling.tiling_size() + size_delta);
++        let size_delta = resize_factor * child_to_remove.tiling_size();
++        sibling.set_tiling_size(sibling.tiling_size() + size_delta);
++      }
++    } else if !tiling_siblings.is_empty() {
++      #[allow(clippy::cast_precision_loss)]
++      let even_delta =
++        child_to_remove.tiling_size() / tiling_siblings.len() as f32;
++      for sibling in &tiling_siblings {
++        sibling.set_tiling_size(sibling.tiling_size() + even_delta);
++      }
+     }
+   }
+ 
+diff --git a/packages/wm/src/commands/container/flatten_child_split_containers.rs b/packages/wm/src/commands/container/flatten_child_split_containers.rs
+index ff825b5..5693b81 100644
+--- a/packages/wm/src/commands/container/flatten_child_split_containers.rs
++++ b/packages/wm/src/commands/container/flatten_child_split_containers.rs
+@@ -17,11 +17,12 @@ pub fn flatten_child_split_containers(
+   parent: &Container,
+ ) -> anyhow::Result<()> {
+   if let Ok(parent) = parent.as_direction_container() {
+-    // Get children that are either tiling windows or split containers.
++    // Get children that are tiling containers (tiling windows, split
++    // containers, or void slots).
+     let tiling_children = parent
+       .children()
+       .into_iter()
+-      .filter(|child| child.is_tiling_window() || child.is_split())
++      .filter(|child| child.as_tiling_container().is_ok())
+       .collect::<Vec<_>>();
+ 
+     if tiling_children.len() == 1 {
+diff --git a/packages/wm/src/commands/container/focus_in_direction.rs b/packages/wm/src/commands/container/focus_in_direction.rs
+index 1a3c5b6..25431e9 100644
+--- a/packages/wm/src/commands/container/focus_in_direction.rs
++++ b/packages/wm/src/commands/container/focus_in_direction.rs
+@@ -100,28 +100,31 @@ fn tiling_focus_target(
+       continue;
+     }
+ 
+-    // Get the next/prev tiling sibling depending on the tiling direction.
+-    let focus_target = match direction {
+-      Direction::Up | Direction::Left => origin_or_ancestor
+-        .prev_siblings()
+-        .find_map(|c| c.as_tiling_container().ok()),
+-      _ => origin_or_ancestor
+-        .next_siblings()
+-        .find_map(|c| c.as_tiling_container().ok()),
+-    };
+-
+-    match focus_target {
+-      Some(target) => {
+-        // Return once a suitable focus target is found.
+-        return Ok(match target {
+-          TilingContainer::TilingWindow(_) => Some(target.into()),
+-          TilingContainer::Split(split) => split
+-            .descendant_in_direction(&direction.inverse())
+-            .map(Into::into),
+-        });
+-      }
+-      None => origin_or_ancestor = parent.into(),
++    // Get the next/prev focusable tiling sibling depending on direction,
++    // skipping empty void slots.
++    let siblings: Box<dyn Iterator<Item = Container> + '_> =
++      match direction {
++        Direction::Up | Direction::Left => {
++          Box::new(origin_or_ancestor.prev_siblings())
++        }
++        _ => Box::new(origin_or_ancestor.next_siblings()),
++      };
++
++    let focus_target = siblings
++      .filter_map(|c| c.as_tiling_container().ok())
++      .find_map(|target| match target {
++        TilingContainer::TilingWindow(_) => Some(target.into()),
++        TilingContainer::Split(split) => split
++          .descendant_in_direction(&direction.inverse())
++          .map(Into::into),
++        TilingContainer::Void(_) => None,
++      });
++
++    if let Some(target) = focus_target {
++      return Ok(Some(target));
+     }
++
++    origin_or_ancestor = parent.into();
+   }
+ 
+   Ok(None)
+diff --git a/packages/wm/src/commands/container/resize_tiling_container.rs b/packages/wm/src/commands/container/resize_tiling_container.rs
+index dfcdc7c..5b18e19 100644
+--- a/packages/wm/src/commands/container/resize_tiling_container.rs
++++ b/packages/wm/src/commands/container/resize_tiling_container.rs
+@@ -34,15 +34,23 @@ pub fn resize_tiling_container(
+     });
+ 
+   // Distribute the available tiling size amongst its siblings.
+-  for sibling in &tiling_siblings {
+-    // Get percentage of resize that affects this container. Siblings are
+-    // resized in proportion to their current size (i.e. larger containers
+-    // are shrunk more).
+-    let resize_factor =
+-      (sibling.tiling_size() - MIN_TILING_SIZE) / available_size;
+-
+-    let size_delta = resize_factor * size_delta;
+-
+-    sibling.set_tiling_size(sibling.tiling_size() - size_delta);
++  if available_size > f32::EPSILON {
++    for sibling in &tiling_siblings {
++      // Get percentage of resize that affects this container. Siblings are
++      // resized in proportion to their current size (i.e. larger
++      // containers are shrunk more).
++      let resize_factor =
++        (sibling.tiling_size() - MIN_TILING_SIZE) / available_size;
++
++      let sibling_delta = resize_factor * size_delta;
++
++      sibling.set_tiling_size(sibling.tiling_size() - sibling_delta);
++    }
++  } else {
++    #[allow(clippy::cast_precision_loss)]
++    let even_delta = size_delta / tiling_siblings.len() as f32;
++    for sibling in &tiling_siblings {
++      sibling.set_tiling_size(sibling.tiling_size() - even_delta);
++    }
+   }
+ }
+diff --git a/packages/wm/src/commands/container/wrap_in_split_container.rs b/packages/wm/src/commands/container/wrap_in_split_container.rs
+index ff55ec2..5ea0029 100644
+--- a/packages/wm/src/commands/container/wrap_in_split_container.rs
++++ b/packages/wm/src/commands/container/wrap_in_split_container.rs
+@@ -24,13 +24,22 @@ pub fn wrap_in_split_container(
+ 
+   let starting_focus_index = target_children
+     .iter()
++    .filter(|child| !child.is_void())
+     .map(CommonGetters::focus_index)
+-    .min()
+-    .context("Failed to get starting focus index.")?;
+-
+-  target_parent
+-    .borrow_child_focus_order_mut()
+-    .insert(starting_focus_index, split_container.id());
++    .min();
++
++  match starting_focus_index {
++    Some(focus_index) => {
++      target_parent
++        .borrow_child_focus_order_mut()
++        .insert(focus_index, split_container.id());
++    }
++    None => {
++      target_parent
++        .borrow_child_focus_order_mut()
++        .push_back(split_container.id());
++    }
++  }
+ 
+   // Get the total tiling size amongst all children.
+   let total_tiling_size = target_children
+diff --git a/packages/wm/src/commands/general/platform_sync.rs b/packages/wm/src/commands/general/platform_sync.rs
+index 133dc7f..2b2da6e 100644
+--- a/packages/wm/src/commands/general/platform_sync.rs
++++ b/packages/wm/src/commands/general/platform_sync.rs
+@@ -228,6 +228,19 @@ fn redraw_containers(
+       WindowState::Fullscreen(config) if config.shown_on_top => {
+         WindowZOrder::TopMost
+       }
++      WindowState::Fullscreen(config) if !config.shown_on_top => {
++        let focused_descendant = workspace
++          .descendant_focus_order()
++          .next()
++          .and_then(|container| container.as_window_container().ok());
++
++        match focused_descendant {
++          Some(focused) if focused.id() != window.id() => {
++            WindowZOrder::AfterWindow(focused.native().id())
++          }
++          _ => WindowZOrder::Normal,
++        }
++      }
+       _ if should_bring_to_front => {
+         let focused_descendant = workspace
+           .descendant_focus_order()
+@@ -572,13 +585,22 @@ fn reposition_maximized_window(
+       swp_flags |= SWP_NOMOVE | SWP_NOSIZE;
+       window.native().set_window_pos(z_order, rect, swp_flags)?;
+     } else {
+-      window.native().restore(Some(rect))?;
++      let restore_rect =
++        window.floating_placement().translate_to_center(rect);
++      window.native().restore(Some(&restore_rect))?;
++      swp_flags |= SWP_NOSIZE;
+       window.native().set_window_pos(z_order, rect, swp_flags)?;
+       window.native().maximize()?;
++      if !matches!(z_order, WindowZOrder::Normal) {
++        window.native().set_z_order(z_order)?;
++      }
+     }
+   } else {
+     window.native().set_window_pos(z_order, rect, swp_flags)?;
+     window.native().maximize()?;
++    if !matches!(z_order, WindowZOrder::Normal) {
++      window.native().set_z_order(z_order)?;
++    }
+   }
+ 
+   Ok(())
+diff --git a/packages/wm/src/commands/general/toggle_pause.rs b/packages/wm/src/commands/general/toggle_pause.rs
+index 7156173..26fb2d2 100644
+--- a/packages/wm/src/commands/general/toggle_pause.rs
++++ b/packages/wm/src/commands/general/toggle_pause.rs
+@@ -7,6 +7,10 @@ pub fn toggle_pause(state: &mut WmState) {
+   let is_paused = !state.is_paused;
+   state.is_paused = is_paused;
+ 
++  if is_paused {
++    state.dispatcher.hide_snap_overlay();
++  }
++
+   // Redraw full container tree on unpause.
+   if !is_paused {
+     state
+diff --git a/packages/wm/src/commands/window/ignore_window.rs b/packages/wm/src/commands/window/ignore_window.rs
+index d92e178..ad03709 100644
+--- a/packages/wm/src/commands/window/ignore_window.rs
++++ b/packages/wm/src/commands/window/ignore_window.rs
+@@ -1,12 +1,14 @@
+ use anyhow::Context;
+ use wm_common::WindowState;
+ 
++use super::vacate_tiling_slot;
+ use crate::{
+   commands::container::{
+     detach_container, flatten_child_split_containers,
+   },
+   models::WindowContainer,
+   traits::{CommonGetters, WindowGetters},
++  user_config::UserConfig,
+   wm_state::WmState,
+ };
+ 
+@@ -14,30 +16,32 @@ use crate::{
+ pub fn ignore_window(
+   window: WindowContainer,
+   state: &mut WmState,
++  config: &UserConfig,
+ ) -> anyhow::Result<()> {
+-  // Create iterator of parent, grandparent, and great-grandparent.
++  let workspace = window.workspace().context("No workspace.")?;
+   let ancestors = window.ancestors().take(3).collect::<Vec<_>>();
+ 
++  state.clear_window_drag_state(window.id());
+   state.ignored_windows.push(window.native().clone());
+-  detach_container(window.clone().into())?;
+ 
+-  // After detaching the container, flatten any redundant split containers.
+-  // For example, in the layout V[1 H[2]] where container 1 is detached to
+-  // become V[H[2]], this will then need to be flattened to V[2].
+-  for ancestor in ancestors.iter().rev() {
+-    flatten_child_split_containers(ancestor)?;
++  match &window {
++    WindowContainer::TilingWindow(tiling_window) => {
++      vacate_tiling_slot(tiling_window, &workspace, false, state, config)?;
++    }
++    WindowContainer::NonTilingWindow(_) => {
++      detach_container(window.clone().into())?;
++
++      for ancestor in ancestors.iter().rev() {
++        flatten_child_split_containers(ancestor)?;
++      }
++    }
+   }
+ 
+   // Sibling containers need to be redrawn if the window was tiling.
+   if window.state() == WindowState::Tiling {
+-    let ancestor_to_redraw = ancestors
+-      .into_iter()
+-      .find(|ancestor| !ancestor.is_detached())
+-      .context("No ancestor to redraw.")?;
+-
+     state
+       .pending_sync
+-      .queue_containers_to_redraw(ancestor_to_redraw.tiling_children());
++      .queue_containers_to_redraw(workspace.tiling_children());
+   }
+ 
+   Ok(())
+diff --git a/packages/wm/src/commands/window/manage_window.rs b/packages/wm/src/commands/window/manage_window.rs
+index 704ef1a..b1b6114 100644
+--- a/packages/wm/src/commands/window/manage_window.rs
++++ b/packages/wm/src/commands/window/manage_window.rs
+@@ -8,6 +8,9 @@ use wm_common::{
+ use wm_platform::NativeWindowWindowsExt;
+ use wm_platform::{NativeWindow, Rect, RectDelta};
+ 
++use super::{
++  first_void_slot, normalize_workspace_voids, replace_tiling_slot,
++};
+ use crate::{
+   commands::{
+     container::{attach_container, set_focused_descendant},
+@@ -176,6 +179,7 @@ fn create_window(
+ 
+   // Attach the new window as the first child of the target parent (if
+   // provided), otherwise, add as a sibling of the focused container.
++  let has_explicit_parent = target_parent.is_some();
+   let (target_parent, target_index) = match target_parent {
+     Some(parent) => (parent, 0),
+     None => insertion_target(&window_state, state)?,
+@@ -251,11 +255,19 @@ fn create_window(
+     .into(),
+   };
+ 
+-  attach_container(
+-    &window_container.clone().into(),
+-    &target_parent,
+-    Some(target_index),
+-  )?;
++  let inserted_into_void = if has_explicit_parent {
++    false
++  } else {
++    try_insert_into_workspace_void(&window_container, &target_workspace)?
++  };
++
++  if !inserted_into_void {
++    attach_container(
++      &window_container.clone().into(),
++      &target_parent,
++      Some(target_index),
++    )?;
++  }
+ 
+   // The OS might spawn the window on a different monitor to the target
+   // parent, so adjustments might need to be made because of DPI.
+@@ -410,3 +422,25 @@ fn insertion_target(
+     focused_workspace.child_count(),
+   ))
+ }
++
++fn try_insert_into_workspace_void(
++  window_container: &WindowContainer,
++  target_workspace: &Workspace,
++) -> anyhow::Result<bool> {
++  let WindowContainer::TilingWindow(tiling_window) = window_container
++  else {
++    return Ok(false);
++  };
++
++  let Some(void_slot) = first_void_slot(target_workspace) else {
++    return Ok(false);
++  };
++
++  replace_tiling_slot(
++    &void_slot.into(),
++    &tiling_window.clone().into(),
++  )?;
++  normalize_workspace_voids(target_workspace)?;
++
++  Ok(true)
++}
+diff --git a/packages/wm/src/commands/window/mod.rs b/packages/wm/src/commands/window/mod.rs
+index 1386ee9..4ff4140 100644
+--- a/packages/wm/src/commands/window/mod.rs
++++ b/packages/wm/src/commands/window/mod.rs
+@@ -6,8 +6,10 @@ mod resize_window;
+ mod run_window_rules;
+ mod set_window_position;
+ mod set_window_size;
++mod snap;
+ mod unmanage_window;
+ mod update_window_state;
++mod void_slots;
+ 
+ pub use ignore_window::*;
+ pub use manage_window::*;
+@@ -17,5 +19,7 @@ pub use resize_window::*;
+ pub use run_window_rules::*;
+ pub use set_window_position::*;
+ pub use set_window_size::*;
++pub use snap::*;
+ pub use unmanage_window::*;
+ pub use update_window_state::*;
++pub use void_slots::*;
+diff --git a/packages/wm/src/commands/window/move_window_in_direction.rs b/packages/wm/src/commands/window/move_window_in_direction.rs
+index 5fcbc0c..7db7581 100644
+--- a/packages/wm/src/commands/window/move_window_in_direction.rs
++++ b/packages/wm/src/commands/window/move_window_in_direction.rs
+@@ -1,12 +1,17 @@
+ use anyhow::Context;
+-use wm_common::{TilingDirection, WindowState};
++use wm_common::{TilingDirection, WindowState, WmEvent};
+ use wm_platform::{Direction, Rect};
+ 
++use super::{
++  first_void_slot, normalize_workspace_voids, replace_tiling_slot,
++  swap_tiling_containers, vacate_tiling_slot,
++};
+ use crate::{
+   commands::container::{
+-    flatten_child_split_containers, flatten_split_container,
+-    move_container_within_tree, resize_tiling_container,
+-    set_focused_descendant, wrap_in_split_container,
++    attach_container, flatten_child_split_containers,
++    flatten_split_container, move_container_within_tree,
++    resize_tiling_container, set_focused_descendant,
++    wrap_in_split_container,
+   },
+   models::{
+     DirectionContainer, Monitor, NonTilingWindow, SplitContainer,
+@@ -41,6 +46,7 @@ pub fn move_window_in_direction(
+           &non_tiling_window.into(),
+           direction,
+           state,
++          config,
+         ),
+         _ => Ok(()),
+       }
+@@ -94,6 +100,7 @@ fn move_tiling_window(
+       &window_to_move.into(),
+       direction,
+       state,
++      config,
+     );
+   }
+ 
+@@ -199,17 +206,45 @@ fn move_to_sibling_container(
+           .pending_sync
+           .queue_container_to_redraw(target_parent)
+           .queue_containers_to_redraw(parent.tiling_children());
++      } else if let Some(void_slot) = sibling_split
++        .descendants()
++        .find_map(|c| c.as_void().cloned())
++      {
++        let workspace =
++          window_to_move.workspace().context("No workspace.")?;
++        swap_tiling_containers(
++          &window_to_move.into(),
++          &void_slot.into(),
++        )?;
++        normalize_workspace_voids(&workspace)?;
++        state
++          .pending_sync
++          .queue_containers_to_redraw(parent.tiling_children());
+       }
+     }
++    TilingContainer::Void(void_slot) => {
++      let workspace =
++        window_to_move.workspace().context("No workspace.")?;
++      swap_tiling_containers(
++        &window_to_move.into(),
++        &void_slot.into(),
++      )?;
++      normalize_workspace_voids(&workspace)?;
++      state
++        .pending_sync
++        .queue_containers_to_redraw(parent.tiling_children());
++    }
+   }
+ 
+   Ok(())
+ }
+ 
++#[allow(clippy::too_many_lines)]
+ fn move_to_workspace_in_direction(
+   window_to_move: &WindowContainer,
+   direction: &Direction,
+   state: &mut WmState,
++  config: &UserConfig,
+ ) -> anyhow::Result<()> {
+   let parent = window_to_move.parent().context("No parent.")?;
+   let workspace = window_to_move.workspace().context("No workspace.")?;
+@@ -220,6 +255,8 @@ fn move_to_workspace_in_direction(
+     .and_then(|monitor| monitor.displayed_workspace());
+ 
+   if let Some(target_workspace) = target_workspace {
++    let was_focused = window_to_move.has_focus(None);
++
+     // Since the window is crossing monitors, adjustments might need to be
+     // made because of DPI.
+     if monitor.has_dpi_difference(&target_workspace.clone().into())? {
+@@ -245,19 +282,57 @@ fn move_to_workspace_in_direction(
+     };
+ 
+     // Focus should be reassigned within the original workspace after the
+-    // window is moved out. For example, if the focus order is 1. tiling
+-    // window and 2. fullscreen window, then we'd want to retain focus on a
+-    // tiling window on move.
+-    let focus_target = state.focus_target_after_removal(window_to_move);
+-
+-    move_container_within_tree(
+-      &window_to_move.clone().into(),
+-      &target_workspace.clone().into(),
+-      target_index,
+-      state,
+-    )?;
++    // window is moved out.
++    let focus_target_id = state
++      .focus_target_after_removal(window_to_move)
++      .map(|target| target.id());
++
++    match window_to_move {
++      WindowContainer::TilingWindow(tiling_window) => {
++        let target_void = first_void_slot(&target_workspace);
++
++        vacate_tiling_slot(
++          tiling_window,
++          &workspace,
++          false,
++          state,
++          config,
++        )?;
++
++        if let Some(void_slot) = target_void {
++          replace_tiling_slot(
++            &void_slot.into(),
++            &tiling_window.clone().into(),
++          )?;
++          normalize_workspace_voids(&target_workspace)?;
++        } else {
++          attach_container(
++            &tiling_window.clone().into(),
++            &target_workspace.clone().into(),
++            Some(target_index),
++          )?;
++        }
++
++        if was_focused {
++          set_focused_descendant(&tiling_window.clone().into(), None);
++          state.emit_event(WmEvent::FocusedContainerMoved {
++            focused_container: tiling_window.to_dto()?,
++          });
++        }
++      }
++      WindowContainer::NonTilingWindow(_) => {
++        move_container_within_tree(
++          &window_to_move.clone().into(),
++          &target_workspace.clone().into(),
++          target_index,
++          state,
++        )?;
++      }
++    }
+ 
+-    if let Some(focus_target) = focus_target {
++    if let Some(focus_target) =
++      focus_target_id.and_then(|id| state.container_by_id(id))
++    {
+       set_focused_descendant(
+         &focus_target,
+         Some(&workspace.clone().into()),
+@@ -268,7 +343,7 @@ fn move_to_workspace_in_direction(
+       .pending_sync
+       .queue_container_to_redraw(window_to_move.clone())
+       .queue_containers_to_redraw(target_workspace.tiling_children())
+-      .queue_containers_to_redraw(parent.tiling_children())
++      .queue_containers_to_redraw(workspace.tiling_children())
+       .queue_cursor_jump()
+       .queue_workspace_to_reorder(target_workspace);
+   }
+diff --git a/packages/wm/src/commands/window/move_window_to_workspace.rs b/packages/wm/src/commands/window/move_window_to_workspace.rs
+index fdcda8b..d1ed85e 100644
+--- a/packages/wm/src/commands/window/move_window_to_workspace.rs
++++ b/packages/wm/src/commands/window/move_window_to_workspace.rs
+@@ -2,9 +2,15 @@ use anyhow::Context;
+ use tracing::info;
+ use wm_common::WindowState;
+ 
++use super::{
++  first_void_slot, normalize_workspace_voids, replace_tiling_slot,
++  vacate_tiling_slot,
++};
+ use crate::{
+   commands::{
+-    container::{move_container_within_tree, set_focused_descendant},
++    container::{
++      attach_container, move_container_within_tree, set_focused_descendant,
++    },
+     workspace::activate_workspace,
+   },
+   models::{WindowContainer, WorkspaceTarget},
+@@ -13,6 +19,7 @@ use crate::{
+   wm_state::WmState,
+ };
+ 
++#[allow(clippy::too_many_lines)]
+ pub fn move_window_to_workspace(
+   window: WindowContainer,
+   target: WorkspaceTarget,
+@@ -73,8 +80,10 @@ pub fn move_window_to_workspace(
+       window.set_insertion_target(None);
+     }
+ 
+-    // Focus target is `None` if the window is not focused.
+-    let focus_target = state.focus_target_after_removal(&window);
++    // Focus target ID is `None` if the window is not focused.
++    let focus_target_id = state
++      .focus_target_after_removal(&window)
++      .map(|target| target.id());
+ 
+     let focus_reset_target = if target_workspace.is_displayed() {
+       None
+@@ -87,19 +96,39 @@ pub fn move_window_to_workspace(
+       .filter_map(|descendant| descendant.as_window_container().ok())
+       .find(|descendant| descendant.state() == WindowState::Tiling);
+ 
+-    // Insert the window into the target workspace.
+-    match (window.is_tiling_window(), insertion_sibling.is_some()) {
+-      (true, true) => {
+-        if let Some(insertion_sibling) = insertion_sibling {
+-          move_container_within_tree(
+-            &window.clone().into(),
+-            &insertion_sibling.clone().parent().context("No parent.")?,
+-            insertion_sibling.index() + 1,
+-            state,
++    let target_void = first_void_slot(&target_workspace);
++
++    match &window {
++      WindowContainer::TilingWindow(tiling_window) => {
++        vacate_tiling_slot(
++          tiling_window,
++          &current_workspace,
++          false,
++          state,
++          config,
++        )?;
++
++        if let Some(void_slot) = target_void {
++          replace_tiling_slot(
++            &void_slot.into(),
++            &tiling_window.clone().into(),
++          )?;
++          normalize_workspace_voids(&target_workspace)?;
++        } else if let Some(insertion_sibling) = insertion_sibling {
++          attach_container(
++            &tiling_window.clone().into(),
++            &insertion_sibling.parent().context("No parent.")?,
++            Some(insertion_sibling.index() + 1),
++          )?;
++        } else {
++          attach_container(
++            &tiling_window.clone().into(),
++            &target_workspace.clone().into(),
++            Some(target_workspace.child_count()),
+           )?;
+         }
+       }
+-      _ => {
++      WindowContainer::NonTilingWindow(_) => {
+         move_container_within_tree(
+           &window.clone().into(),
+           &target_workspace.clone().into(),
+@@ -122,7 +151,9 @@ pub fn move_window_to_workspace(
+     }
+ 
+     // Retain focus within the workspace from where the window was moved.
+-    if let Some(focus_target) = focus_target {
++    if let Some(focus_target) =
++      focus_target_id.and_then(|id| state.container_by_id(id))
++    {
+       set_focused_descendant(&focus_target, None);
+       state.pending_sync.queue_focus_change();
+     }
+diff --git a/packages/wm/src/commands/window/snap.rs b/packages/wm/src/commands/window/snap.rs
+new file mode 100644
+index 0000000..9d33aa3
+--- /dev/null
++++ b/packages/wm/src/commands/window/snap.rs
+@@ -0,0 +1,1956 @@
++use anyhow::Context;
++use uuid::Uuid;
++use wm_common::{
++  ActiveDrag, ActiveDragOperation, FullscreenStateConfig, TilingDirection,
++  WindowState,
++};
++use wm_platform::{Point, Rect};
++
++use super::{
++  collapse_origin_void, normalize_workspace_voids, replace_tiling_slot,
++  swap_tiling_containers, update_window_state,
++};
++use crate::{
++  commands::container::{
++    attach_container, detach_container, set_focused_descendant,
++    wrap_in_split_container,
++  },
++  events::update_floating_window_position,
++  models::{
++    NonTilingWindow, SplitContainer, TilingContainer, TilingWindow,
++    VoidSlot, WindowContainer, Workspace,
++  },
++  traits::{
++    CommonGetters, PositionGetters, TilingDirectionGetters,
++    TilingSizeGetters, WindowGetters,
++  },
++  user_config::UserConfig,
++  wm_state::WmState,
++};
++
++/// Screen-edge and corner zones active during mouse move drags.
++#[derive(Debug, Copy, Clone, PartialEq, Eq)]
++pub enum ScreenZone {
++  TopCenter,
++  Left,
++  Right,
++  Top,
++  Bottom,
++  TopLeft,
++  TopRight,
++  BottomLeft,
++  BottomRight,
++}
++
++/// Side of an existing tiling window when splitting it in place.
++#[derive(Debug, Copy, Clone, PartialEq, Eq)]
++pub enum SplitSide {
++  Left,
++  Right,
++  Top,
++  Bottom,
++}
++
++/// Resolved drop target during a window move drag.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum DropTarget {
++  Maximize {
++    workspace_id: Uuid,
++  },
++  SnapZone {
++    workspace_id: Uuid,
++    zone: ScreenZone,
++  },
++  SwapTile {
++    workspace_id: Uuid,
++    target_window_id: Uuid,
++  },
++  SplitTile {
++    workspace_id: Uuid,
++    target_window_id: Uuid,
++    side: SplitSide,
++  },
++}
++
++#[derive(Debug, Clone)]
++enum VoidMatch {
++  Exact(VoidSlot),
++  SplitHalf {
++    slot: VoidSlot,
++    split_dir: TilingDirection,
++    insert_first: bool,
++  },
++}
++
++/// Detects which screen snap zone contains `cursor` within a monitor's
++/// `bounds` (falling back to `working_area`).
++#[must_use]
++pub fn detect_screen_zone(
++  cursor: &Point,
++  working_area: &Rect,
++  monitor_bounds: Option<&Rect>,
++) -> Option<ScreenZone> {
++  let containment = monitor_bounds.unwrap_or(working_area);
++  if !containment.contains_point(cursor) {
++    return None;
++  }
++
++  let edge_px = (working_area.width().min(working_area.height()) / 50)
++    .clamp(14, 24);
++  let corner_w = (working_area.width() / 6).clamp(100, 200);
++  let corner_h = (working_area.height() / 5).clamp(100, 200);
++
++  let near_left = cursor.x <= working_area.left + edge_px;
++  let near_right = cursor.x >= working_area.right - 1 - edge_px;
++  let near_top = cursor.y <= working_area.top + edge_px;
++  let near_bottom = cursor.y >= working_area.bottom - 1 - edge_px;
++
++  if !near_left && !near_right && !near_top && !near_bottom {
++    return None;
++  }
++
++  let is_top_left = (near_top
++    && (near_left || cursor.x < working_area.left + corner_w))
++    || (near_left && cursor.y < working_area.top + corner_h);
++  if is_top_left {
++    return Some(ScreenZone::TopLeft);
++  }
++
++  let is_top_right = (near_top
++    && (near_right || cursor.x >= working_area.right - corner_w))
++    || (near_right && cursor.y < working_area.top + corner_h);
++  if is_top_right {
++    return Some(ScreenZone::TopRight);
++  }
++
++  let is_bottom_left = (near_bottom
++    && (near_left || cursor.x < working_area.left + corner_w))
++    || (near_left && cursor.y >= working_area.bottom - corner_h);
++  if is_bottom_left {
++    return Some(ScreenZone::BottomLeft);
++  }
++
++  let is_bottom_right = (near_bottom
++    && (near_right || cursor.x >= working_area.right - corner_w))
++    || (near_right && cursor.y >= working_area.bottom - corner_h);
++  if is_bottom_right {
++    return Some(ScreenZone::BottomRight);
++  }
++
++  let third_w = working_area.width() / 3;
++  let mid_left = working_area.left + third_w;
++  let mid_right = working_area.right - third_w;
++
++  if near_top && cursor.x >= mid_left && cursor.x <= mid_right {
++    return Some(ScreenZone::TopCenter);
++  }
++
++  if near_top {
++    return Some(ScreenZone::Top);
++  }
++  if near_bottom {
++    return Some(ScreenZone::Bottom);
++  }
++  if near_left {
++    return Some(ScreenZone::Left);
++  }
++  if near_right {
++    return Some(ScreenZone::Right);
++  }
++
++  None
++}
++
++/// Resolves the drop target for `dragged_window` at `cursor` under the
++/// active drag's origin rules.
++///
++/// - `is_from_floating == true`: only screen edges, corners, and
++///   top-center maximize can trigger (never interior tiles).
++/// - `is_from_floating == false`: screen edges/corners/top-center trigger;
++///   hovering over an interior `TilingWindow` swaps (if `origin_void_id`
++///   exists on the target workspace) or splits; empty space / `VoidSlot`
++///   returns `None` (leaving the window floating on drop).
++pub fn resolve_drop_target(
++  dragged_window: &WindowContainer,
++  cursor: &Point,
++  active_drag: &ActiveDrag,
++  state: &WmState,
++) -> anyhow::Result<Option<DropTarget>> {
++  let monitor = state
++    .monitor_at_point(cursor)
++    .or_else(|| dragged_window.monitor())
++    .context("No monitor found for snap target.")?;
++
++  let workspace = monitor
++    .displayed_workspace()
++    .context("No displayed workspace on monitor.")?;
++
++  let props = monitor.native_properties();
++  if let Some(zone) =
++    detect_screen_zone(cursor, &props.working_area, Some(&props.bounds))
++  {
++    return Ok(Some(match zone {
++      ScreenZone::TopCenter => DropTarget::Maximize {
++        workspace_id: workspace.id(),
++      },
++      _ => DropTarget::SnapZone {
++        workspace_id: workspace.id(),
++        zone,
++      },
++    }));
++  }
++
++  if active_drag.is_from_floating {
++    return Ok(None);
++  }
++
++  let target_tile = workspace
++    .tiling_windows()
++    .filter(|tile| tile.id() != dragged_window.id())
++    .find(|tile| {
++      tile
++        .to_rect()
++        .is_ok_and(|rect| rect.contains_point(cursor))
++    });
++
++  let Some(target_tile) = target_tile else {
++    return Ok(None);
++  };
++
++  let has_origin_void_in_ws = active_drag
++    .origin_void_id
++    .and_then(|id| super::void_slot_by_id(&workspace, id))
++    .is_some();
++
++  if has_origin_void_in_ws {
++    return Ok(Some(DropTarget::SwapTile {
++      workspace_id: workspace.id(),
++      target_window_id: target_tile.id(),
++    }));
++  }
++
++  let tile_rect = target_tile.to_rect()?;
++  let side = split_side_for_cursor(cursor, &tile_rect);
++
++  Ok(Some(DropTarget::SplitTile {
++    workspace_id: workspace.id(),
++    target_window_id: target_tile.id(),
++    side,
++  }))
++}
++
++/// Computes the exact preview rect in screen coordinates for `target`.
++pub fn compute_drop_preview_rect(
++  target: &DropTarget,
++  dragged_window: &WindowContainer,
++  active_drag: &ActiveDrag,
++  state: &WmState,
++) -> anyhow::Result<Option<Rect>> {
++  match target {
++    DropTarget::Maximize { workspace_id } => {
++      let Some(workspace) = state.workspace_by_id(*workspace_id) else {
++        return Ok(None);
++      };
++      let monitor = workspace.monitor().context("No monitor.")?;
++      let can_maximize =
++        window_supports_native_maximize(dragged_window, state);
++      let rect = if can_maximize {
++        monitor.native_properties().working_area
++      } else {
++        workspace.max_workspace_rect()?
++      };
++      Ok(Some(rect))
++    }
++    DropTarget::SwapTile {
++      target_window_id, ..
++    } => {
++      let Some(container) = state.container_by_id(*target_window_id) else {
++        return Ok(None);
++      };
++      Ok(Some(container.to_rect()?))
++    }
++    DropTarget::SplitTile {
++      workspace_id,
++      target_window_id,
++      side,
++    } => {
++      let Some(workspace) = state.workspace_by_id(*workspace_id) else {
++        return Ok(None);
++      };
++      let Some(container) = state.container_by_id(*target_window_id) else {
++        return Ok(None);
++      };
++      let (h_gap, v_gap) = workspace.workspace_inner_gaps()?;
++      let rect = container.to_rect()?;
++      let (dir, is_first, gap) = match side {
++        SplitSide::Left => (TilingDirection::Horizontal, true, h_gap),
++        SplitSide::Right => (TilingDirection::Horizontal, false, h_gap),
++        SplitSide::Top => (TilingDirection::Vertical, true, v_gap),
++        SplitSide::Bottom => (TilingDirection::Vertical, false, v_gap),
++      };
++      Ok(Some(split_half_rect(&rect, &dir, is_first, gap)))
++    }
++    DropTarget::SnapZone { workspace_id, zone } => {
++      let Some(workspace) = state.workspace_by_id(*workspace_id) else {
++        return Ok(None);
++      };
++      Ok(Some(compute_snap_zone_preview_rect(
++        &workspace,
++        *zone,
++        active_drag.origin_void_id,
++      )?))
++    }
++  }
++}
++
++/// Updates or hides the Aero glass snap overlay during a move drag.
++pub fn update_drag_snap_preview(
++  window: &WindowContainer,
++  cursor_override: Option<&Point>,
++  state: &WmState,
++) -> anyhow::Result<()> {
++  let Some(active_drag) = window.active_drag() else {
++    state.dispatcher.hide_snap_overlay();
++    return Ok(());
++  };
++
++  if active_drag.operation != Some(ActiveDragOperation::Move) {
++    state.dispatcher.hide_snap_overlay();
++    return Ok(());
++  }
++
++  let cursor = match cursor_override {
++    Some(pos) => pos.clone(),
++    None => state.dispatcher.cursor_position()?,
++  };
++
++  let target = resolve_drop_target(window, &cursor, &active_drag, state)?;
++  let Some(target) = target else {
++    state.dispatcher.hide_snap_overlay();
++    return Ok(());
++  };
++
++  let Some(rect) =
++    compute_drop_preview_rect(&target, window, &active_drag, state)?
++  else {
++    state.dispatcher.hide_snap_overlay();
++    return Ok(());
++  };
++
++  state
++    .dispatcher
++    .show_snap_overlay(&rect, Some(window.native().id()));
++
++  Ok(())
++}
++
++/// Finalizes a move drag on button/movesize release: snaps to edge/corner,
++/// maximizes, swaps/splits an interior tile, or leaves floating over free
++/// space.
++pub fn finalize_move_drag(
++  moved_window: &NonTilingWindow,
++  frame_position: Rect,
++  active_drag: &ActiveDrag,
++  cursor_override: Option<&Point>,
++  state: &mut WmState,
++  config: &UserConfig,
++) -> anyhow::Result<WindowContainer> {
++  state.dispatcher.hide_snap_overlay();
++
++  let window_container: WindowContainer = moved_window.clone().into();
++  let cursor = match cursor_override {
++    Some(pos) => pos.clone(),
++    None => state.dispatcher.cursor_position()?,
++  };
++
++  let drop_target = if active_drag.operation
++    == Some(ActiveDragOperation::Move)
++  {
++    resolve_drop_target(&window_container, &cursor, active_drag, state)?
++  } else {
++    None
++  };
++
++  match drop_target {
++    Some(DropTarget::Maximize { workspace_id }) => commit_maximize_drop(
++      moved_window,
++      workspace_id,
++      active_drag,
++      state,
++      config,
++    ),
++    Some(DropTarget::SwapTile {
++      workspace_id,
++      target_window_id,
++    }) => commit_swap_tile(
++      moved_window,
++      workspace_id,
++      target_window_id,
++      active_drag,
++      state,
++      config,
++    ),
++    Some(DropTarget::SplitTile {
++      workspace_id,
++      target_window_id,
++      side,
++    }) => commit_split_tile(
++      moved_window,
++      workspace_id,
++      target_window_id,
++      side,
++      active_drag,
++      state,
++      config,
++    ),
++    Some(DropTarget::SnapZone { workspace_id, zone }) => commit_snap_zone(
++      moved_window,
++      workspace_id,
++      zone,
++      active_drag,
++      state,
++      config,
++    ),
++    None => {
++      // Dropped in free space: stay floating and keep voids in place.
++      if let Some(workspace) = moved_window.workspace() {
++        if active_drag
++          .origin_void_id
++          .and_then(|id| super::void_slot_by_id(&workspace, id))
++          .is_some()
++        {
++          normalize_workspace_voids(&workspace)?;
++        }
++      }
++
++      let nearest_monitor = state
++        .nearest_monitor(&moved_window.native())
++        .context("Failed to get workspace of nearest monitor.")?;
++
++      update_floating_window_position(
++        moved_window,
++        frame_position,
++        &nearest_monitor,
++        state,
++      )?;
++      moved_window.set_active_drag(None);
++      Ok(moved_window.clone().into())
++    }
++  }
++}
++
++fn commit_maximize_drop(
++  moved_window: &NonTilingWindow,
++  target_workspace_id: Uuid,
++  active_drag: &ActiveDrag,
++  state: &mut WmState,
++  config: &UserConfig,
++) -> anyhow::Result<WindowContainer> {
++  let old_workspace = moved_window.workspace();
++  let target_workspace = state
++    .workspace_by_id(target_workspace_id)
++    .context("Target workspace not found.")?;
++
++  let moved_across_ws = old_workspace
++    .as_ref()
++    .is_some_and(|ws| ws.id() != target_workspace.id());
++
++  if moved_across_ws {
++    if let (Some(old_mon), Some(new_mon)) = (
++      old_workspace.as_ref().and_then(|ws| ws.monitor().ok()),
++      target_workspace.monitor().ok(),
++    ) {
++      if old_mon.has_dpi_difference(&new_mon.clone().into())? {
++        moved_window.set_has_pending_dpi_adjustment(true);
++      }
++      if old_mon.id() != new_mon.id() {
++        moved_window.set_floating_placement(
++          moved_window
++            .floating_placement()
++            .translate_to_center(&target_workspace.to_rect()?),
++        );
++      }
++    }
++
++    moved_window.set_insertion_target(None);
++    move_container_within_tree_or_attach(moved_window, &target_workspace)?;
++  }
++
++  let fullscreen_state = if let WindowState::Fullscreen(fullscreen) =
++    moved_window.state()
++  {
++    fullscreen
++  } else {
++    config
++      .value
++      .window_behavior
++      .state_defaults
++      .fullscreen
++      .clone()
++  };
++
++  let maximized = update_window_state(
++    moved_window.clone().into(),
++    WindowState::Fullscreen(FullscreenStateConfig {
++      maximized: true,
++      ..fullscreen_state
++    }),
++    state,
++    config,
++  )?;
++
++  if let (Some(origin_void_id), Some(old_ws)) =
++    (active_drag.origin_void_id, old_workspace)
++  {
++    let preferred_front = if old_ws.id() == target_workspace.id() {
++      Some(maximized.id())
++    } else {
++      None
++    };
++    collapse_origin_void(
++      origin_void_id,
++      &old_ws,
++      preferred_front,
++      state,
++      config,
++    )?;
++  }
++
++  set_focused_descendant(&maximized.clone().into(), None);
++  maximized.set_active_drag(None);
++  state
++    .pending_sync
++    .queue_container_to_redraw(maximized.clone())
++    .queue_workspace_to_reorder(target_workspace);
++
++  Ok(maximized)
++}
++
++fn commit_swap_tile(
++  moved_window: &NonTilingWindow,
++  workspace_id: Uuid,
++  target_window_id: Uuid,
++  active_drag: &ActiveDrag,
++  state: &mut WmState,
++  config: &UserConfig,
++) -> anyhow::Result<WindowContainer> {
++  let workspace = state
++    .workspace_by_id(workspace_id)
++    .context("Target workspace not found.")?;
++
++  let Some(target_window) = state
++    .container_by_id(target_window_id)
++    .and_then(|c| c.as_tiling_window().cloned())
++  else {
++    return Ok(moved_window.clone().into());
++  };
++
++  let Some(origin_void) = active_drag
++    .origin_void_id
++    .and_then(|id| super::void_slot_by_id(&workspace, id))
++  else {
++    return Ok(moved_window.clone().into());
++  };
++
++  let tiling_window = moved_window.to_tiling(config.value.gaps.clone());
++  detach_container(moved_window.clone().into())?;
++  replace_tiling_slot(&origin_void.into(), &tiling_window.clone().into())?;
++  swap_tiling_containers(
++    &tiling_window.clone().into(),
++    &target_window.into(),
++  )?;
++  normalize_workspace_voids(&workspace)?;
++
++  tiling_window.set_active_drag(None);
++  set_focused_descendant(&tiling_window.clone().into(), None);
++
++  state
++    .pending_sync
++    .queue_containers_to_redraw(workspace.tiling_children())
++    .queue_workspace_to_reorder(workspace);
++
++  Ok(tiling_window.into())
++}
++
++fn commit_split_tile(
++  moved_window: &NonTilingWindow,
++  workspace_id: Uuid,
++  target_window_id: Uuid,
++  side: SplitSide,
++  active_drag: &ActiveDrag,
++  state: &mut WmState,
++  config: &UserConfig,
++) -> anyhow::Result<WindowContainer> {
++  let old_workspace = moved_window.workspace();
++  let workspace = state
++    .workspace_by_id(workspace_id)
++    .context("Target workspace not found.")?;
++
++  let Some(target_window) = state
++    .container_by_id(target_window_id)
++    .and_then(|c| c.as_tiling_window().cloned())
++  else {
++    return Ok(moved_window.clone().into());
++  };
++
++  if let (Some(origin_void_id), Some(old_ws)) =
++    (active_drag.origin_void_id, &old_workspace)
++  {
++    if old_ws.id() != workspace.id() {
++      collapse_origin_void(origin_void_id, old_ws, None, state, config)?;
++    }
++  }
++
++  let (split_dir, insert_first) = match side {
++    SplitSide::Left => (TilingDirection::Horizontal, true),
++    SplitSide::Right => (TilingDirection::Horizontal, false),
++    SplitSide::Top => (TilingDirection::Vertical, true),
++    SplitSide::Bottom => (TilingDirection::Vertical, false),
++  };
++
++  let tiling_window = moved_window.to_tiling(config.value.gaps.clone());
++  detach_container(moved_window.clone().into())?;
++
++  let target_parent = target_window.parent().context("No parent.")?;
++  let split_container =
++    SplitContainer::new(split_dir, config.value.gaps.clone());
++  wrap_in_split_container(
++    &split_container,
++    &target_parent,
++    &[target_window.into()],
++  )?;
++
++  let insert_idx = usize::from(!insert_first);
++  attach_container(
++    &tiling_window.clone().into(),
++    &split_container.into(),
++    Some(insert_idx),
++  )?;
++
++  normalize_workspace_voids(&workspace)?;
++  tiling_window.set_active_drag(None);
++  set_focused_descendant(&tiling_window.clone().into(), None);
++
++  state
++    .pending_sync
++    .queue_containers_to_redraw(workspace.tiling_children())
++    .queue_workspace_to_reorder(workspace);
++
++  Ok(tiling_window.into())
++}
++
++#[allow(clippy::too_many_lines)]
++fn commit_snap_zone(
++  moved_window: &NonTilingWindow,
++  workspace_id: Uuid,
++  zone: ScreenZone,
++  active_drag: &ActiveDrag,
++  state: &mut WmState,
++  config: &UserConfig,
++) -> anyhow::Result<WindowContainer> {
++  let old_workspace = moved_window.workspace();
++  let workspace = state
++    .workspace_by_id(workspace_id)
++    .context("Target workspace not found.")?;
++
++  let origin_void_in_target = active_drag
++    .origin_void_id
++    .filter(|id| super::void_slot_by_id(&workspace, *id).is_some());
++
++  let (h_gap, v_gap) = workspace.workspace_inner_gaps()?;
++  let ws_rect = workspace.multi_window_workspace_rect()?;
++
++  let void_match = find_matching_void(
++    &workspace,
++    zone,
++    origin_void_in_target,
++    &ws_rect,
++    h_gap,
++    v_gap,
++  )?;
++
++  let tiling_window = moved_window.to_tiling(config.value.gaps.clone());
++  detach_container(moved_window.clone().into())?;
++
++  if let Some(void_match) = void_match {
++    match void_match {
++      VoidMatch::Exact(slot) => {
++        replace_tiling_slot(&slot.into(), &tiling_window.clone().into())?;
++      }
++      VoidMatch::SplitHalf {
++        slot,
++        split_dir,
++        insert_first,
++      } => {
++        let slot_parent =
++          slot.parent().context("Void slot has no parent.")?;
++        let split =
++          SplitContainer::new(split_dir, config.value.gaps.clone());
++        let slot_tiling: TilingContainer = slot.into();
++        wrap_in_split_container(&split, &slot_parent, &[slot_tiling])?;
++        let insert_idx = usize::from(!insert_first);
++        attach_container(
++          &tiling_window.clone().into(),
++          &split.into(),
++          Some(insert_idx),
++        )?;
++      }
++    }
++
++    if let (Some(origin_void_id), Some(old_ws)) =
++      (active_drag.origin_void_id, &old_workspace)
++    {
++      collapse_origin_void(origin_void_id, old_ws, None, state, config)?;
++    }
++
++    normalize_workspace_voids(&workspace)?;
++    tiling_window.set_active_drag(None);
++    set_focused_descendant(&tiling_window.clone().into(), None);
++
++    state
++      .pending_sync
++      .queue_containers_to_redraw(workspace.tiling_children())
++      .queue_workspace_to_reorder(workspace);
++
++    return Ok(tiling_window.into());
++  }
++
++  // Collapse any active drag's origin void cleanly so we don't leave a
++  // stale hole from the dragged window itself before edge/corner insert.
++  if let (Some(origin_void_id), Some(old_ws)) =
++    (active_drag.origin_void_id, &old_workspace)
++  {
++    if let Some(origin_void) =
++      super::void_slot_by_id(old_ws, origin_void_id)
++    {
++      super::detach_tiling_preferring_non_void_siblings(
++        &origin_void.into(),
++      )?;
++      normalize_workspace_voids(old_ws)?;
++      if old_ws.id() != workspace.id() {
++        state
++          .pending_sync
++          .queue_containers_to_redraw(old_ws.tiling_children());
++      }
++    }
++  }
++
++  let existing_children: Vec<TilingContainer> =
++    workspace.tiling_children().collect();
++
++  if existing_children.is_empty() {
++    insert_into_empty_workspace(&tiling_window, &workspace, zone, config)?;
++  } else if existing_children.len() == 1
++    && existing_children[0].is_tiling_window()
++  {
++    insert_beside_sole_window(
++      &tiling_window,
++      &workspace,
++      &existing_children[0],
++      zone,
++      config,
++    )?;
++  } else {
++    insert_into_populated_workspace(
++      &tiling_window,
++      &workspace,
++      &existing_children,
++      zone,
++      config,
++    )?;
++  }
++
++  normalize_workspace_voids(&workspace)?;
++  tiling_window.set_active_drag(None);
++  set_focused_descendant(&tiling_window.clone().into(), None);
++
++  state
++    .pending_sync
++    .queue_containers_to_redraw(workspace.tiling_children())
++    .queue_workspace_to_reorder(workspace);
++
++  Ok(tiling_window.into())
++}
++
++fn insert_into_empty_workspace(
++  tiling_window: &TilingWindow,
++  workspace: &Workspace,
++  zone: ScreenZone,
++  config: &UserConfig,
++) -> anyhow::Result<()> {
++  let gaps = config.value.gaps.clone();
++  let ws_container = workspace.clone().into();
++  let win_container: crate::models::Container =
++    tiling_window.clone().into();
++
++  match zone {
++    ScreenZone::Left
++    | ScreenZone::Right
++    | ScreenZone::Top
++    | ScreenZone::Bottom => {
++      let (dir, is_first) = edge_direction_and_side(zone);
++      workspace.set_tiling_direction(dir);
++      let void_slot = VoidSlot::new(gaps);
++      if is_first {
++        attach_container(&win_container, &ws_container, Some(0))?;
++        attach_container(&void_slot.into(), &ws_container, Some(1))?;
++      } else {
++        attach_container(&void_slot.into(), &ws_container, Some(0))?;
++        attach_container(&win_container, &ws_container, Some(1))?;
++      }
++    }
++    ScreenZone::TopLeft
++    | ScreenZone::TopRight
++    | ScreenZone::BottomLeft
++    | ScreenZone::BottomRight => {
++      let (is_left, is_top) = corner_sides(zone);
++      workspace.set_tiling_direction(TilingDirection::Horizontal);
++      let half_split =
++        SplitContainer::new(TilingDirection::Vertical, gaps.clone());
++      let inner_void = VoidSlot::new(gaps.clone());
++      let outer_void = VoidSlot::new(gaps);
++
++      if is_left {
++        attach_container(
++          &half_split.clone().into(),
++          &ws_container,
++          Some(0),
++        )?;
++        attach_container(&outer_void.into(), &ws_container, Some(1))?;
++      } else {
++        attach_container(&outer_void.into(), &ws_container, Some(0))?;
++        attach_container(
++          &half_split.clone().into(),
++          &ws_container,
++          Some(1),
++        )?;
++      }
++
++      let split_container = half_split.into();
++      if is_top {
++        attach_container(&win_container, &split_container, Some(0))?;
++        attach_container(&inner_void.into(), &split_container, Some(1))?;
++      } else {
++        attach_container(&inner_void.into(), &split_container, Some(0))?;
++        attach_container(&win_container, &split_container, Some(1))?;
++      }
++    }
++    ScreenZone::TopCenter => {}
++  }
++
++  Ok(())
++}
++
++fn insert_beside_sole_window(
++  tiling_window: &TilingWindow,
++  workspace: &Workspace,
++  existing: &TilingContainer,
++  zone: ScreenZone,
++  config: &UserConfig,
++) -> anyhow::Result<()> {
++  let ws_container = workspace.clone().into();
++  let gaps = config.value.gaps.clone();
++  let win_container: crate::models::Container =
++    tiling_window.clone().into();
++
++  match zone {
++    ScreenZone::Left
++    | ScreenZone::Right
++    | ScreenZone::Top
++    | ScreenZone::Bottom => {
++      let (dir, is_first) = edge_direction_and_side(zone);
++      workspace.set_tiling_direction(dir);
++      let insert_idx = usize::from(!is_first);
++      attach_container(&win_container, &ws_container, Some(insert_idx))?;
++    }
++    ScreenZone::TopLeft
++    | ScreenZone::TopRight
++    | ScreenZone::BottomLeft
++    | ScreenZone::BottomRight => {
++      let (is_left, is_top) = corner_sides(zone);
++      workspace.set_tiling_direction(TilingDirection::Horizontal);
++      let half_split =
++        SplitContainer::new(TilingDirection::Vertical, gaps.clone());
++      let inner_void = VoidSlot::new(gaps);
++      let existing_c: crate::models::Container = existing.clone().into();
++
++      // Detach existing temporarily to place beside the new split.
++      detach_container(existing_c.clone())?;
++      if is_left {
++        attach_container(
++          &half_split.clone().into(),
++          &ws_container,
++          Some(0),
++        )?;
++        attach_container(&existing_c, &ws_container, Some(1))?;
++      } else {
++        attach_container(&existing_c, &ws_container, Some(0))?;
++        attach_container(
++          &half_split.clone().into(),
++          &ws_container,
++          Some(1),
++        )?;
++      }
++
++      let split_container = half_split.into();
++      if is_top {
++        attach_container(&win_container, &split_container, Some(0))?;
++        attach_container(&inner_void.into(), &split_container, Some(1))?;
++      } else {
++        attach_container(&inner_void.into(), &split_container, Some(0))?;
++        attach_container(&win_container, &split_container, Some(1))?;
++      }
++    }
++    ScreenZone::TopCenter => {}
++  }
++
++  Ok(())
++}
++
++fn insert_into_populated_workspace(
++  tiling_window: &TilingWindow,
++  workspace: &Workspace,
++  existing_children: &[TilingContainer],
++  zone: ScreenZone,
++  config: &UserConfig,
++) -> anyhow::Result<()> {
++  let ws_container = workspace.clone().into();
++  let gaps = config.value.gaps.clone();
++
++  match zone {
++    ScreenZone::Left
++    | ScreenZone::Right
++    | ScreenZone::Top
++    | ScreenZone::Bottom => {
++      let (edge_dir, is_first) = edge_direction_and_side(zone);
++      if workspace.tiling_direction() == edge_dir {
++        let insert_idx =
++          if is_first { 0 } else { existing_children.len() };
++        attach_container(
++          &tiling_window.clone().into(),
++          &ws_container,
++          Some(insert_idx),
++        )?;
++      } else {
++        let old_dir = workspace.tiling_direction();
++        let wrapper = SplitContainer::new(old_dir, gaps);
++        wrap_in_split_container(
++          &wrapper,
++          &ws_container,
++          existing_children,
++        )?;
++        workspace.set_tiling_direction(edge_dir);
++        let insert_idx = usize::from(!is_first);
++        attach_container(
++          &tiling_window.clone().into(),
++          &ws_container,
++          Some(insert_idx),
++        )?;
++      }
++    }
++    ScreenZone::TopLeft
++    | ScreenZone::TopRight
++    | ScreenZone::BottomLeft
++    | ScreenZone::BottomRight => {
++      let ws_rect = workspace.multi_window_workspace_rect()?;
++      let leaf = find_corner_leaf(workspace, None, zone, &ws_rect)?;
++      let leaf_rect = leaf.to_rect()?;
++      let split_dir = corner_split_direction(&leaf_rect);
++      let insert_first = corner_leaf_insert_first(zone, &split_dir);
++
++      let leaf_parent =
++        leaf.parent().context("Corner leaf has no parent.")?;
++      let split = SplitContainer::new(split_dir, gaps);
++      wrap_in_split_container(&split, &leaf_parent, &[leaf])?;
++      let insert_idx = usize::from(!insert_first);
++      attach_container(
++        &tiling_window.clone().into(),
++        &split.into(),
++        Some(insert_idx),
++      )?;
++    }
++    ScreenZone::TopCenter => {}
++  }
++
++  Ok(())
++}
++
++fn compute_snap_zone_preview_rect(
++  workspace: &Workspace,
++  zone: ScreenZone,
++  origin_void_id: Option<Uuid>,
++) -> anyhow::Result<Rect> {
++  let ws_rect = workspace.multi_window_workspace_rect()?;
++  let (h_gap, v_gap) = workspace.workspace_inner_gaps()?;
++
++  let origin_in_ws = origin_void_id
++    .filter(|id| super::void_slot_by_id(workspace, *id).is_some());
++
++  if let Some(void_match) = find_matching_void(
++    workspace,
++    zone,
++    origin_in_ws,
++    &ws_rect,
++    h_gap,
++    v_gap,
++  )? {
++    return match void_match {
++      VoidMatch::Exact(slot) => slot.to_rect(),
++      VoidMatch::SplitHalf {
++        slot,
++        split_dir,
++        insert_first,
++      } => {
++        let slot_rect = slot.to_rect()?;
++        let gap = gap_for_dir(&split_dir, h_gap, v_gap);
++        Ok(split_half_rect(&slot_rect, &split_dir, insert_first, gap))
++      }
++    };
++  }
++
++  let effective_children: Vec<TilingContainer> = workspace
++    .tiling_children()
++    .filter(|c| Some(c.id()) != origin_in_ws)
++    .collect();
++
++  if effective_children.is_empty()
++    || (effective_children.len() == 1
++      && effective_children[0].is_tiling_window())
++  {
++    return Ok(match zone {
++      ScreenZone::Left
++      | ScreenZone::Right
++      | ScreenZone::Top
++      | ScreenZone::Bottom => {
++        let (dir, is_first) = edge_direction_and_side(zone);
++        let gap = gap_for_dir(&dir, h_gap, v_gap);
++        split_half_rect(&ws_rect, &dir, is_first, gap)
++      }
++      ScreenZone::TopLeft
++      | ScreenZone::TopRight
++      | ScreenZone::BottomLeft
++      | ScreenZone::BottomRight => {
++        let (is_left, is_top) = corner_sides(zone);
++        let half = split_half_rect(
++          &ws_rect,
++          &TilingDirection::Horizontal,
++          is_left,
++          h_gap,
++        );
++        split_half_rect(&half, &TilingDirection::Vertical, is_top, v_gap)
++      }
++      ScreenZone::TopCenter => ws_rect,
++    });
++  }
++
++  compute_populated_snap_zone_preview(
++    workspace,
++    zone,
++    origin_in_ws,
++    &ws_rect,
++    effective_children.len(),
++    h_gap,
++    v_gap,
++  )
++}
++
++fn compute_populated_snap_zone_preview(
++  workspace: &Workspace,
++  zone: ScreenZone,
++  origin_in_ws: Option<Uuid>,
++  ws_rect: &Rect,
++  sibling_count: usize,
++  h_gap: i32,
++  v_gap: i32,
++) -> anyhow::Result<Rect> {
++  match zone {
++    ScreenZone::Left
++    | ScreenZone::Right
++    | ScreenZone::Top
++    | ScreenZone::Bottom => {
++      let (edge_dir, is_first) = edge_direction_and_side(zone);
++      let gap = gap_for_dir(&edge_dir, h_gap, v_gap);
++      if workspace.tiling_direction() == edge_dir {
++        #[allow(clippy::cast_precision_loss)]
++        let new_fraction = 1.0 / (sibling_count + 1) as f32;
++        Ok(edge_insertion_rect(
++          ws_rect,
++          &edge_dir,
++          is_first,
++          gap,
++          sibling_count,
++          new_fraction,
++        ))
++      } else {
++        Ok(split_half_rect(ws_rect, &edge_dir, is_first, gap))
++      }
++    }
++    ScreenZone::TopLeft
++    | ScreenZone::TopRight
++    | ScreenZone::BottomLeft
++    | ScreenZone::BottomRight => {
++      let leaf = find_corner_leaf(workspace, origin_in_ws, zone, ws_rect)?;
++      let leaf_rect = effective_leaf_rect(&leaf, origin_in_ws)?;
++      let split_dir = corner_split_direction(&leaf_rect);
++      let insert_first = corner_leaf_insert_first(zone, &split_dir);
++      let gap = gap_for_dir(&split_dir, h_gap, v_gap);
++      Ok(split_half_rect(&leaf_rect, &split_dir, insert_first, gap))
++    }
++    ScreenZone::TopCenter => Ok(ws_rect.clone()),
++  }
++}
++
++fn find_matching_void(
++  workspace: &Workspace,
++  zone: ScreenZone,
++  origin_void_id: Option<Uuid>,
++  ws_rect: &Rect,
++  h_gap: i32,
++  v_gap: i32,
++) -> anyhow::Result<Option<VoidMatch>> {
++  let slots: Vec<VoidSlot> = workspace
++    .descendants()
++    .filter_map(|c| c.as_void().cloned())
++    .filter(|slot| Some(slot.id()) != origin_void_id)
++    .collect();
++
++  for slot in slots {
++    let r = slot.to_rect()?;
++    let near_l = r.left <= ws_rect.left + h_gap + 6;
++    let near_r = r.right >= ws_rect.right - h_gap - 6;
++    let near_t = r.top <= ws_rect.top + v_gap + 6;
++    let near_b = r.bottom >= ws_rect.bottom - v_gap - 6;
++    let is_full_h = r.height() >= (ws_rect.height() * 2) / 3;
++    let is_full_w = r.width() >= (ws_rect.width() * 2) / 3;
++    let is_sub_w = r.width() <= (ws_rect.width() * 3) / 4;
++    let is_sub_h = r.height() <= (ws_rect.height() * 3) / 4;
++
++    let matched = match zone {
++      ScreenZone::Left if near_l && is_full_h && is_sub_w => {
++        Some(VoidMatch::Exact(slot))
++      }
++      ScreenZone::Right if near_r && is_full_h && is_sub_w => {
++        Some(VoidMatch::Exact(slot))
++      }
++      ScreenZone::Top if near_t && is_full_w && is_sub_h => {
++        Some(VoidMatch::Exact(slot))
++      }
++      ScreenZone::Bottom if near_b && is_full_w && is_sub_h => {
++        Some(VoidMatch::Exact(slot))
++      }
++      ScreenZone::TopLeft
++      | ScreenZone::TopRight
++      | ScreenZone::BottomLeft
++      | ScreenZone::BottomRight => {
++        let (is_left, is_top) = corner_sides(zone);
++        let horiz_ok = if is_left { near_l } else { near_r };
++        let vert_ok = if is_top { near_t } else { near_b };
++
++        if horiz_ok && vert_ok && is_sub_w && is_sub_h {
++          Some(VoidMatch::Exact(slot))
++        } else if horiz_ok && is_full_h && is_sub_w {
++          Some(VoidMatch::SplitHalf {
++            slot,
++            split_dir: TilingDirection::Vertical,
++            insert_first: is_top,
++          })
++        } else if vert_ok && is_full_w && is_sub_h {
++          Some(VoidMatch::SplitHalf {
++            slot,
++            split_dir: TilingDirection::Horizontal,
++            insert_first: is_left,
++          })
++        } else {
++          None
++        }
++      }
++      _ => None,
++    };
++
++    if matched.is_some() {
++      return Ok(matched);
++    }
++  }
++
++  Ok(None)
++}
++
++fn find_corner_leaf(
++  workspace: &Workspace,
++  exclude_void_id: Option<Uuid>,
++  zone: ScreenZone,
++  ws_rect: &Rect,
++) -> anyhow::Result<TilingContainer> {
++  let target_pt = match zone {
++    ScreenZone::TopLeft => Point {
++      x: ws_rect.left,
++      y: ws_rect.top,
++    },
++    ScreenZone::TopRight => Point {
++      x: ws_rect.right,
++      y: ws_rect.top,
++    },
++    ScreenZone::BottomLeft => Point {
++      x: ws_rect.left,
++      y: ws_rect.bottom,
++    },
++    _ => Point {
++      x: ws_rect.right,
++      y: ws_rect.bottom,
++    },
++  };
++
++  let mut best: Option<(i32, TilingContainer)> = None;
++  for descendant in workspace.descendants() {
++    let Ok(tiling) = descendant.as_tiling_container() else {
++      continue;
++    };
++    if tiling.is_split() || Some(tiling.id()) == exclude_void_id {
++      continue;
++    }
++
++    let rect = tiling.to_rect()?;
++    let corner_pt = match zone {
++      ScreenZone::TopLeft => Point {
++        x: rect.left,
++        y: rect.top,
++      },
++      ScreenZone::TopRight => Point {
++        x: rect.right,
++        y: rect.top,
++      },
++      ScreenZone::BottomLeft => Point {
++        x: rect.left,
++        y: rect.bottom,
++      },
++      _ => Point {
++        x: rect.right,
++        y: rect.bottom,
++      },
++    };
++
++    let dist = (corner_pt.x - target_pt.x).abs()
++      + (corner_pt.y - target_pt.y).abs();
++    if best.as_ref().is_none_or(|(best_dist, _)| dist < *best_dist) {
++      best = Some((dist, tiling));
++    }
++  }
++
++  best
++    .map(|(_, leaf)| leaf)
++    .context("No tiling leaf container found in workspace.")
++}
++
++fn effective_leaf_rect(
++  leaf: &TilingContainer,
++  origin_void_id: Option<Uuid>,
++) -> anyhow::Result<Rect> {
++  let rect = leaf.to_rect()?;
++  let Some(origin_id) = origin_void_id else {
++    return Ok(rect);
++  };
++
++  let Some(parent) = leaf.direction_container() else {
++    return Ok(rect);
++  };
++
++  let Some(origin_void) = parent
++    .tiling_children()
++    .find(|child| child.id() == origin_id)
++  else {
++    return Ok(rect);
++  };
++
++  let remaining_sum: f32 = parent
++    .tiling_children()
++    .filter(|child| child.id() != origin_id)
++    .map(|child| child.tiling_size())
++    .sum();
++  if remaining_sum <= f32::EPSILON {
++    return Ok(rect);
++  }
++
++  let scale = (remaining_sum + origin_void.tiling_size()) / remaining_sum;
++  let parent_rect = parent.to_rect()?;
++  let (h_gap, v_gap) = parent.as_tiling_container().ok().map_or_else(
++    || {
++      leaf
++        .workspace()
++        .and_then(|ws| ws.workspace_inner_gaps().ok())
++        .unwrap_or((0, 0))
++    },
++    |tc| tc.inner_gaps().unwrap_or((0, 0)),
++  );
++  let remaining_siblings = parent
++    .tiling_children()
++    .filter(|child| child.id() != origin_id)
++    .count()
++    .saturating_sub(1);
++
++  #[allow(
++    clippy::cast_possible_wrap,
++    clippy::cast_possible_truncation,
++    clippy::cast_precision_loss
++  )]
++  match parent.tiling_direction() {
++    TilingDirection::Horizontal => {
++      let avail = parent_rect.width() - h_gap * remaining_siblings as i32;
++      let mut x = parent_rect.x();
++      for sibling in parent
++        .tiling_children()
++        .filter(|child| child.id() != origin_id)
++      {
++        let width =
++          (avail as f32 * sibling.tiling_size() * scale).round() as i32;
++        if sibling.id() == leaf.id() {
++          return Ok(Rect::from_xy(
++            x,
++            parent_rect.y(),
++            width,
++            parent_rect.height(),
++          ));
++        }
++        x += width + h_gap;
++      }
++      Ok(rect)
++    }
++    TilingDirection::Vertical => {
++      let avail = parent_rect.height() - v_gap * remaining_siblings as i32;
++      let mut y = parent_rect.y();
++      for sibling in parent
++        .tiling_children()
++        .filter(|child| child.id() != origin_id)
++      {
++        let height =
++          (sibling.tiling_size() * scale * avail as f32) as i32;
++        if sibling.id() == leaf.id() {
++          return Ok(Rect::from_xy(
++            parent_rect.x(),
++            y,
++            parent_rect.width(),
++            height,
++          ));
++        }
++        y += height + v_gap;
++      }
++      Ok(rect)
++    }
++  }
++}
++
++fn split_side_for_cursor(cursor: &Point, rect: &Rect) -> SplitSide {
++  let dx = cursor.x - rect.center_point().x;
++  let dy = cursor.y - rect.center_point().y;
++
++  if dx.abs() * rect.height() >= dy.abs() * rect.width() {
++    if dx >= 0 {
++      SplitSide::Right
++    } else {
++      SplitSide::Left
++    }
++  } else if dy >= 0 {
++    SplitSide::Bottom
++  } else {
++    SplitSide::Top
++  }
++}
++
++fn edge_direction_and_side(zone: ScreenZone) -> (TilingDirection, bool) {
++  match zone {
++    ScreenZone::Left => (TilingDirection::Horizontal, true),
++    ScreenZone::Right => (TilingDirection::Horizontal, false),
++    ScreenZone::Top => (TilingDirection::Vertical, true),
++    _ => (TilingDirection::Vertical, false),
++  }
++}
++
++fn corner_sides(zone: ScreenZone) -> (bool, bool) {
++  match zone {
++    ScreenZone::TopLeft => (true, true),
++    ScreenZone::TopRight => (false, true),
++    ScreenZone::BottomLeft => (true, false),
++    _ => (false, false),
++  }
++}
++
++fn corner_split_direction(leaf_rect: &Rect) -> TilingDirection {
++  let is_wide_strip = leaf_rect.height() < 160
++    && leaf_rect.width() > leaf_rect.height() * 2;
++  if is_wide_strip {
++    TilingDirection::Horizontal
++  } else {
++    TilingDirection::Vertical
++  }
++}
++
++fn corner_leaf_insert_first(
++  zone: ScreenZone,
++  split_dir: &TilingDirection,
++) -> bool {
++  let (is_left, is_top) = corner_sides(zone);
++  match split_dir {
++    TilingDirection::Horizontal => is_left,
++    TilingDirection::Vertical => is_top,
++  }
++}
++
++fn gap_for_dir(dir: &TilingDirection, h_gap: i32, v_gap: i32) -> i32 {
++  match dir {
++    TilingDirection::Horizontal => h_gap,
++    TilingDirection::Vertical => v_gap,
++  }
++}
++
++#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
++fn split_half_rect(
++  rect: &Rect,
++  direction: &TilingDirection,
++  is_first: bool,
++  gap: i32,
++) -> Rect {
++  match direction {
++    TilingDirection::Horizontal => {
++      let avail_w = (rect.width() - gap).max(1);
++      let half_w = (avail_w as f32 * 0.5).round() as i32;
++      let x = if is_first {
++        rect.x()
++      } else {
++        rect.x() + half_w + gap
++      };
++      Rect::from_xy(x, rect.y(), half_w, rect.height())
++    }
++    TilingDirection::Vertical => {
++      let avail_h = (rect.height() - gap).max(1);
++      let half_h = (0.5 * avail_h as f32) as i32;
++      let y = if is_first {
++        rect.y()
++      } else {
++        rect.y() + half_h + gap
++      };
++      Rect::from_xy(rect.x(), y, rect.width(), half_h)
++    }
++  }
++}
++
++#[allow(
++  clippy::cast_possible_truncation,
++  clippy::cast_possible_wrap,
++  clippy::cast_precision_loss
++)]
++fn edge_insertion_rect(
++  ws_rect: &Rect,
++  direction: &TilingDirection,
++  is_first: bool,
++  gap: i32,
++  sibling_count: usize,
++  tiling_size: f32,
++) -> Rect {
++  match direction {
++    TilingDirection::Horizontal => {
++      let avail_w = (ws_rect.width() - gap * sibling_count as i32).max(1);
++      let width = (avail_w as f32 * tiling_size).round() as i32;
++      let x = if is_first {
++        ws_rect.x()
++      } else {
++        ws_rect.right - width
++      };
++      Rect::from_xy(x, ws_rect.y(), width, ws_rect.height())
++    }
++    TilingDirection::Vertical => {
++      let avail_h = (ws_rect.height() - gap * sibling_count as i32).max(1);
++      let height = (tiling_size * avail_h as f32) as i32;
++      let y = if is_first {
++        ws_rect.y()
++      } else {
++        ws_rect.bottom - height
++      };
++      Rect::from_xy(ws_rect.x(), y, ws_rect.width(), height)
++    }
++  }
++}
++
++fn move_container_within_tree_or_attach(
++  window: &NonTilingWindow,
++  target_workspace: &Workspace,
++) -> anyhow::Result<()> {
++  detach_container(window.clone().into())?;
++  attach_container(
++    &window.clone().into(),
++    &target_workspace.clone().into(),
++    Some(target_workspace.child_count()),
++  )?;
++  Ok(())
++}
++
++fn window_supports_native_maximize(
++  window: &WindowContainer,
++  state: &WmState,
++) -> bool {
++  #[cfg(target_os = "windows")]
++  if state.dispatcher.has_event_loop() && window.native().id().0 != 0 {
++    use wm_platform::{NativeWindowWindowsExt, WS_MAXIMIZEBOX};
++    return window.native().has_window_style(WS_MAXIMIZEBOX);
++  }
++  let _ = (window, state);
++  true
++}
++
++#[cfg(test)]
++mod tests {
++  use tokio::sync::mpsc;
++  use wm_common::FloatingStateConfig;
++  use wm_platform::Dispatcher;
++
++  use super::*;
++  use crate::{
++    commands::window::{
++      first_void_slot, unmanage_window, vacate_tiling_slot,
++    },
++    models::Monitor,
++  };
++
++  fn setup_state() -> (WmState, UserConfig, Workspace) {
++    let (event_tx, _event_rx) = mpsc::unbounded_channel();
++    let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
++    let mut state = WmState::new(Dispatcher::mock(), event_tx, exit_tx);
++    let config = UserConfig::mock();
++
++    let workspace = Workspace::mock()
++      .gaps_config(config.value.gaps.clone())
++      .call();
++    let monitor = Monitor::mock()
++      .bounds(Rect::from_xy(0, 0, 1920, 1080))
++      .working_area(Rect::from_xy(0, 0, 1920, 1032))
++      .workspaces(vec![workspace.clone()])
++      .call();
++    attach_container(
++      &monitor.into(),
++      &state.root_container.clone().into(),
++      None,
++    )
++    .unwrap();
++    set_focused_descendant(&workspace.clone().into(), None);
++
++    (state, config, workspace)
++  }
++
++  fn add_floating(
++    workspace: &Workspace,
++    rect: Rect,
++  ) -> NonTilingWindow {
++    let win = NonTilingWindow::mock()
++      .floating_placement(rect)
++      .state(WindowState::Floating(FloatingStateConfig::default()))
++      .call();
++    attach_container(
++      &win.clone().into(),
++      &workspace.clone().into(),
++      None,
++    )
++    .unwrap();
++    set_focused_descendant(&win.clone().into(), None);
++    win
++  }
++
++  fn drag_move(
++    is_from_floating: bool,
++    origin_void_id: Option<Uuid>,
++  ) -> ActiveDrag {
++    ActiveDrag {
++      operation: Some(ActiveDragOperation::Move),
++      is_from_floating,
++      initial_position: Rect::from_xy(200, 200, 600, 400),
++      origin_void_id,
++    }
++  }
++
++  #[test]
++  fn detects_top_center_edges_and_corners() {
++    let work = Rect::from_xy(0, 0, 1920, 1032);
++    let bounds = Rect::from_xy(0, 0, 1920, 1080);
++
++    assert_eq!(
++      detect_screen_zone(&Point { x: 960, y: 4 }, &work, Some(&bounds)),
++      Some(ScreenZone::TopCenter)
++    );
++    assert_eq!(
++      detect_screen_zone(&Point { x: 650, y: 0 }, &work, Some(&bounds)),
++      Some(ScreenZone::TopCenter)
++    );
++    assert_eq!(
++      detect_screen_zone(&Point { x: 300, y: 4 }, &work, Some(&bounds)),
++      Some(ScreenZone::Top)
++    );
++    assert_eq!(
++      detect_screen_zone(&Point { x: 20, y: 10 }, &work, Some(&bounds)),
++      Some(ScreenZone::TopLeft)
++    );
++    assert_eq!(
++      detect_screen_zone(&Point { x: 1910, y: 10 }, &work, Some(&bounds)),
++      Some(ScreenZone::TopRight)
++    );
++    assert_eq!(
++      detect_screen_zone(&Point { x: 10, y: 500 }, &work, Some(&bounds)),
++      Some(ScreenZone::Left)
++    );
++    assert_eq!(
++      detect_screen_zone(&Point { x: 1915, y: 500 }, &work, Some(&bounds)),
++      Some(ScreenZone::Right)
++    );
++    assert_eq!(
++      detect_screen_zone(&Point { x: 960, y: 1030 }, &work, Some(&bounds)),
++      Some(ScreenZone::Bottom)
++    );
++    assert_eq!(
++      detect_screen_zone(
++        &Point { x: 15, y: 1070 },
++        &work,
++        Some(&bounds),
++      ),
++      Some(ScreenZone::BottomLeft)
++    );
++    assert_eq!(
++      detect_screen_zone(
++        &Point { x: 1910, y: 1070 },
++        &work,
++        Some(&bounds),
++      ),
++      Some(ScreenZone::BottomRight)
++    );
++    assert_eq!(
++      detect_screen_zone(&Point { x: 960, y: 500 }, &work, Some(&bounds)),
++      None
++    );
++  }
++
++  #[test]
++  fn floating_drag_ignores_interior_tiles_and_snaps_only_at_edges() {
++    let (state, config, workspace) = setup_state();
++    let tile = TilingWindow::mock()
++      .gaps_config(config.value.gaps.clone())
++      .call();
++    attach_container(
++      &tile.clone().into(),
++      &workspace.clone().into(),
++      None,
++    )
++    .unwrap();
++
++    let floater =
++      add_floating(&workspace, Rect::from_xy(100, 100, 500, 400));
++    let floater_c: WindowContainer = floater.into();
++    let drag = drag_move(true, None);
++
++    // Interior hover over a tile must not trigger for floating drags.
++    let interior = resolve_drop_target(
++      &floater_c,
++      &Point { x: 500, y: 500 },
++      &drag,
++      &state,
++    )
++    .unwrap();
++    assert_eq!(interior, None);
++
++    // Top-center triggers maximize.
++    let top_center = resolve_drop_target(
++      &floater_c,
++      &Point { x: 960, y: 5 },
++      &drag,
++      &state,
++    )
++    .unwrap();
++    assert_eq!(
++      top_center,
++      Some(DropTarget::Maximize {
++        workspace_id: workspace.id(),
++      })
++    );
++
++    // Screen left edge triggers `SnapZone::Left`.
++    let left_edge = resolve_drop_target(
++      &floater_c,
++      &Point { x: 5, y: 500 },
++      &drag,
++      &state,
++    )
++    .unwrap();
++    assert_eq!(
++      left_edge,
++      Some(DropTarget::SnapZone {
++        workspace_id: workspace.id(),
++        zone: ScreenZone::Left,
++      })
++    );
++  }
++
++  #[test]
++  fn edge_and_corner_snapping_populates_voids_matching_preview_rect() {
++    let (mut state, config, workspace) = setup_state();
++
++    // 1. Floating w1 snaps Left on empty workspace -> [w1, Void].
++    let w1 = add_floating(&workspace, Rect::from_xy(100, 100, 500, 400));
++    let drag1 = drag_move(true, None);
++    let target1 = resolve_drop_target(
++      &w1.clone().into(),
++      &Point { x: 4, y: 500 },
++      &drag1,
++      &state,
++    )
++    .unwrap()
++    .unwrap();
++    let preview1 = compute_drop_preview_rect(
++      &target1,
++      &w1.clone().into(),
++      &drag1,
++      &state,
++    )
++    .unwrap()
++    .unwrap();
++    let res1 = finalize_move_drag(
++      &w1,
++      Rect::from_xy(100, 100, 500, 400),
++      &drag1,
++      Some(&Point { x: 4, y: 500 }),
++      &mut state,
++      &config,
++    )
++    .unwrap();
++    assert_eq!(res1.state(), WindowState::Tiling);
++    assert_eq!(res1.to_rect().unwrap(), preview1);
++    assert_eq!(workspace.tiling_children().count(), 2);
++    assert!(first_void_slot(&workspace).is_some());
++
++    // 2. Floating w2 snaps TopRight -> splits right Void.
++    let w2 = add_floating(&workspace, Rect::from_xy(200, 200, 500, 400));
++    let drag2 = drag_move(true, None);
++    let target2 = resolve_drop_target(
++      &w2.clone().into(),
++      &Point { x: 1915, y: 10 },
++      &drag2,
++      &state,
++    )
++    .unwrap()
++    .unwrap();
++    let preview2 = compute_drop_preview_rect(
++      &target2,
++      &w2.clone().into(),
++      &drag2,
++      &state,
++    )
++    .unwrap()
++    .unwrap();
++    let res2 = finalize_move_drag(
++      &w2,
++      Rect::from_xy(200, 200, 500, 400),
++      &drag2,
++      Some(&Point { x: 1915, y: 10 }),
++      &mut state,
++      &config,
++    )
++    .unwrap();
++    assert_eq!(res2.to_rect().unwrap(), preview2);
++
++    // 3. Floating w3 snaps BottomRight -> fills bottom-right Void.
++    let w3 = add_floating(&workspace, Rect::from_xy(300, 300, 500, 400));
++    let drag3 = drag_move(true, None);
++    let target3 = resolve_drop_target(
++      &w3.clone().into(),
++      &Point { x: 1915, y: 1025 },
++      &drag3,
++      &state,
++    )
++    .unwrap()
++    .unwrap();
++    let preview3 = compute_drop_preview_rect(
++      &target3,
++      &w3.clone().into(),
++      &drag3,
++      &state,
++    )
++    .unwrap()
++    .unwrap();
++    let res3 = finalize_move_drag(
++      &w3,
++      Rect::from_xy(300, 300, 500, 400),
++      &drag3,
++      Some(&Point { x: 1915, y: 1025 }),
++      &mut state,
++      &config,
++    )
++    .unwrap();
++    assert_eq!(res3.to_rect().unwrap(), preview3);
++    assert!(first_void_slot(&workspace).is_none());
++  }
++
++  #[test]
++  fn void_lifecycle_horizontal_persists_vertical_auto_maximizes() {
++    let (mut state, config, workspace) = setup_state();
++
++    // Horizontal layout: [a(0.5), b(0.5)]. Closing b leaves a VoidSlot.
++    let a = TilingWindow::mock()
++      .gaps_config(config.value.gaps.clone())
++      .call();
++    let b = TilingWindow::mock()
++      .gaps_config(config.value.gaps.clone())
++      .call();
++    attach_container(&a.clone().into(), &workspace.clone().into(), None)
++      .unwrap();
++    attach_container(&b.clone().into(), &workspace.clone().into(), None)
++      .unwrap();
++
++    unmanage_window(b.into(), &mut state, &config).unwrap();
++    assert!(first_void_slot(&workspace).is_some());
++    assert_eq!(workspace.tiling_windows().count(), 1);
++    assert_eq!(a.state(), WindowState::Tiling);
++
++    // Closing a too clears all voids cleanly.
++    unmanage_window(a.into(), &mut state, &config).unwrap();
++    assert!(first_void_slot(&workspace).is_none());
++    assert_eq!(workspace.tiling_windows().count(), 0);
++
++    // Vertical layout: V[c, d]. Closing d expands c -> auto-maximize.
++    workspace.set_tiling_direction(TilingDirection::Vertical);
++    let c = TilingWindow::mock()
++      .gaps_config(config.value.gaps.clone())
++      .call();
++    let d = TilingWindow::mock()
++      .gaps_config(config.value.gaps.clone())
++      .call();
++    attach_container(&c.clone().into(), &workspace.clone().into(), None)
++      .unwrap();
++    attach_container(&d.clone().into(), &workspace.clone().into(), None)
++      .unwrap();
++    let c_id = c.id();
++
++    unmanage_window(d.into(), &mut state, &config).unwrap();
++    assert!(first_void_slot(&workspace).is_none());
++    let sole_c = state
++      .window_by_id(c_id)
++      .unwrap()
++      .as_non_tiling_window()
++      .unwrap()
++      .clone();
++    assert!(matches!(
++      sole_c.state(),
++      WindowState::Fullscreen(FullscreenStateConfig {
++        maximized: true,
++        ..
++      })
++    ));
++  }
++
++  #[test]
++  fn dragging_tiled_window_over_tile_swaps_slots() {
++    let (mut state, config, workspace) = setup_state();
++
++    let w1 = TilingWindow::mock()
++      .gaps_config(config.value.gaps.clone())
++      .call();
++    let w2 = TilingWindow::mock()
++      .gaps_config(config.value.gaps.clone())
++      .call();
++    attach_container(&w1.clone().into(), &workspace.clone().into(), None)
++      .unwrap();
++    attach_container(&w2.clone().into(), &workspace.clone().into(), None)
++      .unwrap();
++    let w1_id = w1.id();
++    let w2_id = w2.id();
++    let w1_rect = w1.to_rect().unwrap();
++
++    let origin_void_id =
++      vacate_tiling_slot(&w2, &workspace, true, &mut state, &config)
++        .unwrap()
++        .unwrap();
++    let w2_floating = NonTilingWindow::new(
++      Some(w2_id),
++      w2.native().clone(),
++      w2.native_properties().clone(),
++      WindowState::Floating(FloatingStateConfig::default()),
++      None,
++      w2.border_delta(),
++      None,
++      w2.floating_placement(),
++      false,
++      vec![],
++      Some(drag_move(false, Some(origin_void_id))),
++    );
++    attach_container(
++      &w2_floating.clone().into(),
++      &workspace.clone().into(),
++      None,
++    )
++    .unwrap();
++
++    let drag_swap = drag_move(false, Some(origin_void_id));
++    finalize_move_drag(
++      &w2_floating,
++      Rect::from_xy(100, 100, 400, 300),
++      &drag_swap,
++      Some(&w1_rect.center_point()),
++      &mut state,
++      &config,
++    )
++    .unwrap();
++
++    let children: Vec<_> = workspace.tiling_children().collect();
++    assert_eq!(children.len(), 2);
++    assert_eq!(children[0].id(), w2_id);
++    assert_eq!(children[1].id(), w1_id);
++  }
++
++  #[test]
++  fn dragging_tiled_window_to_top_center_maximizes_both() {
++    let (mut state, config, workspace) = setup_state();
++
++    let w1 = TilingWindow::mock()
++      .gaps_config(config.value.gaps.clone())
++      .call();
++    let w2 = TilingWindow::mock()
++      .gaps_config(config.value.gaps.clone())
++      .call();
++    attach_container(&w1.clone().into(), &workspace.clone().into(), None)
++      .unwrap();
++    attach_container(&w2.clone().into(), &workspace.clone().into(), None)
++      .unwrap();
++    let w1_id = w1.id();
++    let w2_id = w2.id();
++
++    w2.set_active_drag(Some(drag_move(false, None)));
++    let w2_float = update_window_state(
++      w2.into(),
++      WindowState::Floating(FloatingStateConfig::default()),
++      &mut state,
++      &config,
++    )
++    .unwrap();
++    let w2_float = w2_float.as_non_tiling_window().unwrap().clone();
++    let drag_max = w2_float.active_drag().unwrap();
++
++    let maxed_w2 = finalize_move_drag(
++      &w2_float,
++      Rect::from_xy(300, 100, 400, 300),
++      &drag_max,
++      Some(&Point { x: 960, y: 4 }),
++      &mut state,
++      &config,
++    )
++    .unwrap();
++
++    assert!(matches!(
++      maxed_w2.state(),
++      WindowState::Fullscreen(FullscreenStateConfig {
++        maximized: true,
++        ..
++      })
++    ));
++    assert!(matches!(
++      state.window_by_id(w1_id).unwrap().state(),
++      WindowState::Fullscreen(FullscreenStateConfig {
++        maximized: true,
++        ..
++      })
++    ));
++    assert!(first_void_slot(&workspace).is_none());
++    assert_eq!(state.focused_container().unwrap().id(), w2_id);
++  }
++}
+diff --git a/packages/wm/src/commands/window/unmanage_window.rs b/packages/wm/src/commands/window/unmanage_window.rs
+index 48e84a2..1ef5ebc 100644
+--- a/packages/wm/src/commands/window/unmanage_window.rs
++++ b/packages/wm/src/commands/window/unmanage_window.rs
+@@ -1,6 +1,7 @@
+ use anyhow::Context;
+ use wm_common::{WindowState, WmEvent};
+ 
++use super::vacate_tiling_slot;
+ use crate::{
+   commands::container::{
+     detach_container, flatten_child_split_containers,
+@@ -8,6 +9,7 @@ use crate::{
+   },
+   models::WindowContainer,
+   traits::{CommonGetters, WindowGetters},
++  user_config::UserConfig,
+   wm_state::WmState,
+ };
+ 
+@@ -15,22 +17,29 @@ use crate::{
+ pub fn unmanage_window(
+   window: WindowContainer,
+   state: &mut WmState,
++  config: &UserConfig,
+ ) -> anyhow::Result<()> {
+-  // Create iterator of parent, grandparent, and great-grandparent.
++  let workspace = window.workspace().context("No workspace.")?;
+   let ancestors = window.ancestors().take(3).collect::<Vec<_>>();
+ 
+   state.clear_window_drag_state(window.id());
+ 
+-  // Get container to switch focus to after the window has been removed.
+-  let focus_target = state.focus_target_after_removal(&window.clone());
++  // Get container ID to switch focus to after the window has been removed.
++  let focus_target_id = state
++    .focus_target_after_removal(&window.clone())
++    .map(|target| target.id());
+ 
+-  detach_container(window.clone().into())?;
++  match &window {
++    WindowContainer::TilingWindow(tiling_window) => {
++      vacate_tiling_slot(tiling_window, &workspace, false, state, config)?;
++    }
++    WindowContainer::NonTilingWindow(_) => {
++      detach_container(window.clone().into())?;
+ 
+-  // After detaching the container, flatten any redundant split containers.
+-  // For example, in the layout V[1 H[2]] where container 1 is detached to
+-  // become V[H[2]], this will then need to be flattened to V[2].
+-  for ancestor in ancestors.iter().rev() {
+-    flatten_child_split_containers(ancestor)?;
++      for ancestor in ancestors.iter().rev() {
++        flatten_child_split_containers(ancestor)?;
++      }
++    }
+   }
+ 
+   state.emit_event(WmEvent::WindowUnmanaged {
+@@ -39,8 +48,11 @@ pub fn unmanage_window(
+     unmanaged_handle: window.native().id().0 as isize,
+   });
+ 
+-  // Reassign focus to suitable target.
+-  if let Some(focus_target) = focus_target {
++  // Reassign focus to suitable target (re-resolving by ID in case the
++  // target auto-maximized from `TilingWindow` to `NonTilingWindow`).
++  if let Some(focus_target) =
++    focus_target_id.and_then(|id| state.container_by_id(id))
++  {
+     set_focused_descendant(&focus_target, None);
+     state.pending_sync.queue_focus_change();
+     state.unmanaged_or_minimized_timestamp =
+@@ -49,14 +61,9 @@ pub fn unmanage_window(
+ 
+   // Sibling containers need to be redrawn if the window was tiling.
+   if window.state() == WindowState::Tiling {
+-    let ancestor_to_redraw = ancestors
+-      .into_iter()
+-      .find(|ancestor| !ancestor.is_detached())
+-      .context("No ancestor to redraw.")?;
+-
+     state
+       .pending_sync
+-      .queue_containers_to_redraw(ancestor_to_redraw.tiling_children());
++      .queue_containers_to_redraw(workspace.tiling_children());
+   }
+ 
+   Ok(())
+diff --git a/packages/wm/src/commands/window/update_window_state.rs b/packages/wm/src/commands/window/update_window_state.rs
+index 80d9f92..b9c5b31 100644
+--- a/packages/wm/src/commands/window/update_window_state.rs
++++ b/packages/wm/src/commands/window/update_window_state.rs
+@@ -2,11 +2,16 @@ use anyhow::Context;
+ use tracing::{info, warn};
+ use wm_common::WindowState;
+ 
++use super::{
++  clear_workspace_voids, first_void_slot, normalize_workspace_voids,
++  replace_tiling_slot, vacate_tiling_slot,
++};
+ use crate::{
+   commands::container::{
+-    move_container_within_tree, replace_container, resize_tiling_container,
++    attach_container, detach_container, move_container_within_tree,
++    replace_container, resize_tiling_container, set_focused_descendant,
+   },
+-  models::{Container, InsertionTarget, WindowContainer},
++  models::{Container, InsertionTarget, VoidSlot, WindowContainer},
+   traits::{CommonGetters, TilingSizeGetters, WindowGetters},
+   user_config::UserConfig,
+   wm_state::WmState,
+@@ -31,11 +36,12 @@ pub fn update_window_state(
+ 
+   match target_state {
+     WindowState::Tiling => set_tiling(&window, state, config),
+-    _ => set_non_tiling(window, target_state, state),
++    _ => set_non_tiling(window, target_state, state, config),
+   }
+ }
+ 
+ /// Updates the state of a window to be `WindowState::Tiling`.
++#[allow(clippy::too_many_lines)]
+ fn set_tiling(
+   window: &WindowContainer,
+   state: &mut WmState,
+@@ -48,16 +54,85 @@ fn set_tiling(
+ 
+   let workspace =
+     window.workspace().context("Window has no workspace.")?;
++  let was_focused = window.has_focus(None);
+ 
+   // Check whether insertion target is still valid.
+   let insertion_target =
+     window.insertion_target().filter(|insertion_target| {
+-      insertion_target
+-        .target_parent
+-        .workspace()
+-        .is_some_and(|workspace| workspace.is_displayed())
++      !insertion_target.target_parent.is_detached()
++        && insertion_target
++          .target_parent
++          .workspace()
++          .is_some_and(|target_ws| target_ws.id() == workspace.id())
+     });
+ 
++  // Check if the previous slot (or any void in the workspace) is an empty
++  // `VoidSlot` ready to receive this window.
++  let target_void = insertion_target
++    .as_ref()
++    .and_then(|target| {
++      let children = target.target_parent.children();
++      let candidate = children
++        .get(target.target_index)
++        .or_else(|| {
++          target
++            .target_index
++            .checked_sub(1)
++            .and_then(|i| children.get(i))
++        });
++      candidate.and_then(|c| c.as_void().cloned())
++    })
++    .or_else(|| first_void_slot(&workspace));
++
++  let tiling_window = window.to_tiling(config.value.gaps.clone());
++
++  if let Some(void_slot) = target_void {
++    detach_container(window.into())?;
++    replace_tiling_slot(&void_slot.into(), &tiling_window.clone().into())?;
++    normalize_workspace_voids(&workspace)?;
++
++    if was_focused {
++      set_focused_descendant(&tiling_window.clone().into(), None);
++    }
++
++    state
++      .pending_sync
++      .queue_containers_to_redraw(workspace.tiling_children())
++      .queue_workspace_to_reorder(workspace);
++
++    return Ok(tiling_window.into());
++  }
++
++  // Hotkey entry onto an empty workspace defaults to half-screen paired
++  // with a `VoidSlot`.
++  if workspace.tiling_children().next().is_none()
++    && window.active_drag().is_none()
++  {
++    detach_container(window.into())?;
++    let void_slot = VoidSlot::new(config.value.gaps.clone());
++    attach_container(
++      &tiling_window.clone().into(),
++      &workspace.clone().into(),
++      Some(0),
++    )?;
++    attach_container(
++      &void_slot.into(),
++      &workspace.clone().into(),
++      Some(1),
++    )?;
++
++    if was_focused {
++      set_focused_descendant(&tiling_window.clone().into(), None);
++    }
++
++    state
++      .pending_sync
++      .queue_containers_to_redraw(workspace.tiling_children())
++      .queue_workspace_to_reorder(workspace);
++
++    return Ok(tiling_window.into());
++  }
++
+   // Get the position in the tree to insert the new tiling window. This
+   // will be the window's previous tiling position if it has one, or
+   // instead beside the last focused tiling window in the workspace.
+@@ -80,8 +155,6 @@ fn set_tiling(
+     // Default to inserting at the end of the workspace.
+     .unwrap_or((workspace.clone().into(), workspace.child_count()));
+ 
+-  let tiling_window = window.to_tiling(config.value.gaps.clone());
+-
+   // Replace the original window with the created tiling window.
+   replace_container(
+     &tiling_window.clone().into(),
+@@ -118,10 +191,12 @@ fn set_tiling(
+ 
+ /// Updates the state of a window to be either `WindowState::Floating`,
+ /// `WindowState::Fullscreen`, or `WindowState::Minimized`.
++#[allow(clippy::too_many_lines)]
+ fn set_non_tiling(
+   window: WindowContainer,
+   target_state: WindowState,
+   state: &mut WmState,
++  config: &UserConfig,
+ ) -> anyhow::Result<WindowContainer> {
+   // A window can only be updated to a minimized state if it is
+   // natively minimized.
+@@ -163,34 +238,52 @@ fn set_non_tiling(
+     }
+     WindowContainer::TilingWindow(window) => {
+       let parent = window.parent().context("No parent")?;
++      let was_focused = window.has_focus(None);
++      let is_active_drag = window.active_drag().is_some();
+ 
+       let non_tiling_window = window.to_non_tiling(
+         target_state.clone(),
+         Some(InsertionTarget {
+-          target_parent: parent.clone(),
++          target_parent: parent,
+           target_index: window.index(),
+           prev_tiling_size: window.tiling_size(),
+           prev_sibling_count: window.tiling_siblings().count(),
+         }),
+       );
+ 
+-      // Non-tiling windows should always be direct children of the
+-      // workspace.
+-      if parent != workspace.clone().into() {
+-        move_container_within_tree(
+-          &window.clone().into(),
+-          &workspace.clone().into(),
+-          workspace.child_count(),
+-          state,
+-        )?;
++      // Vacate the tiling slot BEFORE attaching `non_tiling_window`
++      // (both share the same container ID).
++      let origin_void_id = vacate_tiling_slot(
++        &window,
++        &workspace,
++        is_active_drag,
++        state,
++        config,
++      )?;
++
++      if is_active_drag {
++        if let Some(mut drag) = non_tiling_window.active_drag() {
++          drag.origin_void_id = origin_void_id;
++          non_tiling_window.set_active_drag(Some(drag));
++        }
+       }
+ 
+-      replace_container(
++      // Non-tiling windows should always be direct children of the
++      // workspace.
++      attach_container(
+         &non_tiling_window.clone().into(),
+         &workspace.clone().into(),
+-        window.index(),
++        Some(workspace.child_count()),
+       )?;
+ 
++      if was_focused {
++        set_focused_descendant(&non_tiling_window.clone().into(), None);
++      }
++
++      if workspace.tiling_windows().next().is_none() {
++        clear_workspace_voids(&workspace)?;
++      }
++
+       state
+         .pending_sync
+         .queue_container_to_redraw(non_tiling_window.clone())
+diff --git a/packages/wm/src/commands/window/void_slots.rs b/packages/wm/src/commands/window/void_slots.rs
+new file mode 100644
+index 0000000..5bdbec2
+--- /dev/null
++++ b/packages/wm/src/commands/window/void_slots.rs
+@@ -0,0 +1,536 @@
++use anyhow::Context;
++use uuid::Uuid;
++use wm_common::{FullscreenStateConfig, TilingDirection, WindowState};
++
++use super::update_window_state;
++use crate::{
++  commands::container::{
++    flatten_child_split_containers, flatten_split_container,
++    set_focused_descendant,
++  },
++  models::{
++    Container, DirectionContainer, SplitContainer, TilingContainer,
++    TilingWindow, VoidSlot, Workspace,
++  },
++  traits::{
++    CommonGetters, TilingDirectionGetters, TilingSizeGetters,
++    MIN_TILING_SIZE,
++  },
++  user_config::UserConfig,
++  wm_state::WmState,
++};
++
++/// Returns the first `VoidSlot` descendant within `workspace`, if any.
++#[must_use]
++pub fn first_void_slot(workspace: &Workspace) -> Option<VoidSlot> {
++  workspace
++    .descendants()
++    .find_map(|container| container.as_void().cloned())
++}
++
++/// Finds a `VoidSlot` by ID within `workspace`.
++#[must_use]
++pub fn void_slot_by_id(
++  workspace: &Workspace,
++  void_id: Uuid,
++) -> Option<VoidSlot> {
++  workspace
++    .descendants()
++    .filter_map(|container| container.as_void().cloned())
++    .find(|slot| slot.id() == void_id)
++}
++
++/// Replaces `old_slot` in-place with a detached `new_slot`, preserving
++/// `tiling_size` and updating `child_focus_order` cleanly.
++pub fn replace_tiling_slot(
++  old_slot: &TilingContainer,
++  new_slot: &TilingContainer,
++) -> anyhow::Result<()> {
++  if !new_slot.is_detached() {
++    anyhow::bail!("Replacement tiling slot must be detached.");
++  }
++
++  let parent = old_slot.parent().context("Old slot has no parent.")?;
++  let index = old_slot.index();
++  let preserved_size = old_slot.tiling_size();
++
++  let old_focus_index = parent
++    .borrow_child_focus_order()
++    .iter()
++    .position(|id| *id == old_slot.id());
++
++  if let Some(slot) = parent.borrow_children_mut().get_mut(index) {
++    *slot = new_slot.clone().into();
++  }
++  *new_slot.borrow_parent_mut() = Some(parent.clone());
++  *old_slot.borrow_parent_mut() = None;
++  new_slot.set_tiling_size(preserved_size);
++
++  let mut focus_order = parent.borrow_child_focus_order_mut();
++  focus_order.retain(|id| *id != old_slot.id());
++  if !new_slot.is_void() {
++    match old_focus_index {
++      Some(focus_idx) => {
++        let clamped_idx = focus_idx.min(focus_order.len());
++        focus_order.insert(clamped_idx, new_slot.id());
++      }
++      None => focus_order.push_back(new_slot.id()),
++    }
++  }
++
++  Ok(())
++}
++
++/// Swaps two attached `TilingContainer`s in-place, exchanging their
++/// parents, sibling indices, and `tiling_size` values.
++pub fn swap_tiling_containers(
++  first: &TilingContainer,
++  second: &TilingContainer,
++) -> anyhow::Result<()> {
++  if first.id() == second.id() {
++    return Ok(());
++  }
++
++  let parent_a = first.parent().context("First container has no parent.")?;
++  let parent_b =
++    second.parent().context("Second container has no parent.")?;
++  let index_a = first.index();
++  let index_b = second.index();
++  let size_a = first.tiling_size();
++  let size_b = second.tiling_size();
++
++  let focus_a = parent_a
++    .borrow_child_focus_order()
++    .iter()
++    .position(|id| *id == first.id());
++  let focus_b = parent_b
++    .borrow_child_focus_order()
++    .iter()
++    .position(|id| *id == second.id());
++
++  if parent_a.id() == parent_b.id() {
++    let mut children = parent_a.borrow_children_mut();
++    if let Some(slot) = children.get_mut(index_a) {
++      *slot = second.clone().into();
++    }
++    if let Some(slot) = children.get_mut(index_b) {
++      *slot = first.clone().into();
++    }
++  } else {
++    if let Some(slot) = parent_a.borrow_children_mut().get_mut(index_a) {
++      *slot = second.clone().into();
++    }
++    if let Some(slot) = parent_b.borrow_children_mut().get_mut(index_b) {
++      *slot = first.clone().into();
++    }
++    *first.borrow_parent_mut() = Some(parent_b.clone());
++    *second.borrow_parent_mut() = Some(parent_a.clone());
++  }
++
++  first.set_tiling_size(size_b);
++  second.set_tiling_size(size_a);
++
++  if parent_a.id() == parent_b.id() {
++    if !first.is_void() && !second.is_void() {
++      let mut order = parent_a.borrow_child_focus_order_mut();
++      if let (Some(idx_a), Some(idx_b)) = (focus_a, focus_b) {
++        if let Some(slot) = order.get_mut(idx_a) {
++          *slot = second.id();
++        }
++        if let Some(slot) = order.get_mut(idx_b) {
++          *slot = first.id();
++        }
++      }
++    }
++  } else {
++    {
++      let mut order_a = parent_a.borrow_child_focus_order_mut();
++      order_a.retain(|id| *id != first.id());
++      if !second.is_void() {
++        match focus_a {
++          Some(idx) => order_a.insert(idx.min(order_a.len()), second.id()),
++          None => order_a.push_back(second.id()),
++        }
++      }
++    }
++    {
++      let mut order_b = parent_b.borrow_child_focus_order_mut();
++      order_b.retain(|id| *id != second.id());
++      if !first.is_void() {
++        match focus_b {
++          Some(idx) => order_b.insert(idx.min(order_b.len()), first.id()),
++          None => order_b.push_back(first.id()),
++        }
++      }
++    }
++  }
++
++  Ok(())
++}
++
++/// Detaches `container` from its parent, preferring non-void tiling
++/// siblings when redistributing `container.tiling_size()`.
++///
++/// Flattens a single-child `SplitContainer` parent if left behind.
++pub fn detach_tiling_preferring_non_void_siblings(
++  container: &TilingContainer,
++) -> anyhow::Result<Option<Container>> {
++  let parent = container.parent().context("Container has no parent.")?;
++  let freed_size = container.tiling_size();
++
++  parent
++    .borrow_children_mut()
++    .retain(|child| child.id() != container.id());
++  parent
++    .borrow_child_focus_order_mut()
++    .retain(|id| *id != container.id());
++  *container.borrow_parent_mut() = None;
++
++  let non_void_siblings: Vec<TilingContainer> = parent
++    .tiling_children()
++    .filter(|sibling| !sibling.is_void())
++    .collect();
++
++  let recipients = if non_void_siblings.is_empty() {
++    parent.tiling_children().collect::<Vec<_>>()
++  } else {
++    non_void_siblings
++  };
++
++  if !recipients.is_empty() {
++    let available_size: f32 = recipients
++      .iter()
++      .map(|sibling| sibling.tiling_size() - MIN_TILING_SIZE)
++      .sum();
++
++    if available_size > f32::EPSILON {
++      for sibling in &recipients {
++        let factor =
++          (sibling.tiling_size() - MIN_TILING_SIZE) / available_size;
++        let next_size = sibling.tiling_size() + factor * freed_size;
++        sibling.set_tiling_size(next_size);
++      }
++    } else {
++      #[allow(clippy::cast_precision_loss)]
++      let even_delta = freed_size / recipients.len() as f32;
++      for sibling in &recipients {
++        sibling.set_tiling_size(sibling.tiling_size() + even_delta);
++      }
++    }
++  }
++
++  if let Ok(split_parent) = parent.as_split().cloned() {
++    if !split_parent.has_children() {
++      let grandparent = split_parent.parent();
++      if let Some(gp) = &grandparent {
++        gp.borrow_children_mut()
++          .retain(|child| child.id() != split_parent.id());
++        gp.borrow_child_focus_order_mut()
++          .retain(|id| *id != split_parent.id());
++      }
++      *split_parent.borrow_parent_mut() = None;
++      return Ok(grandparent);
++    }
++    if split_parent.child_count() == 1 {
++      let grandparent = split_parent.parent();
++      flatten_split_container(split_parent)?;
++      return Ok(grandparent);
++    }
++  }
++
++  Ok(Some(parent))
++}
++
++/// Removes all `VoidSlot`s and any empty `SplitContainer`s from
++/// `workspace`.
++pub fn clear_workspace_voids(workspace: &Workspace) -> anyhow::Result<()> {
++  let voids: Vec<VoidSlot> = workspace
++    .descendants()
++    .filter_map(|container| container.as_void().cloned())
++    .collect();
++
++  for void_slot in voids {
++    if let Some(parent) = void_slot.parent() {
++      parent
++        .borrow_children_mut()
++        .retain(|child| child.id() != void_slot.id());
++      parent
++        .borrow_child_focus_order_mut()
++        .retain(|id| *id != void_slot.id());
++      *void_slot.borrow_parent_mut() = None;
++    }
++  }
++
++  loop {
++    let empty_splits: Vec<SplitContainer> = workspace
++      .descendants()
++      .filter_map(|container| container.as_split().cloned())
++      .filter(|split| !split.has_children())
++      .collect();
++
++    if empty_splits.is_empty() {
++      break;
++    }
++
++    for split in empty_splits {
++      if let Some(parent) = split.parent() {
++        parent
++          .borrow_children_mut()
++          .retain(|child| child.id() != split.id());
++        parent
++          .borrow_child_focus_order_mut()
++          .retain(|id| *id != split.id());
++        *split.borrow_parent_mut() = None;
++      }
++    }
++  }
++
++  Ok(())
++}
++
++/// Merges adjacent `VoidSlot`s, removes empty splits, and flattens single
++/// or same-direction child splits within `workspace`.
++///
++/// Clears all voids if no tiling windows remain in `workspace`.
++pub fn normalize_workspace_voids(
++  workspace: &Workspace,
++) -> anyhow::Result<()> {
++  if workspace.tiling_windows().next().is_none() {
++    return clear_workspace_voids(workspace);
++  }
++
++  loop {
++    let mut changed = false;
++
++    let mut dir_containers: Vec<DirectionContainer> =
++      vec![workspace.clone().into()];
++    dir_containers.extend(
++      workspace
++        .descendants()
++        .filter_map(|container| container.as_split().cloned())
++        .map(DirectionContainer::from),
++    );
++
++    for dir_container in dir_containers {
++      if dir_container.is_detached() {
++        continue;
++      }
++
++      if merge_adjacent_voids(&dir_container) {
++        changed = true;
++      }
++
++      if let Ok(split) = dir_container.as_split().cloned() {
++        if !split.has_children() {
++          if let Some(parent) = split.parent() {
++            parent
++              .borrow_children_mut()
++              .retain(|child| child.id() != split.id());
++            parent
++              .borrow_child_focus_order_mut()
++              .retain(|id| *id != split.id());
++            *split.borrow_parent_mut() = None;
++            changed = true;
++            continue;
++          }
++        } else if split.child_count() == 1 {
++          flatten_split_container(split)?;
++          changed = true;
++          continue;
++        }
++      }
++
++      let parent_dir = dir_container.tiling_direction();
++      let tiling_children =
++        dir_container.tiling_children().collect::<Vec<_>>();
++      let single_split =
++        tiling_children.len() == 1 && tiling_children[0].is_split();
++      let same_dir_split = tiling_children.iter().any(|child| {
++        child
++          .as_split()
++          .is_ok_and(|split| split.tiling_direction() == parent_dir)
++      });
++
++      if single_split || same_dir_split {
++        flatten_child_split_containers(&dir_container.into())?;
++        changed = true;
++      }
++    }
++
++    if !changed {
++      break;
++    }
++  }
++
++  Ok(())
++}
++
++fn merge_adjacent_voids(dir_container: &DirectionContainer) -> bool {
++  let children: Vec<Container> =
++    dir_container.children().into_iter().collect();
++  let mut merged = false;
++  let mut current_void: Option<VoidSlot> = None;
++
++  for child in children {
++    if let Some(void_slot) = child.as_void() {
++      if let Some(anchor) = &current_void {
++        anchor
++          .set_tiling_size(anchor.tiling_size() + void_slot.tiling_size());
++        dir_container
++          .borrow_children_mut()
++          .retain(|c| c.id() != void_slot.id());
++        *void_slot.borrow_parent_mut() = None;
++        merged = true;
++      } else {
++        current_void = Some(void_slot.clone());
++      }
++    } else if child.as_tiling_container().is_ok() {
++      current_void = None;
++    }
++  }
++
++  merged
++}
++
++/// Automatically maximizes the sole remaining tiling window in `workspace`
++/// when no voids remain after a void-fill expansion.
++///
++/// Preserves focus on `preferred_front_id` when specified (e.g. a newly
++/// maximized or dragged floating window).
++pub fn auto_maximize_sole_window(
++  workspace: &Workspace,
++  preferred_front_id: Option<Uuid>,
++  state: &mut WmState,
++  config: &UserConfig,
++) -> anyhow::Result<bool> {
++  if first_void_slot(workspace).is_some() {
++    return Ok(false);
++  }
++
++  let mut tiling_windows = workspace.tiling_windows();
++  let Some(sole_window) = tiling_windows.next() else {
++    return Ok(false);
++  };
++  if tiling_windows.next().is_some() {
++    return Ok(false);
++  }
++
++  let was_sole_focused = sole_window.has_focus(None);
++  let fullscreen_state = WindowState::Fullscreen(FullscreenStateConfig {
++    maximized: true,
++    ..config.value.window_behavior.state_defaults.fullscreen
++  });
++
++  let maximized = update_window_state(
++    sole_window.into(),
++    fullscreen_state,
++    state,
++    config,
++  )?;
++
++  if let Some(front_id) = preferred_front_id {
++    if let Some(front_container) = state.container_by_id(front_id) {
++      set_focused_descendant(&front_container, None);
++    }
++  } else if was_sole_focused {
++    set_focused_descendant(&maximized.clone().into(), None);
++  }
++
++  state
++    .pending_sync
++    .queue_container_to_redraw(maximized)
++    .queue_workspace_to_reorder(workspace.clone());
++
++  Ok(true)
++}
++
++/// Detaches a `TilingWindow` from `workspace` according to the void
++/// lifecycle rules:
++/// - If it has vertical neighbors, those neighbors expand to fill its slot
++///   (and auto-maximize if only one tiling window remains with no voids).
++/// - Otherwise, its slot becomes a `VoidSlot` (cleared when no tiling
++///   windows remain in `workspace`).
++///
++/// Returns the created `VoidSlot` ID when `preserve_origin_void` is `true`
++/// and a void was left in place.
++pub fn vacate_tiling_slot(
++  window: &TilingWindow,
++  workspace: &Workspace,
++  preserve_origin_void: bool,
++  state: &mut WmState,
++  config: &UserConfig,
++) -> anyhow::Result<Option<Uuid>> {
++  let parent = window.parent().context("Window has no parent.")?;
++  let has_vertical_neighbors =
++    parent.as_direction_container().is_ok_and(|dir| {
++      dir.tiling_direction() == TilingDirection::Vertical
++        && parent
++          .tiling_children()
++          .any(|child| child.id() != window.id() && !child.is_void())
++    });
++
++  if has_vertical_neighbors {
++    detach_tiling_preferring_non_void_siblings(&window.clone().into())?;
++    normalize_workspace_voids(workspace)?;
++    state
++      .pending_sync
++      .queue_containers_to_redraw(workspace.tiling_children());
++    auto_maximize_sole_window(workspace, None, state, config)?;
++    return Ok(None);
++  }
++
++  let void_slot = VoidSlot::new(config.value.gaps.clone());
++  let void_id = void_slot.id();
++  replace_tiling_slot(&window.clone().into(), &void_slot.into())?;
++
++  if workspace.tiling_windows().next().is_none() {
++    clear_workspace_voids(workspace)?;
++    return Ok(None);
++  }
++
++  if !preserve_origin_void {
++    normalize_workspace_voids(workspace)?;
++  }
++
++  state
++    .pending_sync
++    .queue_containers_to_redraw(workspace.tiling_children());
++
++  Ok(Some(void_id))
++}
++
++/// Collapses an active drag's origin `VoidSlot` so its remaining neighbors
++/// expand to fill the slot (and auto-maximize if one tiling window
++/// remains).
++pub fn collapse_origin_void(
++  origin_void_id: Uuid,
++  workspace: &Workspace,
++  preferred_front_id: Option<Uuid>,
++  state: &mut WmState,
++  config: &UserConfig,
++) -> anyhow::Result<bool> {
++  let Some(void_slot) = void_slot_by_id(workspace, origin_void_id) else {
++    return Ok(false);
++  };
++
++  let had_siblings = void_slot
++    .tiling_siblings()
++    .any(|sibling| !sibling.is_void());
++
++  detach_tiling_preferring_non_void_siblings(&void_slot.into())?;
++  normalize_workspace_voids(workspace)?;
++  state
++    .pending_sync
++    .queue_containers_to_redraw(workspace.tiling_children());
++
++  if had_siblings {
++    auto_maximize_sole_window(
++      workspace,
++      preferred_front_id,
++      state,
++      config,
++    )?;
++  }
++
++  Ok(true)
++}
+diff --git a/packages/wm/src/events/handle_mouse_move.rs b/packages/wm/src/events/handle_mouse_move.rs
+index 34648a0..d995299 100644
+--- a/packages/wm/src/events/handle_mouse_move.rs
++++ b/packages/wm/src/events/handle_mouse_move.rs
+@@ -13,7 +13,9 @@ use wm_platform::{MouseButton, MouseEvent};
+ use crate::events::handle_window_moved_or_resized_end;
+ #[cfg(target_os = "windows")]
+ use crate::{
+-  commands::window::update_window_state,
++  commands::window::{
++    finalize_move_drag, update_drag_snap_preview, update_window_state,
++  },
+   events::update_floating_window_position,
+   models::WindowContainer,
+   wm_state::{ManualWindowDrag, PendingMaximizeDrag},
+@@ -38,7 +40,7 @@ pub fn handle_mouse_move(
+   }
+ 
+   #[cfg(target_os = "windows")]
+-  if handle_windows_mouse_button(event, state)? {
++  if handle_windows_mouse_button(event, state, config)? {
+     return Ok(());
+   }
+ 
+@@ -154,6 +156,7 @@ pub fn handle_mouse_move(
+ fn handle_windows_mouse_button(
+   event: &MouseEvent,
+   state: &mut WmState,
++  config: &UserConfig,
+ ) -> anyhow::Result<bool> {
+   match event {
+     MouseEvent::ButtonDown {
+@@ -161,16 +164,17 @@ fn handle_windows_mouse_button(
+       position,
+       ..
+     } => {
+-      handle_windows_left_down(position, state)?;
++      handle_windows_left_down(position, state, config)?;
+       Ok(true)
+     }
+     MouseEvent::ButtonUp {
+       button: MouseButton::Left,
++      position,
+       ..
+     } => {
+       state.pending_maximize_drag = None;
+       if state.active_manual_drag.is_some() {
+-        finish_manual_drag(state)?;
++        finish_manual_drag(Some(position), state, config)?;
+       }
+       Ok(true)
+     }
+@@ -182,11 +186,12 @@ fn handle_windows_mouse_button(
+ fn handle_windows_left_down(
+   position: &Point,
+   state: &mut WmState,
++  config: &UserConfig,
+ ) -> anyhow::Result<()> {
+   state.pending_maximize_drag = None;
+ 
+   if state.active_manual_drag.is_some() {
+-    finish_manual_drag(state)?;
++    finish_manual_drag(Some(position), state, config)?;
+   }
+ 
+   // Skip if another window is already in a native drag.
+@@ -238,18 +243,20 @@ fn handle_drag_move(
+     if !pressed_buttons.contains(&MouseButton::Left)
+       || !state.dispatcher.is_mouse_down(&MouseButton::Left)
+     {
+-      finish_manual_drag(state)?;
++      finish_manual_drag(Some(position), state, config)?;
+       return Ok(false);
+     }
+ 
+     let Some(window) = state.window_by_id(drag.window_id) else {
+       state.active_manual_drag = None;
++      state.dispatcher.hide_snap_overlay();
+       return Ok(false);
+     };
+ 
+     let native = window.native();
+     if !native.is_valid() {
+       state.active_manual_drag = None;
++      state.dispatcher.hide_snap_overlay();
+       return Ok(false);
+     }
+ 
+@@ -257,6 +264,9 @@ fn handle_drag_move(
+       position.x - drag.cursor_offset_x,
+       position.y - drag.cursor_offset_y,
+     );
++    drop(native);
++
++    update_drag_snap_preview(&window, Some(position), state)?;
+ 
+     return Ok(true);
+   }
+@@ -384,6 +394,7 @@ fn start_maximize_drag(
+     operation: Some(ActiveDragOperation::Move),
+     is_from_floating: true,
+     initial_position: restored_frame,
++    origin_void_id: None,
+   }));
+ 
+   let window = update_window_state(
+@@ -408,7 +419,13 @@ fn start_maximize_drag(
+ }
+ 
+ #[cfg(target_os = "windows")]
+-fn finish_manual_drag(state: &mut WmState) -> anyhow::Result<()> {
++fn finish_manual_drag(
++  cursor_override: Option<&Point>,
++  state: &mut WmState,
++  config: &UserConfig,
++) -> anyhow::Result<()> {
++  state.dispatcher.hide_snap_overlay();
++
+   let Some(drag) = state.active_manual_drag.take() else {
+     return Ok(());
+   };
+@@ -434,19 +451,36 @@ fn finish_manual_drag(state: &mut WmState) -> anyhow::Result<()> {
+     }
+   });
+ 
+-  window.set_active_drag(None);
+-
+-  if let WindowContainer::NonTilingWindow(non_tiling) = window {
+-    let nearest_monitor = state
+-      .nearest_monitor(&non_tiling.native())
+-      .context("Failed to get workspace of nearest monitor.")?;
++  let active_drag = window.active_drag();
+ 
+-    update_floating_window_position(
+-      &non_tiling,
++  if let (
++    Some(active_drag),
++    WindowContainer::NonTilingWindow(non_tiling),
++  ) = (active_drag, &window)
++  {
++    finalize_move_drag(
++      non_tiling,
+       frame,
+-      &nearest_monitor,
++      &active_drag,
++      cursor_override,
+       state,
++      config,
+     )?;
++  } else {
++    window.set_active_drag(None);
++
++    if let WindowContainer::NonTilingWindow(non_tiling) = window {
++      let nearest_monitor = state
++        .nearest_monitor(&non_tiling.native())
++        .context("Failed to get workspace of nearest monitor.")?;
++
++      update_floating_window_position(
++        &non_tiling,
++        frame,
++        &nearest_monitor,
++        state,
++      )?;
++    }
+   }
+ 
+   Ok(())
+diff --git a/packages/wm/src/events/handle_window_destroyed.rs b/packages/wm/src/events/handle_window_destroyed.rs
+index f925bb0..7b9fbea 100644
+--- a/packages/wm/src/events/handle_window_destroyed.rs
++++ b/packages/wm/src/events/handle_window_destroyed.rs
+@@ -5,12 +5,14 @@ use wm_platform::WindowId;
+ use crate::{
+   commands::{window::unmanage_window, workspace::deactivate_workspace},
+   traits::{CommonGetters, WindowGetters},
++  user_config::UserConfig,
+   wm_state::WmState,
+ };
+ 
+ pub fn handle_window_destroyed(
+   native_window_id: WindowId,
+   state: &mut WmState,
++  config: &UserConfig,
+ ) -> anyhow::Result<()> {
+   let found_window = state
+     .windows()
+@@ -22,7 +24,7 @@ pub fn handle_window_destroyed(
+     let workspace = window.workspace().context("No workspace.")?;
+ 
+     info!("Window closed: {window}");
+-    unmanage_window(window, state)?;
++    unmanage_window(window, state, config)?;
+ 
+     // Destroy parent workspace if window was killed while its workspace
+     // was not displayed (e.g. via task manager).
+diff --git a/packages/wm/src/events/handle_window_hidden.rs b/packages/wm/src/events/handle_window_hidden.rs
+index 26aa7f5..881af51 100644
+--- a/packages/wm/src/events/handle_window_hidden.rs
++++ b/packages/wm/src/events/handle_window_hidden.rs
+@@ -32,7 +32,7 @@ pub fn handle_window_hidden(
+       || window.display_state() == DisplayState::Shown)
+       && !window.native().is_visible().unwrap_or(false)
+     {
+-      unmanage_window(window, state)?;
++      unmanage_window(window, state, config)?;
+     }
+   }
+ 
+diff --git a/packages/wm/src/events/handle_window_moved_or_resized.rs b/packages/wm/src/events/handle_window_moved_or_resized.rs
+index c757341..7c6d388 100644
+--- a/packages/wm/src/events/handle_window_moved_or_resized.rs
++++ b/packages/wm/src/events/handle_window_moved_or_resized.rs
+@@ -12,7 +12,7 @@ use wm_platform::{NativeWindow, Rect};
+ use crate::{
+   commands::{
+     container::{flatten_split_container, move_container_within_tree},
+-    window::update_window_state,
++    window::{update_drag_snap_preview, update_window_state},
+   },
+   events::handle_window_moved_or_resized_end,
+   models::{Monitor, NonTilingWindow, WindowContainer},
+@@ -188,12 +188,15 @@ pub fn handle_window_moved_or_resized(
+     if is_drag_start {
+       tracing::info!("Window started dragging: {window}");
+ 
++      let is_from_floating = matches!(
++        window.state(),
++        WindowState::Floating(_)
++      ) || (matches!(window.state(), WindowState::Fullscreen(_))
++        && !matches!(window.prev_state(), Some(WindowState::Tiling)));
++
+       window.set_active_drag(Some(ActiveDrag {
+         operation: None,
+-        is_from_floating: matches!(
+-          window.state(),
+-          WindowState::Floating(_)
+-        ),
++        is_from_floating,
+         #[cfg(target_os = "windows")]
+         initial_position: old_frame_position.clone(),
+         // The updated frame position is used here instead of the initial
+@@ -204,6 +207,7 @@ pub fn handle_window_moved_or_resized(
+         // `WindowEvent::MovedOrResized` event.
+         #[cfg(target_os = "macos")]
+         initial_position: frame_position.clone(),
++        origin_void_id: None,
+       }));
+ 
+       #[cfg(target_os = "windows")]
+@@ -423,6 +427,7 @@ pub fn update_floating_window_position(
+ /// This function determines whether a window is being moved or resized and
+ /// updates its operation state accordingly. If the window is being moved,
+ /// it's set to floating mode.
++#[allow(clippy::too_many_lines)]
+ fn update_drag_state(
+   window: &WindowContainer,
+   frame_position: &Rect,
+@@ -464,7 +469,9 @@ fn update_drag_state(
+   // after it has been moved at least 10px from its initial position. The
+   // 10px threshold is to account for small movements that may be
+   // accidental.
+-  if is_move && !matches!(window.state(), WindowState::Floating(_)) {
++  let active_window = if is_move
++    && !matches!(window.state(), WindowState::Floating(_))
++  {
+     let move_distance = frame_position
+       .center_point()
+       .distance_between(&active_drag.initial_position.center_point());
+@@ -487,7 +494,7 @@ fn update_drag_state(
+         matches!(window.state(), WindowState::Fullscreen(_))
+           && !is_maximized;
+ 
+-      let window = update_window_state(
++      let updated = update_window_state(
+         window.clone(),
+         WindowState::Floating(FloatingStateConfig {
+           centered: false,
+@@ -504,30 +511,33 @@ fn update_drag_state(
+       if !is_fullscreen {
+         state
+           .pending_sync
+-          .dequeue_container_from_redraw(window.clone());
++          .dequeue_container_from_redraw(updated.clone());
+       }
+ 
+       // Flatten the parent split container if it only contains the window.
+-      // TODO: Consider doing this to `move_container_within_tree`, so that
+-      // the behavior is consistent.
+       if let Some(split_parent) = parent.as_split() {
+-        if split_parent.child_count() == 1 {
++        if !split_parent.is_detached() && split_parent.child_count() == 1 {
+           flatten_split_container(split_parent.clone())?;
+ 
+-          // Hacky fix to redraw siblings after flattening. The parent is
+-          // queued for redraw from the state change, which gets detached
+-          // on flatten.
+-          // TODO: Change `queue_containers_to_redraw` to iterate over its
+-          // descendant windows and store those instead.
+           state
+             .pending_sync
+-            .queue_containers_to_redraw(window.tiling_siblings());
++            .queue_containers_to_redraw(updated.tiling_siblings());
+         }
+       }
++
++      updated
++    } else {
++      window.clone()
+     }
++  } else {
++    window.clone()
++  };
++
++  if is_move && matches!(active_window.state(), WindowState::Floating(_)) {
++    update_drag_snap_preview(&active_window, None, state)?;
+   } else if !is_move {
+     update_live_resize(
+-      window,
++      &active_window,
+       frame_position,
+       &active_drag.initial_position,
+       state,
+diff --git a/packages/wm/src/events/handle_window_moved_or_resized_end.rs b/packages/wm/src/events/handle_window_moved_or_resized_end.rs
+index 3dbbb4a..4c06c73 100644
+--- a/packages/wm/src/events/handle_window_moved_or_resized_end.rs
++++ b/packages/wm/src/events/handle_window_moved_or_resized_end.rs
+@@ -1,35 +1,25 @@
+ use anyhow::Context;
+ use wm_common::{
+   try_warn, ActiveDrag, ActiveDragOperation, FullscreenStateConfig,
+-  TilingDirection, WindowState,
++  WindowState,
+ };
+-use wm_platform::{LengthValue, Point, Rect};
++use wm_platform::LengthValue;
+ 
+ use crate::{
+-  commands::{
+-    container::{move_container_within_tree, wrap_in_split_container},
+-    window::{set_window_size, update_window_state},
++  commands::window::{
++    collapse_origin_void, finalize_move_drag, set_window_size,
++    update_window_state,
+   },
+   events::{update_floating_window_position, update_live_resize},
+-  models::{
+-    DirectionContainer, NonTilingWindow, SplitContainer, TilingContainer,
+-    TilingWindow, WindowContainer,
+-  },
+-  traits::{
+-    CommonGetters, PositionGetters, TilingDirectionGetters, WindowGetters,
+-  },
++  models::{TilingWindow, WindowContainer},
++  traits::{CommonGetters, WindowGetters},
+   user_config::UserConfig,
+   wm_state::WmState,
+ };
+ 
+ /// Handles the event for when a window is finished being moved or resized
+ /// by the user (e.g. via the window's drag handles).
+-///
+-/// This resizes the window if it's a tiling window and attach a dragged
+-/// floating window.
+-///
+-/// TODO: Move this to a better location - maybe a new `active_drag_ext`
+-/// mod.
++#[allow(clippy::too_many_lines)]
+ pub fn handle_window_moved_or_resized_end(
+   window: &WindowContainer,
+   state: &mut WmState,
+@@ -39,6 +29,8 @@ pub fn handle_window_moved_or_resized_end(
+     return Ok(());
+   };
+ 
++  state.dispatcher.hide_snap_overlay();
++
+   match &window {
+     WindowContainer::NonTilingWindow(window) => {
+       let is_maximized = try_warn!(window.native().is_maximized());
+@@ -72,7 +64,7 @@ pub fn handle_window_moved_or_resized_end(
+             .clone()
+         };
+ 
+-        let window = update_window_state(
++        let updated = update_window_state(
+           window.clone().into(),
+           WindowState::Fullscreen(FullscreenStateConfig {
+             maximized: is_maximized,
+@@ -82,24 +74,34 @@ pub fn handle_window_moved_or_resized_end(
+           config,
+         )?;
+ 
+-        window.set_active_drag(None);
++        if let (Some(origin_void_id), Some(workspace)) =
++          (active_drag.origin_void_id, updated.workspace())
++        {
++          collapse_origin_void(
++            origin_void_id,
++            &workspace,
++            Some(updated.id()),
++            state,
++            config,
++          )?;
++        }
++
++        updated.set_active_drag(None);
+ 
+         if is_maximized {
+           // Dequeue the window from redraw if it's maximized, since the
+           // window is already in the correct state.
+           state
+             .pending_sync
+-            .dequeue_container_from_redraw(window.clone());
++            .dequeue_container_from_redraw(updated);
+         } else {
+-          // Force a redraw to snap the window to the monitor edges.
+-          // TODO: Skip redraw if it's already matches fullscreen frame.
+-          state.pending_sync.queue_container_to_redraw(window.clone());
++          state.pending_sync.queue_container_to_redraw(updated);
+         }
+ 
+         return Ok(());
+       }
+ 
+-      if active_drag.is_from_floating {
++      if active_drag.operation == Some(ActiveDragOperation::Resize) {
+         update_floating_window_position(
+           window,
+           window.native_properties().frame,
+@@ -108,10 +110,14 @@ pub fn handle_window_moved_or_resized_end(
+         )?;
+         window.set_active_drag(None);
+       } else {
+-        // Window is a temporary floating window that should be
+-        // reverted back to tiling.
+-        let window = drop_as_tiling_window(window, state, config)?;
+-        window.set_active_drag(None);
++        finalize_move_drag(
++          window,
++          window.native_properties().frame,
++          &active_drag,
++          None,
++          state,
++          config,
++        )?;
+       }
+     }
+     WindowContainer::TilingWindow(window) => {
+@@ -169,175 +175,3 @@ fn finish_tiling_window_drag(
+ 
+   Ok(())
+ }
+-
+-/// Handles transition from temporary floating window to tiling window on
+-/// drag end.
+-#[allow(clippy::too_many_lines)]
+-fn drop_as_tiling_window(
+-  moved_window: &NonTilingWindow,
+-  state: &mut WmState,
+-  config: &UserConfig,
+-) -> anyhow::Result<WindowContainer> {
+-  tracing::info!(
+-    "Tiling window drag ended: {}",
+-    moved_window.as_window_container()?
+-  );
+-
+-  let mouse_pos = state.dispatcher.cursor_position()?;
+-  let mouse_workspace = state
+-    .monitor_at_point(&mouse_pos)
+-    .and_then(|monitor| monitor.displayed_workspace())
+-    .or_else(|| moved_window.workspace())
+-    .context("Couldn't find workspace for window drop.")?;
+-
+-  // Get the workspace, split containers, and other windows under the
+-  // dragged window.
+-  let containers_at_pos = state
+-    .containers_at_point(&mouse_workspace.clone().into(), &mouse_pos)
+-    .into_iter()
+-    .filter(|container| container.id() != moved_window.id());
+-
+-  // Get the deepest direction container under the dragged window.
+-  let target_parent: DirectionContainer = containers_at_pos
+-    .filter_map(|container| container.as_direction_container().ok())
+-    .fold(mouse_workspace.into(), |acc, container| {
+-      if container.ancestors().count() > acc.ancestors().count() {
+-        container
+-      } else {
+-        acc
+-      }
+-    });
+-
+-  // If the target parent has no children (i.e. an empty workspace), then
+-  // add the window directly.
+-  if target_parent.tiling_children().count() == 0 {
+-    move_container_within_tree(
+-      &moved_window.clone().into(),
+-      &target_parent.clone().into(),
+-      0,
+-      state,
+-    )?;
+-
+-    moved_window.set_insertion_target(None);
+-
+-    return update_window_state(
+-      moved_window.as_window_container()?,
+-      WindowState::Tiling,
+-      state,
+-      config,
+-    );
+-  }
+-
+-  let nearest_container = target_parent
+-    .children()
+-    .into_iter()
+-    .filter_map(|container| container.as_tiling_container().ok())
+-    .try_fold(None, |acc: Option<TilingContainer>, container| match acc {
+-      Some(acc) => {
+-        let is_nearer = acc.to_rect()?.distance_to_point(&mouse_pos)
+-          < container.to_rect()?.distance_to_point(&mouse_pos);
+-
+-        anyhow::Ok(Some(if is_nearer { acc } else { container }))
+-      }
+-      None => Ok(Some(container)),
+-    })?
+-    .context("No nearest container.")?;
+-
+-  let tiling_direction = target_parent.tiling_direction();
+-  let drop_position =
+-    drop_position(&mouse_pos, &nearest_container.to_rect()?);
+-
+-  let moved_window = update_window_state(
+-    moved_window.clone().into(),
+-    WindowState::Tiling,
+-    state,
+-    config,
+-  )?;
+-
+-  let should_split = nearest_container.is_tiling_window()
+-    && match tiling_direction {
+-      TilingDirection::Horizontal => {
+-        drop_position == DropPosition::Top
+-          || drop_position == DropPosition::Bottom
+-      }
+-      TilingDirection::Vertical => {
+-        drop_position == DropPosition::Left
+-          || drop_position == DropPosition::Right
+-      }
+-    };
+-
+-  if should_split {
+-    let split_container = SplitContainer::new(
+-      tiling_direction.inverse(),
+-      config.value.gaps.clone(),
+-    );
+-
+-    wrap_in_split_container(
+-      &split_container,
+-      &target_parent.clone().into(),
+-      &[nearest_container],
+-    )?;
+-
+-    let target_index = match drop_position {
+-      DropPosition::Top | DropPosition::Left => 0,
+-      _ => 1,
+-    };
+-
+-    move_container_within_tree(
+-      &moved_window.clone().into(),
+-      &split_container.into(),
+-      target_index,
+-      state,
+-    )?;
+-  } else {
+-    let target_index = match drop_position {
+-      DropPosition::Top | DropPosition::Left => nearest_container.index(),
+-      _ => nearest_container.index() + 1,
+-    };
+-
+-    move_container_within_tree(
+-      &moved_window.clone().into(),
+-      &target_parent.clone().into(),
+-      target_index,
+-      state,
+-    )?;
+-  }
+-
+-  state.pending_sync.queue_container_to_redraw(target_parent);
+-
+-  Ok(moved_window)
+-}
+-
+-/// Represents where the window was dropped over another.
+-#[derive(Debug, Clone, PartialEq)]
+-enum DropPosition {
+-  Top,
+-  Bottom,
+-  Left,
+-  Right,
+-}
+-
+-/// Gets the drop position for a window based on the mouse position.
+-///
+-/// This approach divides the window rect into an "X", creating four
+-/// triangular quadrants, to determine which side the cursor is closest to.
+-fn drop_position(mouse_pos: &Point, rect: &Rect) -> DropPosition {
+-  let delta_x = mouse_pos.x - rect.center_point().x;
+-  let delta_y = mouse_pos.y - rect.center_point().y;
+-
+-  if delta_x.abs() > delta_y.abs() {
+-    // Window is in the left or right triangle.
+-    if delta_x > 0 {
+-      DropPosition::Right
+-    } else {
+-      DropPosition::Left
+-    }
+-  } else {
+-    // Window is in the top or bottom triangle.
+-    if delta_y > 0 {
+-      DropPosition::Bottom
+-    } else {
+-      DropPosition::Top
+-    }
+-  }
+-}
+diff --git a/packages/wm/src/main.rs b/packages/wm/src/main.rs
+index cb27990..c0e03f5 100644
+--- a/packages/wm/src/main.rs
++++ b/packages/wm/src/main.rs
+@@ -212,7 +212,7 @@ async fn start_wm(
+         if wm.state.is_paused {
+           Ok(())
+         } else {
+-          wm.state.cleanup_invalid_windows()
++          wm.state.cleanup_invalid_windows(&config)
+         }
+       },
+       Some((
+diff --git a/packages/wm/src/models/container.rs b/packages/wm/src/models/container.rs
+index e3c14ac..b3e50f9 100644
+--- a/packages/wm/src/models/container.rs
++++ b/packages/wm/src/models/container.rs
+@@ -16,7 +16,7 @@ use wm_platform::{Direction, NativeWindow, Rect, RectDelta};
+ use crate::{
+   models::{
+     Monitor, NativeWindowProperties, NonTilingWindow, RootContainer,
+-    SplitContainer, TilingWindow, Workspace,
++    SplitContainer, TilingWindow, VoidSlot, Workspace,
+   },
+   traits::*,
+   user_config::UserConfig,
+@@ -106,6 +106,8 @@ pub enum Container {
+   TilingWindow(TilingWindow),
+   #[subenum(WindowContainer)]
+   NonTilingWindow(NonTilingWindow),
++  #[subenum(TilingContainer)]
++  Void(VoidSlot),
+ }
+ 
+ impl PartialEq for Container {
+diff --git a/packages/wm/src/models/mod.rs b/packages/wm/src/models/mod.rs
+index dc93428..679e490 100644
+--- a/packages/wm/src/models/mod.rs
++++ b/packages/wm/src/models/mod.rs
+@@ -7,6 +7,7 @@ mod non_tiling_window;
+ mod root_container;
+ mod split_container;
+ mod tiling_window;
++mod void_slot;
+ mod workspace;
+ mod workspace_target;
+ 
+@@ -19,5 +20,6 @@ pub use non_tiling_window::*;
+ pub use root_container::*;
+ pub use split_container::*;
+ pub use tiling_window::*;
++pub use void_slot::*;
+ pub use workspace::*;
+ pub use workspace_target::*;
+diff --git a/packages/wm/src/models/void_slot.rs b/packages/wm/src/models/void_slot.rs
+new file mode 100644
+index 0000000..96af9fc
+--- /dev/null
++++ b/packages/wm/src/models/void_slot.rs
+@@ -0,0 +1,71 @@
++use std::{
++  cell::{Ref, RefCell, RefMut},
++  collections::VecDeque,
++  rc::Rc,
++};
++
++use anyhow::Context;
++use uuid::Uuid;
++use wm_common::{ContainerDto, GapsConfig, TilingDirection, VoidSlotDto};
++use wm_platform::Rect;
++
++use crate::{
++  impl_common_getters, impl_container_debug,
++  impl_position_getters_as_resizable, impl_tiling_size_getters,
++  models::{
++    Container, DirectionContainer, TilingContainer, WindowContainer,
++  },
++  traits::{
++    CommonGetters, PositionGetters, TilingDirectionGetters,
++    TilingSizeGetters,
++  },
++};
++
++#[derive(Clone)]
++pub struct VoidSlot(Rc<RefCell<VoidSlotInner>>);
++
++struct VoidSlotInner {
++  id: Uuid,
++  parent: Option<Container>,
++  children: VecDeque<Container>,
++  child_focus_order: VecDeque<Uuid>,
++  tiling_size: f32,
++  gaps_config: GapsConfig,
++}
++
++impl VoidSlot {
++  /// Creates a detached `VoidSlot` placeholder for an empty tiling slot.
++  #[must_use]
++  pub fn new(gaps_config: GapsConfig) -> Self {
++    let slot = VoidSlotInner {
++      id: Uuid::new_v4(),
++      parent: None,
++      children: VecDeque::new(),
++      child_focus_order: VecDeque::new(),
++      tiling_size: 1.0,
++      gaps_config,
++    };
++
++    Self(Rc::new(RefCell::new(slot)))
++  }
++
++  /// Converts this `VoidSlot` into its IPC DTO representation.
++  pub fn to_dto(&self) -> anyhow::Result<ContainerDto> {
++    let rect = self.to_rect()?;
++
++    Ok(ContainerDto::Void(VoidSlotDto {
++      id: self.id(),
++      parent_id: self.parent().map(|parent| parent.id()),
++      tiling_size: self.tiling_size(),
++      width: rect.width(),
++      height: rect.height(),
++      x: rect.x(),
++      y: rect.y(),
++    }))
++  }
++}
++
++impl_container_debug!(VoidSlot);
++impl_common_getters!(VoidSlot);
++impl_tiling_size_getters!(VoidSlot);
++impl_position_getters_as_resizable!(VoidSlot);
+diff --git a/packages/wm/src/models/workspace.rs b/packages/wm/src/models/workspace.rs
+index 9ad291f..7706bc6 100644
+--- a/packages/wm/src/models/workspace.rs
++++ b/packages/wm/src/models/workspace.rs
+@@ -15,7 +15,8 @@ use crate::{
+   impl_common_getters, impl_container_debug,
+   impl_tiling_direction_getters,
+   models::{
+-    Container, DirectionContainer, TilingContainer, WindowContainer,
++    Container, DirectionContainer, TilingContainer, TilingWindow,
++    WindowContainer,
+   },
+   traits::{CommonGetters, PositionGetters, TilingDirectionGetters},
+ };
+@@ -71,6 +72,48 @@ impl Workspace {
+       .is_some_and(|workspace| workspace.id() == self.id())
+   }
+ 
++  /// Returns the gaps configuration assigned to this workspace.
++  #[must_use]
++  pub fn gaps_config(&self) -> GapsConfig {
++    self.0.borrow().gaps_config.clone()
++  }
++
++  /// Returns an iterator over all descendant `TilingWindow`s in this
++  /// workspace.
++  pub fn tiling_windows(&self) -> impl Iterator<Item = TilingWindow> + '_ {
++    self
++      .descendants()
++      .filter_map(|container| container.as_tiling_window().cloned())
++  }
++
++  /// Returns the workspace bounds using the multi-window `outer_gap`.
++  pub fn multi_window_workspace_rect(&self) -> anyhow::Result<Rect> {
++    let outer_gap = self.0.borrow().gaps_config.outer_gap.clone();
++    self.workspace_rect_with_gap_config(&outer_gap)
++  }
++
++  /// Returns the horizontal and vertical inner gaps in pixels for this
++  /// workspace.
++  pub fn workspace_inner_gaps(&self) -> anyhow::Result<(i32, i32)> {
++    let monitor =
++      self.monitor().context("Workspace has no parent monitor.")?;
++    let monitor_rect = monitor.native_properties().bounds;
++    let gaps_config = &self.0.borrow().gaps_config;
++
++    let scale_factor = if gaps_config.scale_with_dpi {
++      monitor.native_properties().scale_factor
++    } else {
++      1.
++    };
++
++    let (horizontal_gap, vertical_gap) = gaps_config.inner_gap.as_axes();
++
++    Ok((
++      horizontal_gap.to_px(monitor_rect.width(), Some(scale_factor)),
++      vertical_gap.to_px(monitor_rect.height(), Some(scale_factor)),
++    ))
++  }
++
+   pub fn set_gaps_config(&self, gaps_config: GapsConfig) {
+     self.0.borrow_mut().gaps_config = gaps_config;
+   }
+diff --git a/packages/wm/src/traits/tiling_direction_getters.rs b/packages/wm/src/traits/tiling_direction_getters.rs
+index ee1b8d3..c5e4d27 100644
+--- a/packages/wm/src/traits/tiling_direction_getters.rs
++++ b/packages/wm/src/traits/tiling_direction_getters.rs
+@@ -15,40 +15,58 @@ pub trait TilingDirectionGetters: CommonGetters {
+   /// direction. For example, for `Direction::Right`, get the right-most
+   /// container.
+   ///
+-  /// Any non-tiling containers are ignored.
++  /// Any non-tiling containers and `VoidSlot`s are skipped.
+   fn descendant_in_direction(
+     &self,
+     direction: &Direction,
+   ) -> Option<TilingWindow> {
+-    let child = self.child_in_direction(direction)?;
+-
+-    // Traverse further down if the child is a split container.
+-    match child {
+-      TilingContainer::Split(split_child) => {
+-        split_child.descendant_in_direction(direction)
+-      }
+-      TilingContainer::TilingWindow(window) => Some(window),
+-    }
+-  }
+-
+-  fn child_in_direction(
+-    &self,
+-    direction: &Direction,
+-  ) -> Option<TilingContainer> {
+-    // When the tiling direction is the inverse of the direction, return
+-    // the last focused tiling child.
+     if self.tiling_direction()
+       != TilingDirection::from_direction(direction)
+     {
+-      return self
+-        .child_focus_order()
+-        .find_map(|c| c.as_tiling_container().ok());
++      for child in self.child_focus_order() {
++        let Ok(child) = child.as_tiling_container() else {
++          continue;
++        };
++        if let Some(window) =
++          descendant_window_from_tiling(child, direction)
++        {
++          return Some(window);
++        }
++      }
++      return None;
+     }
+ 
+-    match direction {
+-      Direction::Up | Direction::Left => self.tiling_children().next(),
+-      _ => self.tiling_children().last(),
++    let ordered: Box<dyn Iterator<Item = TilingContainer> + '_> =
++      match direction {
++        Direction::Up | Direction::Left => {
++          Box::new(self.tiling_children())
++        }
++        _ => Box::new(
++          self.tiling_children().collect::<Vec<_>>().into_iter().rev(),
++        ),
++      };
++
++    for child in ordered {
++      if let Some(window) = descendant_window_from_tiling(child, direction)
++      {
++        return Some(window);
++      }
++    }
++
++    None
++  }
++}
++
++fn descendant_window_from_tiling(
++  child: TilingContainer,
++  direction: &Direction,
++) -> Option<TilingWindow> {
++  match child {
++    TilingContainer::Split(split_child) => {
++      split_child.descendant_in_direction(direction)
+     }
++    TilingContainer::TilingWindow(window) => Some(window),
++    TilingContainer::Void(_) => None,
+   }
+ }
+ 
+diff --git a/packages/wm/src/user_config.rs b/packages/wm/src/user_config.rs
+index 5547f0c..6fb6fcc 100644
+--- a/packages/wm/src/user_config.rs
++++ b/packages/wm/src/user_config.rs
+@@ -377,4 +377,21 @@ impl UserConfig {
+       }
+     })
+   }
++
++  /// Creates an in-memory `UserConfig` from `SAMPLE_CONFIG` for unit
++  /// tests.
++  #[cfg(test)]
++  #[must_use]
++  pub fn mock() -> Self {
++    let value: ParsedConfig = serde_yaml::from_str(SAMPLE_CONFIG)
++      .expect("Failed to parse sample config.");
++    let window_rules_by_event = Self::window_rules_by_event(&value);
++
++    Self {
++      path: PathBuf::new(),
++      value,
++      value_str: SAMPLE_CONFIG.to_string(),
++      window_rules_by_event,
++    }
++  }
+ }
+diff --git a/packages/wm/src/wm.rs b/packages/wm/src/wm.rs
+index 7e58d8d..9eeed33 100644
+--- a/packages/wm/src/wm.rs
++++ b/packages/wm/src/wm.rs
+@@ -138,7 +138,7 @@ impl WindowManager {
+           handle_window_title_changed(&window, state, config)
+         }
+         WindowEvent::Destroyed { window_id, .. } => {
+-          handle_window_destroyed(window_id, state)
++          handle_window_destroyed(window_id, state, config)
+         }
+       },
+     }?;
+@@ -332,7 +332,7 @@ impl WindowManager {
+       }
+       InvokeCommand::Ignore => {
+         match subject_container.as_window_container() {
+-          Ok(window) => ignore_window(window, state),
++          Ok(window) => ignore_window(window, state, config),
+           _ => Ok(()),
+         }
+       }
+diff --git a/packages/wm/src/wm_state.rs b/packages/wm/src/wm_state.rs
+index 78f81e7..86b83e4 100644
+--- a/packages/wm/src/wm_state.rs
++++ b/packages/wm/src/wm_state.rs
+@@ -146,6 +146,8 @@ impl WmState {
+   /// Clears any pending or active drag tracking state associated with
+   /// `window_id`.
+   pub fn clear_window_drag_state(&mut self, window_id: Uuid) {
++    let mut cleared_move_drag = false;
++
+     #[cfg(target_os = "windows")]
+     {
+       if self
+@@ -162,6 +164,7 @@ impl WmState {
+         .is_some_and(|drag| drag.window_id == window_id)
+       {
+         self.active_manual_drag = None;
++        cleared_move_drag = true;
+       }
+     }
+ 
+@@ -172,6 +175,17 @@ impl WmState {
+     {
+       self.live_resize_state = None;
+     }
++
++    if self
++      .window_by_id(window_id)
++      .is_some_and(|window| window.active_drag().is_some())
++    {
++      cleared_move_drag = true;
++    }
++
++    if cleared_move_drag {
++      self.dispatcher.hide_snap_overlay();
++    }
+   }
+ 
+   /// Finds a managed window by its container `window_id`.
+@@ -752,7 +766,10 @@ impl WmState {
+   /// windows in WM state.
+   ///
+   /// See: <https://github.com/glzr-io/glazewm/issues/1219>
+-  pub fn cleanup_invalid_windows(&mut self) -> anyhow::Result<()> {
++  pub fn cleanup_invalid_windows(
++    &mut self,
++    config: &UserConfig,
++  ) -> anyhow::Result<()> {
+     let invalid_windows = self
+       .windows()
+       .into_iter()
+@@ -760,7 +777,7 @@ impl WmState {
+ 
+     for window in invalid_windows {
+       tracing::info!("Removing invalid window: {}", window);
+-      unmanage_window(window, self)?;
++      unmanage_window(window, self, config)?;
+     }
+ 
+     // Prune ignored windows that are no longer valid.
+@@ -772,6 +789,11 @@ impl WmState {
+ 
+ impl Drop for WmState {
+   fn drop(&mut self) {
++    self.dispatcher.hide_snap_overlay();
++    if !self.dispatcher.has_event_loop() {
++      return;
++    }
++
+     let managed_windows = self.windows();
+ 
+     for window in &managed_windows {

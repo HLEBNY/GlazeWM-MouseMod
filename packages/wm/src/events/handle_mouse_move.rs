@@ -13,7 +13,9 @@ use wm_platform::{MouseButton, MouseEvent};
 use crate::events::handle_window_moved_or_resized_end;
 #[cfg(target_os = "windows")]
 use crate::{
-  commands::window::update_window_state,
+  commands::window::{
+    finalize_move_drag, update_drag_snap_preview, update_window_state,
+  },
   events::update_floating_window_position,
   models::WindowContainer,
   wm_state::{ManualWindowDrag, PendingMaximizeDrag},
@@ -38,7 +40,7 @@ pub fn handle_mouse_move(
   }
 
   #[cfg(target_os = "windows")]
-  if handle_windows_mouse_button(event, state)? {
+  if handle_windows_mouse_button(event, state, config)? {
     return Ok(());
   }
 
@@ -154,6 +156,7 @@ pub fn handle_mouse_move(
 fn handle_windows_mouse_button(
   event: &MouseEvent,
   state: &mut WmState,
+  config: &UserConfig,
 ) -> anyhow::Result<bool> {
   match event {
     MouseEvent::ButtonDown {
@@ -161,16 +164,17 @@ fn handle_windows_mouse_button(
       position,
       ..
     } => {
-      handle_windows_left_down(position, state)?;
+      handle_windows_left_down(position, state, config)?;
       Ok(true)
     }
     MouseEvent::ButtonUp {
       button: MouseButton::Left,
+      position,
       ..
     } => {
       state.pending_maximize_drag = None;
       if state.active_manual_drag.is_some() {
-        finish_manual_drag(state)?;
+        finish_manual_drag(Some(position), state, config)?;
       }
       Ok(true)
     }
@@ -182,11 +186,12 @@ fn handle_windows_mouse_button(
 fn handle_windows_left_down(
   position: &Point,
   state: &mut WmState,
+  config: &UserConfig,
 ) -> anyhow::Result<()> {
   state.pending_maximize_drag = None;
 
   if state.active_manual_drag.is_some() {
-    finish_manual_drag(state)?;
+    finish_manual_drag(Some(position), state, config)?;
   }
 
   // Skip if another window is already in a native drag.
@@ -238,18 +243,20 @@ fn handle_drag_move(
     if !pressed_buttons.contains(&MouseButton::Left)
       || !state.dispatcher.is_mouse_down(&MouseButton::Left)
     {
-      finish_manual_drag(state)?;
+      finish_manual_drag(Some(position), state, config)?;
       return Ok(false);
     }
 
     let Some(window) = state.window_by_id(drag.window_id) else {
       state.active_manual_drag = None;
+      state.dispatcher.hide_snap_overlay();
       return Ok(false);
     };
 
     let native = window.native();
     if !native.is_valid() {
       state.active_manual_drag = None;
+      state.dispatcher.hide_snap_overlay();
       return Ok(false);
     }
 
@@ -257,6 +264,9 @@ fn handle_drag_move(
       position.x - drag.cursor_offset_x,
       position.y - drag.cursor_offset_y,
     );
+    drop(native);
+
+    update_drag_snap_preview(&window, Some(position), state)?;
 
     return Ok(true);
   }
@@ -384,6 +394,7 @@ fn start_maximize_drag(
     operation: Some(ActiveDragOperation::Move),
     is_from_floating: true,
     initial_position: restored_frame,
+    origin_void_id: None,
   }));
 
   let window = update_window_state(
@@ -408,7 +419,13 @@ fn start_maximize_drag(
 }
 
 #[cfg(target_os = "windows")]
-fn finish_manual_drag(state: &mut WmState) -> anyhow::Result<()> {
+fn finish_manual_drag(
+  cursor_override: Option<&Point>,
+  state: &mut WmState,
+  config: &UserConfig,
+) -> anyhow::Result<()> {
+  state.dispatcher.hide_snap_overlay();
+
   let Some(drag) = state.active_manual_drag.take() else {
     return Ok(());
   };
@@ -434,19 +451,36 @@ fn finish_manual_drag(state: &mut WmState) -> anyhow::Result<()> {
     }
   });
 
-  window.set_active_drag(None);
+  let active_drag = window.active_drag();
 
-  if let WindowContainer::NonTilingWindow(non_tiling) = window {
-    let nearest_monitor = state
-      .nearest_monitor(&non_tiling.native())
-      .context("Failed to get workspace of nearest monitor.")?;
-
-    update_floating_window_position(
-      &non_tiling,
+  if let (
+    Some(active_drag),
+    WindowContainer::NonTilingWindow(non_tiling),
+  ) = (active_drag, &window)
+  {
+    finalize_move_drag(
+      non_tiling,
       frame,
-      &nearest_monitor,
+      &active_drag,
+      cursor_override,
       state,
+      config,
     )?;
+  } else {
+    window.set_active_drag(None);
+
+    if let WindowContainer::NonTilingWindow(non_tiling) = window {
+      let nearest_monitor = state
+        .nearest_monitor(&non_tiling.native())
+        .context("Failed to get workspace of nearest monitor.")?;
+
+      update_floating_window_position(
+        &non_tiling,
+        frame,
+        &nearest_monitor,
+        state,
+      )?;
+    }
   }
 
   Ok(())

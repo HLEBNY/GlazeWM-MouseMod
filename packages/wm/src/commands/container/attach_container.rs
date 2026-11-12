@@ -30,9 +30,11 @@ pub fn attach_container(
     target_parent.borrow_children_mut().push_back(child.clone());
   }
 
-  target_parent
-    .borrow_child_focus_order_mut()
-    .push_back(child.id());
+  if !child.is_void() {
+    target_parent
+      .borrow_child_focus_order_mut()
+      .push_back(child.id());
+  }
 
   *child.borrow_parent_mut() = Some(target_parent.clone());
 

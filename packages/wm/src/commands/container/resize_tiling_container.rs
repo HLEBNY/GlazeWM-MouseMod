@@ -34,15 +34,23 @@ pub fn resize_tiling_container(
     });
 
   // Distribute the available tiling size amongst its siblings.
-  for sibling in &tiling_siblings {
-    // Get percentage of resize that affects this container. Siblings are
-    // resized in proportion to their current size (i.e. larger containers
-    // are shrunk more).
-    let resize_factor =
-      (sibling.tiling_size() - MIN_TILING_SIZE) / available_size;
+  if available_size > f32::EPSILON {
+    for sibling in &tiling_siblings {
+      // Get percentage of resize that affects this container. Siblings are
+      // resized in proportion to their current size (i.e. larger
+      // containers are shrunk more).
+      let resize_factor =
+        (sibling.tiling_size() - MIN_TILING_SIZE) / available_size;
 
-    let size_delta = resize_factor * size_delta;
+      let sibling_delta = resize_factor * size_delta;
 
-    sibling.set_tiling_size(sibling.tiling_size() - size_delta);
+      sibling.set_tiling_size(sibling.tiling_size() - sibling_delta);
+    }
+  } else {
+    #[allow(clippy::cast_precision_loss)]
+    let even_delta = size_delta / tiling_siblings.len() as f32;
+    for sibling in &tiling_siblings {
+      sibling.set_tiling_size(sibling.tiling_size() - even_delta);
+    }
   }
 }

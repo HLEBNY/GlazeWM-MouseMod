@@ -377,4 +377,21 @@ impl UserConfig {
       }
     })
   }
+
+  /// Creates an in-memory `UserConfig` from `SAMPLE_CONFIG` for unit
+  /// tests.
+  #[cfg(test)]
+  #[must_use]
+  pub fn mock() -> Self {
+    let value: ParsedConfig = serde_yaml::from_str(SAMPLE_CONFIG)
+      .expect("Failed to parse sample config.");
+    let window_rules_by_event = Self::window_rules_by_event(&value);
+
+    Self {
+      path: PathBuf::new(),
+      value,
+      value_str: SAMPLE_CONFIG.to_string(),
+      window_rules_by_event,
+    }
+  }
 }

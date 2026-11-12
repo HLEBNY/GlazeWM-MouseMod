@@ -15,7 +15,8 @@ use crate::{
   impl_common_getters, impl_container_debug,
   impl_tiling_direction_getters,
   models::{
-    Container, DirectionContainer, TilingContainer, WindowContainer,
+    Container, DirectionContainer, TilingContainer, TilingWindow,
+    WindowContainer,
   },
   traits::{CommonGetters, PositionGetters, TilingDirectionGetters},
 };
@@ -69,6 +70,48 @@ impl Workspace {
       .monitor()
       .and_then(|monitor| monitor.displayed_workspace())
       .is_some_and(|workspace| workspace.id() == self.id())
+  }
+
+  /// Returns the gaps configuration assigned to this workspace.
+  #[must_use]
+  pub fn gaps_config(&self) -> GapsConfig {
+    self.0.borrow().gaps_config.clone()
+  }
+
+  /// Returns an iterator over all descendant `TilingWindow`s in this
+  /// workspace.
+  pub fn tiling_windows(&self) -> impl Iterator<Item = TilingWindow> + '_ {
+    self
+      .descendants()
+      .filter_map(|container| container.as_tiling_window().cloned())
+  }
+
+  /// Returns the workspace bounds using the multi-window `outer_gap`.
+  pub fn multi_window_workspace_rect(&self) -> anyhow::Result<Rect> {
+    let outer_gap = self.0.borrow().gaps_config.outer_gap.clone();
+    self.workspace_rect_with_gap_config(&outer_gap)
+  }
+
+  /// Returns the horizontal and vertical inner gaps in pixels for this
+  /// workspace.
+  pub fn workspace_inner_gaps(&self) -> anyhow::Result<(i32, i32)> {
+    let monitor =
+      self.monitor().context("Workspace has no parent monitor.")?;
+    let monitor_rect = monitor.native_properties().bounds;
+    let gaps_config = &self.0.borrow().gaps_config;
+
+    let scale_factor = if gaps_config.scale_with_dpi {
+      monitor.native_properties().scale_factor
+    } else {
+      1.
+    };
+
+    let (horizontal_gap, vertical_gap) = gaps_config.inner_gap.as_axes();
+
+    Ok((
+      horizontal_gap.to_px(monitor_rect.width(), Some(scale_factor)),
+      vertical_gap.to_px(monitor_rect.height(), Some(scale_factor)),
+    ))
   }
 
   pub fn set_gaps_config(&self, gaps_config: GapsConfig) {

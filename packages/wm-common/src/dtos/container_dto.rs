@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-  MonitorDto, RootContainerDto, SplitContainerDto, WindowDto, WorkspaceDto,
+  MonitorDto, RootContainerDto, SplitContainerDto, VoidSlotDto, WindowDto,
+  WorkspaceDto,
 };
 
 /// User-friendly representation of a container.
@@ -15,4 +16,5 @@ pub enum ContainerDto {
   Workspace(WorkspaceDto),
   Split(SplitContainerDto),
   Window(WindowDto),
+  Void(VoidSlotDto),
 }

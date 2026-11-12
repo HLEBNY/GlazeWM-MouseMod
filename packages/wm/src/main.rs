@@ -212,7 +212,7 @@ async fn start_wm(
         if wm.state.is_paused {
           Ok(())
         } else {
-          wm.state.cleanup_invalid_windows()
+          wm.state.cleanup_invalid_windows(&config)
         }
       },
       Some((

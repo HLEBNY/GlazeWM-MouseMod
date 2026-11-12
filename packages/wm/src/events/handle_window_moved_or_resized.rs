@@ -12,7 +12,7 @@ use wm_platform::{NativeWindow, Rect};
 use crate::{
   commands::{
     container::{flatten_split_container, move_container_within_tree},
-    window::update_window_state,
+    window::{update_drag_snap_preview, update_window_state},
   },
   events::handle_window_moved_or_resized_end,
   models::{Monitor, NonTilingWindow, WindowContainer},
@@ -188,12 +188,15 @@ pub fn handle_window_moved_or_resized(
     if is_drag_start {
       tracing::info!("Window started dragging: {window}");
 
+      let is_from_floating = matches!(
+        window.state(),
+        WindowState::Floating(_)
+      ) || (matches!(window.state(), WindowState::Fullscreen(_))
+        && !matches!(window.prev_state(), Some(WindowState::Tiling)));
+
       window.set_active_drag(Some(ActiveDrag {
         operation: None,
-        is_from_floating: matches!(
-          window.state(),
-          WindowState::Floating(_)
-        ),
+        is_from_floating,
         #[cfg(target_os = "windows")]
         initial_position: old_frame_position.clone(),
         // The updated frame position is used here instead of the initial
@@ -204,6 +207,7 @@ pub fn handle_window_moved_or_resized(
         // `WindowEvent::MovedOrResized` event.
         #[cfg(target_os = "macos")]
         initial_position: frame_position.clone(),
+        origin_void_id: None,
       }));
 
       #[cfg(target_os = "windows")]
@@ -423,6 +427,7 @@ pub fn update_floating_window_position(
 /// This function determines whether a window is being moved or resized and
 /// updates its operation state accordingly. If the window is being moved,
 /// it's set to floating mode.
+#[allow(clippy::too_many_lines)]
 fn update_drag_state(
   window: &WindowContainer,
   frame_position: &Rect,
@@ -464,7 +469,9 @@ fn update_drag_state(
   // after it has been moved at least 10px from its initial position. The
   // 10px threshold is to account for small movements that may be
   // accidental.
-  if is_move && !matches!(window.state(), WindowState::Floating(_)) {
+  let active_window = if is_move
+    && !matches!(window.state(), WindowState::Floating(_))
+  {
     let move_distance = frame_position
       .center_point()
       .distance_between(&active_drag.initial_position.center_point());
@@ -487,7 +494,7 @@ fn update_drag_state(
         matches!(window.state(), WindowState::Fullscreen(_))
           && !is_maximized;
 
-      let window = update_window_state(
+      let updated = update_window_state(
         window.clone(),
         WindowState::Floating(FloatingStateConfig {
           centered: false,
@@ -504,30 +511,33 @@ fn update_drag_state(
       if !is_fullscreen {
         state
           .pending_sync
-          .dequeue_container_from_redraw(window.clone());
+          .dequeue_container_from_redraw(updated.clone());
       }
 
       // Flatten the parent split container if it only contains the window.
-      // TODO: Consider doing this to `move_container_within_tree`, so that
-      // the behavior is consistent.
       if let Some(split_parent) = parent.as_split() {
-        if split_parent.child_count() == 1 {
+        if !split_parent.is_detached() && split_parent.child_count() == 1 {
           flatten_split_container(split_parent.clone())?;
 
-          // Hacky fix to redraw siblings after flattening. The parent is
-          // queued for redraw from the state change, which gets detached
-          // on flatten.
-          // TODO: Change `queue_containers_to_redraw` to iterate over its
-          // descendant windows and store those instead.
           state
             .pending_sync
-            .queue_containers_to_redraw(window.tiling_siblings());
+            .queue_containers_to_redraw(updated.tiling_siblings());
         }
       }
+
+      updated
+    } else {
+      window.clone()
     }
+  } else {
+    window.clone()
+  };
+
+  if is_move && matches!(active_window.state(), WindowState::Floating(_)) {
+    update_drag_snap_preview(&active_window, None, state)?;
   } else if !is_move {
     update_live_resize(
-      window,
+      &active_window,
       frame_position,
       &active_drag.initial_position,
       state,
