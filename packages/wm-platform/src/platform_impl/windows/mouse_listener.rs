@@ -226,37 +226,12 @@ impl MouseListener {
     let is_dragging = callback_data.pressed.contains(&MouseButton::Left)
       || callback_data.pressed.contains(&MouseButton::Right);
 
-    let is_event_enabled = match event_kind {
-      MouseEventKind::Move => {
-        enabled_events.contains(&MouseEventKind::Move)
-          || (is_dragging
-            && enabled_events.contains(&MouseEventKind::DragMove))
-      }
-      _ => enabled_events.contains(&event_kind),
-    };
-
-    if !is_event_enabled {
-      return Ok(());
-    }
-
-    // Throttle passive mouse move events to 50ms, while drag moves run
-    // at 8ms (~120 Hz) for smooth window tracking. State change events
-    // (button down/up) always get emitted.
-    let should_emit = match event_kind {
-      MouseEventKind::Move => {
-        let interval = if is_dragging {
-          Duration::from_millis(8)
-        } else {
-          Duration::from_millis(50)
-        };
-        callback_data
-          .last_move_emission
-          .is_none_or(|timestamp| timestamp.elapsed() >= interval)
-      }
-      _ => true,
-    };
-
-    if !should_emit {
+    if !Self::should_emit_event(
+      enabled_events,
+      event_kind,
+      is_dragging,
+      callback_data.last_move_emission,
+    ) {
       return Ok(());
     }
 
@@ -281,13 +256,11 @@ impl MouseListener {
         button: MouseButton::Right,
         pressed_buttons: callback_data.pressed,
       },
-      MouseEventKind::Move | MouseEventKind::DragMove => {
-        MouseEvent::Move {
-          position: Self::cursor_pos()?,
-          pressed_buttons: callback_data.pressed,
-          window_below_cursor: None,
-        }
-      }
+      MouseEventKind::Move | MouseEventKind::DragMove => MouseEvent::Move {
+        position: Self::cursor_pos()?,
+        pressed_buttons: callback_data.pressed,
+        window_below_cursor: None,
+      },
     };
 
     let _ = callback_data.event_tx.send(mouse_event);
@@ -297,6 +270,42 @@ impl MouseListener {
     }
 
     Ok(())
+  }
+
+  /// Checks if an input event passes the enabled mask and throttle.
+  fn should_emit_event(
+    enabled_events: &[MouseEventKind],
+    event_kind: MouseEventKind,
+    is_dragging: bool,
+    last_move_emission: Option<Instant>,
+  ) -> bool {
+    let is_enabled = match event_kind {
+      MouseEventKind::Move => {
+        enabled_events.contains(&MouseEventKind::Move)
+          || (is_dragging
+            && enabled_events.contains(&MouseEventKind::DragMove))
+      }
+      _ => enabled_events.contains(&event_kind),
+    };
+
+    if !is_enabled {
+      return false;
+    }
+
+    // Throttle passive move events to 50ms and drag moves to 8ms (~120Hz)
+    // for smooth tracking. Button events always pass through.
+    match event_kind {
+      MouseEventKind::Move => {
+        let interval = if is_dragging {
+          Duration::from_millis(8)
+        } else {
+          Duration::from_millis(50)
+        };
+        last_move_emission
+          .is_none_or(|timestamp| timestamp.elapsed() >= interval)
+      }
+      _ => true,
+    }
   }
 
   /// Gets the current cursor position.

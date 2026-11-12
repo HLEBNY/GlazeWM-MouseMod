@@ -51,10 +51,7 @@ impl InnerGapConfig {
   pub fn as_axes(&self) -> (&LengthValue, &LengthValue) {
     match self {
       Self::Uniform(value) => (value, value),
-      Self::Axes {
-        horizontal,
-        vertical,
-      } => (horizontal, vertical),
+      Self::Axes { horizontal, vertical } => (horizontal, vertical),
     }
   }
 }

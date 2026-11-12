@@ -509,10 +509,7 @@ impl NativeWindow {
     const HTTRANSPARENT_HIT: usize = HTTRANSPARENT as isize as usize;
     const MAX_ANCESTOR_STEPS: usize = 16;
 
-    let pt = POINT {
-      x: point.x,
-      y: point.y,
-    };
+    let pt = POINT { x: point.x, y: point.y };
     let target_hwnd = unsafe { WindowFromPoint(pt) };
     if target_hwnd.0 == 0 {
       return false;
@@ -567,8 +564,8 @@ impl NativeWindow {
 
   /// Implements [`NativeWindowWindowsExt::is_in_native_movesize`].
   pub(crate) fn is_in_native_movesize(&self) -> bool {
-    let thread_id =
-      unsafe { GetWindowThreadProcessId(self.hwnd(), None) };
+    let hwnd = self.hwnd();
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, None) };
     if thread_id == 0 {
       return false;
     }

@@ -38,25 +38,8 @@ pub fn handle_mouse_move(
   }
 
   #[cfg(target_os = "windows")]
-  match event {
-    MouseEvent::ButtonDown {
-      button: MouseButton::Left,
-      position,
-      ..
-    } => {
-      return handle_windows_left_down(position, state, config);
-    }
-    MouseEvent::ButtonUp {
-      button: MouseButton::Left,
-      ..
-    } => {
-      state.pending_maximize_drag = None;
-      if state.active_manual_drag.is_some() {
-        return finish_manual_drag(state);
-      }
-      return Ok(());
-    }
-    _ => {}
+  if handle_windows_mouse_button(event, state)? {
+    return Ok(());
   }
 
   // On macOS, detect when a window drag operation has ended by listening
@@ -173,10 +156,37 @@ pub fn handle_mouse_move(
 }
 
 #[cfg(target_os = "windows")]
+fn handle_windows_mouse_button(
+  event: &MouseEvent,
+  state: &mut WmState,
+) -> anyhow::Result<bool> {
+  match event {
+    MouseEvent::ButtonDown {
+      button: MouseButton::Left,
+      position,
+      ..
+    } => {
+      handle_windows_left_down(position, state)?;
+      Ok(true)
+    }
+    MouseEvent::ButtonUp {
+      button: MouseButton::Left,
+      ..
+    } => {
+      state.pending_maximize_drag = None;
+      if state.active_manual_drag.is_some() {
+        finish_manual_drag(state)?;
+      }
+      Ok(true)
+    }
+    _ => Ok(false),
+  }
+}
+
+#[cfg(target_os = "windows")]
 fn handle_windows_left_down(
   position: &Point,
   state: &mut WmState,
-  _config: &UserConfig,
 ) -> anyhow::Result<()> {
   state.pending_maximize_drag = None;
 
@@ -300,6 +310,41 @@ fn handle_windows_drag_move(
 }
 
 #[cfg(target_os = "windows")]
+fn restored_window_size(
+  window: &WindowContainer,
+  max_width: i32,
+  max_height: i32,
+) -> (i32, i32) {
+  let fits_restored = |width: i32, height: i32| {
+    width >= 250
+      && height >= 140
+      && (width < max_width - 20 || height < max_height - 20)
+  };
+
+  let placement = window.floating_placement();
+  if fits_restored(placement.width(), placement.height()) {
+    return (placement.width(), placement.height());
+  }
+
+  if let Ok((normal_width, normal_height)) =
+    window.native().normal_frame_size()
+  {
+    let borders = window.native_properties().shadow_borders;
+    let width = normal_width
+      - borders.left.to_px(0, None)
+      - borders.right.to_px(0, None);
+    let height = normal_height
+      - borders.top.to_px(0, None)
+      - borders.bottom.to_px(0, None);
+    if fits_restored(width, height) {
+      return (width, height);
+    }
+  }
+
+  ((max_width * 7) / 10, (max_height * 75) / 100)
+}
+
+#[cfg(target_os = "windows")]
 fn start_maximize_drag(
   window: WindowContainer,
   pending: &PendingMaximizeDrag,
@@ -307,53 +352,38 @@ fn start_maximize_drag(
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
-  let max_w = pending.max_frame.width().max(320);
-  let max_h = pending.max_frame.height().max(200);
+  let max_width = pending.max_frame.width().max(320);
+  let max_height = pending.max_frame.height().max(200);
+  let (restored_width, restored_height) =
+    restored_window_size(&window, max_width, max_height);
 
-  let fp = window.floating_placement();
-  let (restored_w, restored_h) = if fp.width() >= 250
-    && fp.height() >= 140
-    && (fp.width() < max_w - 20 || fp.height() < max_h - 20)
-  {
-    (fp.width(), fp.height())
-  } else if let Ok((norm_w, norm_h)) =
-    window.native().normal_frame_size()
-  {
-    let sb = window.native_properties().shadow_borders;
-    let w = norm_w - sb.left.to_px(0, None) - sb.right.to_px(0, None);
-    let h = norm_h - sb.top.to_px(0, None) - sb.bottom.to_px(0, None);
-    if w >= 250 && h >= 140 && (w < max_w - 20 || h < max_h - 20) {
-      (w, h)
-    } else {
-      ((max_w * 7) / 10, (max_h * 75) / 100)
-    }
-  } else {
-    ((max_w * 7) / 10, (max_h * 75) / 100)
-  };
+  let restored_width =
+    restored_width.clamp(250, (max_width - 20).max(250));
+  let restored_height =
+    restored_height.clamp(140, (max_height - 20).max(140));
 
-  let restored_w = restored_w.clamp(250, (max_w - 20).max(250));
-  let restored_h = restored_h.clamp(140, (max_h - 20).max(140));
-
-  #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-  let rel_x = ((pending.start_cursor.x - pending.max_frame.left) as f32
-    / max_w as f32)
-    .clamp(0.15, 0.85);
+  #[allow(clippy::cast_precision_loss)]
+  let cursor_offset =
+    (pending.start_cursor.x - pending.max_frame.left) as f32;
+  #[allow(clippy::cast_precision_loss)]
+  let rel_x = (cursor_offset / max_width as f32).clamp(0.15, 0.85);
   let grab_offset_y =
     (pending.start_cursor.y - pending.max_frame.top).clamp(8, 36);
 
   #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-  let frame_x = position.x - (restored_w as f32 * rel_x).round() as i32;
+  let frame_x =
+    position.x - (restored_width as f32 * rel_x).round() as i32;
   let frame_y = position.y - grab_offset_y;
   let restored_frame =
-    Rect::from_xy(frame_x, frame_y, restored_w, restored_h);
+    Rect::from_xy(frame_x, frame_y, restored_width, restored_height);
 
   let border_delta = window.total_border_delta()?;
   let outer_rect = restored_frame.apply_delta(&border_delta, None);
 
-  window.native().restore(Some(&outer_rect))?;
-  let _ = window
-    .native()
-    .move_without_resize(outer_rect.left, outer_rect.top);
+  let native = window.native();
+  native.restore(Some(&outer_rect))?;
+  let _ = native.move_without_resize(outer_rect.left, outer_rect.top);
+  drop(native);
 
   window.set_floating_placement(restored_frame.clone());
   window.set_has_custom_floating_placement(true);

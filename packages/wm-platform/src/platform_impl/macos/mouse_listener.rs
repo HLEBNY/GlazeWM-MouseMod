@@ -198,15 +198,11 @@ impl MouseListener {
 
     for event in enabled_events {
       match event {
-        MouseEventKind::Move => {
+        MouseEventKind::Move | MouseEventKind::DragMove => {
           // NOTE: `MouseMoved` doesn't get triggered when clicking and
           // dragging. Therefore, we also listen for `LeftMouseDragged`
           // and `RightMouseDragged` events.
           mask |= 1u64 << u64::from(CGEventType::MouseMoved.0);
-          mask |= 1u64 << u64::from(CGEventType::LeftMouseDragged.0);
-          mask |= 1u64 << u64::from(CGEventType::RightMouseDragged.0);
-        }
-        MouseEventKind::DragMove => {
           mask |= 1u64 << u64::from(CGEventType::LeftMouseDragged.0);
           mask |= 1u64 << u64::from(CGEventType::RightMouseDragged.0);
         }
@@ -321,13 +317,11 @@ impl MouseListener {
         button: MouseButton::Right,
         pressed_buttons: data.pressed_buttons,
       },
-      MouseEventKind::Move | MouseEventKind::DragMove => {
-        MouseEvent::Move {
-          position,
-          pressed_buttons: data.pressed_buttons,
-          window_below_cursor,
-        }
-      }
+      MouseEventKind::Move | MouseEventKind::DragMove => MouseEvent::Move {
+        position,
+        pressed_buttons: data.pressed_buttons,
+        window_below_cursor,
+      },
     };
 
     if should_emit {

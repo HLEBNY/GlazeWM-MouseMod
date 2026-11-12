@@ -93,8 +93,7 @@ pub struct WmState {
   /// Whether the OS focused window is the same as the WM focused window.
   pub is_focus_synced: bool,
 
-  /// Candidate titlebar press on a maximized window awaiting drag
-  /// threshold.
+  /// Pending titlebar click on a maximized window awaiting drag start.
   #[cfg(target_os = "windows")]
   pub pending_maximize_drag: Option<PendingMaximizeDrag>,
 

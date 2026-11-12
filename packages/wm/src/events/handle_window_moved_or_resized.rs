@@ -546,7 +546,7 @@ pub fn update_live_resize(
   initial_position: &Rect,
   state: &mut WmState,
 ) -> anyhow::Result<()> {
-  let Ok(tiling_window) = window.as_tiling_window() else {
+  let Some(tiling_window) = window.as_tiling_window() else {
     return Ok(());
   };
 
@@ -559,8 +559,7 @@ pub fn update_live_resize(
           frame_position.right != initial_position.right;
       }
       if !existing.dragged_top && !existing.dragged_bottom {
-        existing.dragged_top =
-          frame_position.top != initial_position.top;
+        existing.dragged_top = frame_position.top != initial_position.top;
         existing.dragged_bottom =
           frame_position.bottom != initial_position.bottom;
       }
@@ -611,14 +610,14 @@ pub fn update_live_resize(
       continue;
     }
 
-    let (h_gap, v_gap) = container.inner_gaps()?;
+    let (horizontal_gap, vertical_gap) = container.inner_gaps()?;
     let parent_rect = parent.to_rect()?;
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     let sibling_count = container.tiling_siblings().count() as i32;
     let available_px = if is_horizontal {
-      parent_rect.width() - h_gap * sibling_count
+      parent_rect.width() - horizontal_gap * sibling_count
     } else {
-      parent_rect.height() - v_gap * sibling_count
+      parent_rect.height() - vertical_gap * sibling_count
     };
 
     if available_px <= 0 {

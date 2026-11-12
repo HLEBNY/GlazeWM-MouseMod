@@ -1,7 +1,7 @@
 use anyhow::Context;
 use wm_common::{
-  try_warn, ActiveDragOperation, FullscreenStateConfig, TilingDirection,
-  WindowState,
+  try_warn, ActiveDrag, ActiveDragOperation, FullscreenStateConfig,
+  TilingDirection, WindowState,
 };
 use wm_platform::{LengthValue, Point, Rect};
 
@@ -13,7 +13,7 @@ use crate::{
   events::{update_floating_window_position, update_live_resize},
   models::{
     DirectionContainer, NonTilingWindow, SplitContainer, TilingContainer,
-    WindowContainer,
+    TilingWindow, WindowContainer,
   },
   traits::{
     CommonGetters, PositionGetters, TilingDirectionGetters, WindowGetters,
@@ -115,54 +115,63 @@ pub fn handle_window_moved_or_resized_end(
       }
     }
     WindowContainer::TilingWindow(window) => {
-      tracing::info!(
-        "Tiling window move/resize ended: {}",
-        window.as_window_container()?
-      );
-
-      let frame = window.native_properties().frame;
-      let is_live_resize = active_drag.operation
-        == Some(ActiveDragOperation::Resize)
-        && state
-          .live_resize_state
-          .as_ref()
-          .is_some_and(|resize| resize.window_id == window.id());
-
-      if is_live_resize {
-        let container: WindowContainer = window.clone().into();
-        update_live_resize(
-          &container,
-          &frame,
-          &active_drag.initial_position,
-          state,
-        )?;
-        state.clear_window_drag_state(window.id());
-      } else {
-        state.clear_window_drag_state(window.id());
-
-        // Update the window's size based on the new frame position. This
-        // means we use the actual window dimensions as the source of
-        // truth.
-        set_window_size(
-          window.clone().into(),
-          Some(LengthValue::from_px(frame.width())),
-          Some(LengthValue::from_px(frame.height())),
-          state,
-        )?;
-      }
-
-      window.set_active_drag(None);
-
-      // Force a redraw of the window to snap it back to its original
-      // position. This is necessary when:
-      // - The window is the only tiling window in the workspace.
-      // - The window is not past the movement threshold for transitioning
-      //   to floating while being dragged.
-      // - Resizing in a direction that doesn't change the window's tiling
-      //   size.
-      state.pending_sync.queue_container_to_redraw(window.clone());
+      finish_tiling_window_drag(window, &active_drag, state)?;
     }
   }
+
+  Ok(())
+}
+
+fn finish_tiling_window_drag(
+  window: &TilingWindow,
+  active_drag: &ActiveDrag,
+  state: &mut WmState,
+) -> anyhow::Result<()> {
+  tracing::info!(
+    "Tiling window move/resize ended: {}",
+    window.as_window_container()?
+  );
+
+  let frame = window.native_properties().frame;
+  let is_live_resize = active_drag.operation
+    == Some(ActiveDragOperation::Resize)
+    && state
+      .live_resize_state
+      .as_ref()
+      .is_some_and(|resize| resize.window_id == window.id());
+
+  if is_live_resize {
+    let container: WindowContainer = window.clone().into();
+    update_live_resize(
+      &container,
+      &frame,
+      &active_drag.initial_position,
+      state,
+    )?;
+    state.clear_window_drag_state(window.id());
+  } else {
+    state.clear_window_drag_state(window.id());
+
+    // Update the window's size based on the new frame position. This means
+    // we use the actual window dimensions as the source of truth.
+    set_window_size(
+      window.clone().into(),
+      Some(LengthValue::from_px(frame.width())),
+      Some(LengthValue::from_px(frame.height())),
+      state,
+    )?;
+  }
+
+  window.set_active_drag(None);
+
+  // Force a redraw of the window to snap it back to its original position.
+  // This is necessary when:
+  // - The window is the only tiling window in the workspace.
+  // - The window is not past the movement threshold for transitioning to
+  //   floating while being dragged.
+  // - Resizing in a direction that doesn't change the window's tiling
+  //   size.
+  state.pending_sync.queue_container_to_redraw(window.clone());
 
   Ok(())
 }

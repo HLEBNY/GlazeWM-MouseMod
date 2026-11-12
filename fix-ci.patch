@@ -1,0 +1,771 @@
+diff --git a/packages/wm-common/src/parsed_config.rs b/packages/wm-common/src/parsed_config.rs
+index 1631839..efbd8de 100644
+--- a/packages/wm-common/src/parsed_config.rs
++++ b/packages/wm-common/src/parsed_config.rs
+@@ -51,10 +51,7 @@ impl InnerGapConfig {
+   pub fn as_axes(&self) -> (&LengthValue, &LengthValue) {
+     match self {
+       Self::Uniform(value) => (value, value),
+-      Self::Axes {
+-        horizontal,
+-        vertical,
+-      } => (horizontal, vertical),
++      Self::Axes { horizontal, vertical } => (horizontal, vertical),
+     }
+   }
+ }
+diff --git a/packages/wm-platform/src/platform_impl/macos/mouse_listener.rs b/packages/wm-platform/src/platform_impl/macos/mouse_listener.rs
+index e32c2f2..1d78d3b 100644
+--- a/packages/wm-platform/src/platform_impl/macos/mouse_listener.rs
++++ b/packages/wm-platform/src/platform_impl/macos/mouse_listener.rs
+@@ -198,7 +198,7 @@ impl MouseListener {
+ 
+     for event in enabled_events {
+       match event {
+-        MouseEventKind::Move => {
++        MouseEventKind::Move | MouseEventKind::DragMove => {
+           // NOTE: `MouseMoved` doesn't get triggered when clicking and
+           // dragging. Therefore, we also listen for `LeftMouseDragged`
+           // and `RightMouseDragged` events.
+@@ -206,10 +206,6 @@ impl MouseListener {
+           mask |= 1u64 << u64::from(CGEventType::LeftMouseDragged.0);
+           mask |= 1u64 << u64::from(CGEventType::RightMouseDragged.0);
+         }
+-        MouseEventKind::DragMove => {
+-          mask |= 1u64 << u64::from(CGEventType::LeftMouseDragged.0);
+-          mask |= 1u64 << u64::from(CGEventType::RightMouseDragged.0);
+-        }
+         MouseEventKind::LeftButtonDown => {
+           mask |= 1u64 << u64::from(CGEventType::LeftMouseDown.0);
+         }
+@@ -321,13 +317,11 @@ impl MouseListener {
+         button: MouseButton::Right,
+         pressed_buttons: data.pressed_buttons,
+       },
+-      MouseEventKind::Move | MouseEventKind::DragMove => {
+-        MouseEvent::Move {
+-          position,
+-          pressed_buttons: data.pressed_buttons,
+-          window_below_cursor,
+-        }
+-      }
++      MouseEventKind::Move | MouseEventKind::DragMove => MouseEvent::Move {
++        position,
++        pressed_buttons: data.pressed_buttons,
++        window_below_cursor,
++      },
+     };
+ 
+     if should_emit {
+diff --git a/packages/wm-platform/src/platform_impl/windows/mouse_listener.rs b/packages/wm-platform/src/platform_impl/windows/mouse_listener.rs
+index ea58938..e00c127 100644
+--- a/packages/wm-platform/src/platform_impl/windows/mouse_listener.rs
++++ b/packages/wm-platform/src/platform_impl/windows/mouse_listener.rs
+@@ -226,37 +226,12 @@ impl MouseListener {
+     let is_dragging = callback_data.pressed.contains(&MouseButton::Left)
+       || callback_data.pressed.contains(&MouseButton::Right);
+ 
+-    let is_event_enabled = match event_kind {
+-      MouseEventKind::Move => {
+-        enabled_events.contains(&MouseEventKind::Move)
+-          || (is_dragging
+-            && enabled_events.contains(&MouseEventKind::DragMove))
+-      }
+-      _ => enabled_events.contains(&event_kind),
+-    };
+-
+-    if !is_event_enabled {
+-      return Ok(());
+-    }
+-
+-    // Throttle passive mouse move events to 50ms, while drag moves run
+-    // at 8ms (~120 Hz) for smooth window tracking. State change events
+-    // (button down/up) always get emitted.
+-    let should_emit = match event_kind {
+-      MouseEventKind::Move => {
+-        let interval = if is_dragging {
+-          Duration::from_millis(8)
+-        } else {
+-          Duration::from_millis(50)
+-        };
+-        callback_data
+-          .last_move_emission
+-          .is_none_or(|timestamp| timestamp.elapsed() >= interval)
+-      }
+-      _ => true,
+-    };
+-
+-    if !should_emit {
++    if !Self::should_emit_event(
++      enabled_events,
++      event_kind,
++      is_dragging,
++      callback_data.last_move_emission,
++    ) {
+       return Ok(());
+     }
+ 
+@@ -281,13 +256,11 @@ impl MouseListener {
+         button: MouseButton::Right,
+         pressed_buttons: callback_data.pressed,
+       },
+-      MouseEventKind::Move | MouseEventKind::DragMove => {
+-        MouseEvent::Move {
+-          position: Self::cursor_pos()?,
+-          pressed_buttons: callback_data.pressed,
+-          window_below_cursor: None,
+-        }
+-      }
++      MouseEventKind::Move | MouseEventKind::DragMove => MouseEvent::Move {
++        position: Self::cursor_pos()?,
++        pressed_buttons: callback_data.pressed,
++        window_below_cursor: None,
++      },
+     };
+ 
+     let _ = callback_data.event_tx.send(mouse_event);
+@@ -299,6 +272,42 @@ impl MouseListener {
+     Ok(())
+   }
+ 
++  /// Checks if an input event passes the enabled mask and throttle.
++  fn should_emit_event(
++    enabled_events: &[MouseEventKind],
++    event_kind: MouseEventKind,
++    is_dragging: bool,
++    last_move_emission: Option<Instant>,
++  ) -> bool {
++    let is_enabled = match event_kind {
++      MouseEventKind::Move => {
++        enabled_events.contains(&MouseEventKind::Move)
++          || (is_dragging
++            && enabled_events.contains(&MouseEventKind::DragMove))
++      }
++      _ => enabled_events.contains(&event_kind),
++    };
++
++    if !is_enabled {
++      return false;
++    }
++
++    // Throttle passive move events to 50ms and drag moves to 8ms (~120Hz)
++    // for smooth tracking. Button events always pass through.
++    match event_kind {
++      MouseEventKind::Move => {
++        let interval = if is_dragging {
++          Duration::from_millis(8)
++        } else {
++          Duration::from_millis(50)
++        };
++        last_move_emission
++          .is_none_or(|timestamp| timestamp.elapsed() >= interval)
++      }
++      _ => true,
++    }
++  }
++
+   /// Gets the current cursor position.
+   fn cursor_pos() -> crate::Result<Point> {
+     let mut point = POINT { x: 0, y: 0 };
+diff --git a/packages/wm-platform/src/platform_impl/windows/native_window.rs b/packages/wm-platform/src/platform_impl/windows/native_window.rs
+index 968369f..54dacd2 100644
+--- a/packages/wm-platform/src/platform_impl/windows/native_window.rs
++++ b/packages/wm-platform/src/platform_impl/windows/native_window.rs
+@@ -509,10 +509,7 @@ impl NativeWindow {
+     const HTTRANSPARENT_HIT: usize = HTTRANSPARENT as isize as usize;
+     const MAX_ANCESTOR_STEPS: usize = 16;
+ 
+-    let pt = POINT {
+-      x: point.x,
+-      y: point.y,
+-    };
++    let pt = POINT { x: point.x, y: point.y };
+     let target_hwnd = unsafe { WindowFromPoint(pt) };
+     if target_hwnd.0 == 0 {
+       return false;
+@@ -567,8 +564,8 @@ impl NativeWindow {
+ 
+   /// Implements [`NativeWindowWindowsExt::is_in_native_movesize`].
+   pub(crate) fn is_in_native_movesize(&self) -> bool {
+-    let thread_id =
+-      unsafe { GetWindowThreadProcessId(self.hwnd(), None) };
++    let hwnd = self.hwnd();
++    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, None) };
+     if thread_id == 0 {
+       return false;
+     }
+diff --git a/packages/wm/src/commands/general/platform_sync.rs b/packages/wm/src/commands/general/platform_sync.rs
+index 2c80edc..e68d04b 100644
+--- a/packages/wm/src/commands/general/platform_sync.rs
++++ b/packages/wm/src/commands/general/platform_sync.rs
+@@ -394,8 +394,7 @@ fn reposition_window(
+     {
+       use wm_platform::{
+         SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+-        SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSENDCHANGING, SWP_NOSIZE,
+-        WS_MAXIMIZEBOX,
++        SWP_NOCOPYBITS, SWP_NOSENDCHANGING, WS_MAXIMIZEBOX,
+       };
+ 
+       // Restore window if it's minimized/maximized and shouldn't be. This
+@@ -437,28 +436,7 @@ fn reposition_window(
+           if fullscreen.maximized
+             && window.native().has_window_style(WS_MAXIMIZEBOX) =>
+         {
+-          let is_same_monitor =
+-            window.monitor().is_some_and(|monitor| {
+-              monitor.to_rect().is_ok_and(|monitor_rect| {
+-                monitor_rect.contains_point(
+-                  &window.native_properties().frame.center_point(),
+-                )
+-              })
+-            });
+-
+-          if window.native().is_maximized()? {
+-            if is_same_monitor {
+-              swp_flags |= SWP_NOMOVE | SWP_NOSIZE;
+-              window.native().set_window_pos(z_order, &rect, swp_flags)?;
+-            } else {
+-              window.native().restore(Some(&rect))?;
+-              window.native().set_window_pos(z_order, &rect, swp_flags)?;
+-              window.native().maximize()?;
+-            }
+-          } else {
+-            window.native().set_window_pos(z_order, &rect, swp_flags)?;
+-            window.native().maximize()?;
+-          }
++          reposition_maximized_window(window, z_order, &rect, swp_flags)?;
+         }
+         _ => {
+           swp_flags |= SWP_FRAMECHANGED;
+@@ -573,6 +551,39 @@ fn apply_window_effects(
+   }
+ }
+ 
++#[cfg(target_os = "windows")]
++fn reposition_maximized_window(
++  window: &WindowContainer,
++  z_order: &WindowZOrder,
++  rect: &Rect,
++  mut swp_flags: wm_platform::SET_WINDOW_POS_FLAGS,
++) -> anyhow::Result<()> {
++  use wm_platform::{SWP_NOMOVE, SWP_NOSIZE};
++
++  let is_same_monitor = window.monitor().is_some_and(|monitor| {
++    monitor.to_rect().is_ok_and(|monitor_rect| {
++      monitor_rect
++        .contains_point(&window.native_properties().frame.center_point())
++    })
++  });
++
++  if window.native().is_maximized()? {
++    if is_same_monitor {
++      swp_flags |= SWP_NOMOVE | SWP_NOSIZE;
++      window.native().set_window_pos(z_order, rect, swp_flags)?;
++    } else {
++      window.native().restore(Some(rect))?;
++      window.native().set_window_pos(z_order, rect, swp_flags)?;
++      window.native().maximize()?;
++    }
++  } else {
++    window.native().set_window_pos(z_order, rect, swp_flags)?;
++    window.native().maximize()?;
++  }
++
++  Ok(())
++}
++
+ #[cfg(target_os = "windows")]
+ fn apply_border_effect(
+   window: &WindowContainer,
+diff --git a/packages/wm/src/commands/window/manage_window.rs b/packages/wm/src/commands/window/manage_window.rs
+index 7e5cf3a..e1bbcc6 100644
+--- a/packages/wm/src/commands/window/manage_window.rs
++++ b/packages/wm/src/commands/window/manage_window.rs
+@@ -4,10 +4,9 @@ use wm_common::{
+   try_warn, FullscreenStateConfig, InitialWindowState, WindowRuleEvent,
+   WindowState, WmEvent,
+ };
+-#[cfg(not(target_os = "windows"))]
+-use wm_platform::{NativeWindow, RectDelta};
+ #[cfg(target_os = "windows")]
+-use wm_platform::{NativeWindow, NativeWindowWindowsExt, Rect, RectDelta};
++use wm_platform::NativeWindowWindowsExt;
++use wm_platform::{NativeWindow, Rect, RectDelta};
+ 
+ use crate::{
+   commands::{
+@@ -16,7 +15,7 @@ use crate::{
+   },
+   models::{
+     Container, Monitor, NativeWindowProperties, NonTilingWindow,
+-    TilingWindow, WindowContainer,
++    TilingWindow, WindowContainer, Workspace,
+   },
+   traits::{CommonGetters, PositionGetters, WindowGetters},
+   user_config::UserConfig,
+@@ -197,37 +196,11 @@ fn create_window(
+   // when already maximized on Windows) and optionally center it.
+   let is_same_workspace = nearest_workspace.id() == target_workspace.id();
+   let floating_placement = {
+-    let base_frame = {
+-      #[cfg(target_os = "windows")]
+-      if native_properties.is_maximized {
+-        if let Ok((norm_w, norm_h)) = native_window.normal_frame_size() {
+-          let sb = &native_properties.shadow_borders;
+-          let w =
+-            norm_w - sb.left.to_px(0, None) - sb.right.to_px(0, None);
+-          let h =
+-            norm_h - sb.top.to_px(0, None) - sb.bottom.to_px(0, None);
+-          if w >= 250 && h >= 140 {
+-            Rect::from_xy(
+-              native_properties.frame.left,
+-              native_properties.frame.top,
+-              w,
+-              h,
+-            )
+-            .translate_to_center(&target_workspace.to_rect()?)
+-          } else {
+-            native_properties.frame.clone()
+-          }
+-        } else {
+-          native_properties.frame.clone()
+-        }
+-      } else {
+-        native_properties.frame.clone()
+-      }
+-      #[cfg(not(target_os = "windows"))]
+-      {
+-        native_properties.frame.clone()
+-      }
+-    };
++    let base_frame = initial_floating_base_frame(
++      &native_window,
++      &native_properties,
++      &target_workspace,
++    )?;
+ 
+     let placement = if !is_same_workspace || prefers_centered {
+       base_frame.translate_to_center(&target_workspace.to_rect()?)
+@@ -298,6 +271,44 @@ fn create_window(
+ /// Gets the initial state for a window based on its native state.
+ ///
+ /// Note that maximized windows are initialized as tiling.
++#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
++fn initial_floating_base_frame(
++  native_window: &NativeWindow,
++  native_properties: &NativeWindowProperties,
++  target_workspace: &Workspace,
++) -> anyhow::Result<Rect> {
++  #[cfg(target_os = "windows")]
++  {
++    if !native_properties.is_maximized {
++      return Ok(native_properties.frame.clone());
++    }
++
++    if let Ok((normal_width, normal_height)) =
++      native_window.normal_frame_size()
++    {
++      let borders = &native_properties.shadow_borders;
++      let width = normal_width
++        - borders.left.to_px(0, None)
++        - borders.right.to_px(0, None);
++      let height = normal_height
++        - borders.top.to_px(0, None)
++        - borders.bottom.to_px(0, None);
++
++      if width >= 250 && height >= 140 {
++        let rect = Rect::from_xy(
++          native_properties.frame.left,
++          native_properties.frame.top,
++          width,
++          height,
++        );
++        return Ok(rect.translate_to_center(&target_workspace.to_rect()?));
++      }
++    }
++  }
++
++  Ok(native_properties.frame.clone())
++}
++
+ fn window_state_to_create(
+   native_properties: &NativeWindowProperties,
+   nearest_monitor: &Monitor,
+diff --git a/packages/wm/src/events/handle_mouse_move.rs b/packages/wm/src/events/handle_mouse_move.rs
+index 705d713..c247a5c 100644
+--- a/packages/wm/src/events/handle_mouse_move.rs
++++ b/packages/wm/src/events/handle_mouse_move.rs
+@@ -38,25 +38,8 @@ pub fn handle_mouse_move(
+   }
+ 
+   #[cfg(target_os = "windows")]
+-  match event {
+-    MouseEvent::ButtonDown {
+-      button: MouseButton::Left,
+-      position,
+-      ..
+-    } => {
+-      return handle_windows_left_down(position, state, config);
+-    }
+-    MouseEvent::ButtonUp {
+-      button: MouseButton::Left,
+-      ..
+-    } => {
+-      state.pending_maximize_drag = None;
+-      if state.active_manual_drag.is_some() {
+-        return finish_manual_drag(state);
+-      }
+-      return Ok(());
+-    }
+-    _ => {}
++  if handle_windows_mouse_button(event, state)? {
++    return Ok(());
+   }
+ 
+   // On macOS, detect when a window drag operation has ended by listening
+@@ -172,11 +155,38 @@ pub fn handle_mouse_move(
+   Ok(())
+ }
+ 
++#[cfg(target_os = "windows")]
++fn handle_windows_mouse_button(
++  event: &MouseEvent,
++  state: &mut WmState,
++) -> anyhow::Result<bool> {
++  match event {
++    MouseEvent::ButtonDown {
++      button: MouseButton::Left,
++      position,
++      ..
++    } => {
++      handle_windows_left_down(position, state)?;
++      Ok(true)
++    }
++    MouseEvent::ButtonUp {
++      button: MouseButton::Left,
++      ..
++    } => {
++      state.pending_maximize_drag = None;
++      if state.active_manual_drag.is_some() {
++        finish_manual_drag(state)?;
++      }
++      Ok(true)
++    }
++    _ => Ok(false),
++  }
++}
++
+ #[cfg(target_os = "windows")]
+ fn handle_windows_left_down(
+   position: &Point,
+   state: &mut WmState,
+-  _config: &UserConfig,
+ ) -> anyhow::Result<()> {
+   state.pending_maximize_drag = None;
+ 
+@@ -299,6 +309,41 @@ fn handle_windows_drag_move(
+   Ok(true)
+ }
+ 
++#[cfg(target_os = "windows")]
++fn restored_window_size(
++  window: &WindowContainer,
++  max_width: i32,
++  max_height: i32,
++) -> (i32, i32) {
++  let fits_restored = |width: i32, height: i32| {
++    width >= 250
++      && height >= 140
++      && (width < max_width - 20 || height < max_height - 20)
++  };
++
++  let placement = window.floating_placement();
++  if fits_restored(placement.width(), placement.height()) {
++    return (placement.width(), placement.height());
++  }
++
++  if let Ok((normal_width, normal_height)) =
++    window.native().normal_frame_size()
++  {
++    let borders = window.native_properties().shadow_borders;
++    let width = normal_width
++      - borders.left.to_px(0, None)
++      - borders.right.to_px(0, None);
++    let height = normal_height
++      - borders.top.to_px(0, None)
++      - borders.bottom.to_px(0, None);
++    if fits_restored(width, height) {
++      return (width, height);
++    }
++  }
++
++  ((max_width * 7) / 10, (max_height * 75) / 100)
++}
++
+ #[cfg(target_os = "windows")]
+ fn start_maximize_drag(
+   window: WindowContainer,
+@@ -307,53 +352,38 @@ fn start_maximize_drag(
+   state: &mut WmState,
+   config: &UserConfig,
+ ) -> anyhow::Result<()> {
+-  let max_w = pending.max_frame.width().max(320);
+-  let max_h = pending.max_frame.height().max(200);
+-
+-  let fp = window.floating_placement();
+-  let (restored_w, restored_h) = if fp.width() >= 250
+-    && fp.height() >= 140
+-    && (fp.width() < max_w - 20 || fp.height() < max_h - 20)
+-  {
+-    (fp.width(), fp.height())
+-  } else if let Ok((norm_w, norm_h)) =
+-    window.native().normal_frame_size()
+-  {
+-    let sb = window.native_properties().shadow_borders;
+-    let w = norm_w - sb.left.to_px(0, None) - sb.right.to_px(0, None);
+-    let h = norm_h - sb.top.to_px(0, None) - sb.bottom.to_px(0, None);
+-    if w >= 250 && h >= 140 && (w < max_w - 20 || h < max_h - 20) {
+-      (w, h)
+-    } else {
+-      ((max_w * 7) / 10, (max_h * 75) / 100)
+-    }
+-  } else {
+-    ((max_w * 7) / 10, (max_h * 75) / 100)
+-  };
+-
+-  let restored_w = restored_w.clamp(250, (max_w - 20).max(250));
+-  let restored_h = restored_h.clamp(140, (max_h - 20).max(140));
+-
+-  #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+-  let rel_x = ((pending.start_cursor.x - pending.max_frame.left) as f32
+-    / max_w as f32)
+-    .clamp(0.15, 0.85);
++  let max_width = pending.max_frame.width().max(320);
++  let max_height = pending.max_frame.height().max(200);
++  let (restored_width, restored_height) =
++    restored_window_size(&window, max_width, max_height);
++
++  let restored_width =
++    restored_width.clamp(250, (max_width - 20).max(250));
++  let restored_height =
++    restored_height.clamp(140, (max_height - 20).max(140));
++
++  #[allow(clippy::cast_precision_loss)]
++  let cursor_offset =
++    (pending.start_cursor.x - pending.max_frame.left) as f32;
++  #[allow(clippy::cast_precision_loss)]
++  let rel_x = (cursor_offset / max_width as f32).clamp(0.15, 0.85);
+   let grab_offset_y =
+     (pending.start_cursor.y - pending.max_frame.top).clamp(8, 36);
+ 
+   #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+-  let frame_x = position.x - (restored_w as f32 * rel_x).round() as i32;
++  let frame_x =
++    position.x - (restored_width as f32 * rel_x).round() as i32;
+   let frame_y = position.y - grab_offset_y;
+   let restored_frame =
+-    Rect::from_xy(frame_x, frame_y, restored_w, restored_h);
++    Rect::from_xy(frame_x, frame_y, restored_width, restored_height);
+ 
+   let border_delta = window.total_border_delta()?;
+   let outer_rect = restored_frame.apply_delta(&border_delta, None);
+ 
+-  window.native().restore(Some(&outer_rect))?;
+-  let _ = window
+-    .native()
+-    .move_without_resize(outer_rect.left, outer_rect.top);
++  let native = window.native();
++  native.restore(Some(&outer_rect))?;
++  let _ = native.move_without_resize(outer_rect.left, outer_rect.top);
++  drop(native);
+ 
+   window.set_floating_placement(restored_frame.clone());
+   window.set_has_custom_floating_placement(true);
+diff --git a/packages/wm/src/events/handle_window_moved_or_resized.rs b/packages/wm/src/events/handle_window_moved_or_resized.rs
+index d06395d..1fdf51b 100644
+--- a/packages/wm/src/events/handle_window_moved_or_resized.rs
++++ b/packages/wm/src/events/handle_window_moved_or_resized.rs
+@@ -546,7 +546,7 @@ pub fn update_live_resize(
+   initial_position: &Rect,
+   state: &mut WmState,
+ ) -> anyhow::Result<()> {
+-  let Ok(tiling_window) = window.as_tiling_window() else {
++  let Some(tiling_window) = window.as_tiling_window() else {
+     return Ok(());
+   };
+ 
+@@ -559,8 +559,7 @@ pub fn update_live_resize(
+           frame_position.right != initial_position.right;
+       }
+       if !existing.dragged_top && !existing.dragged_bottom {
+-        existing.dragged_top =
+-          frame_position.top != initial_position.top;
++        existing.dragged_top = frame_position.top != initial_position.top;
+         existing.dragged_bottom =
+           frame_position.bottom != initial_position.bottom;
+       }
+@@ -611,14 +610,14 @@ pub fn update_live_resize(
+       continue;
+     }
+ 
+-    let (h_gap, v_gap) = container.inner_gaps()?;
++    let (horizontal_gap, vertical_gap) = container.inner_gaps()?;
+     let parent_rect = parent.to_rect()?;
+     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+     let sibling_count = container.tiling_siblings().count() as i32;
+     let available_px = if is_horizontal {
+-      parent_rect.width() - h_gap * sibling_count
++      parent_rect.width() - horizontal_gap * sibling_count
+     } else {
+-      parent_rect.height() - v_gap * sibling_count
++      parent_rect.height() - vertical_gap * sibling_count
+     };
+ 
+     if available_px <= 0 {
+diff --git a/packages/wm/src/events/handle_window_moved_or_resized_end.rs b/packages/wm/src/events/handle_window_moved_or_resized_end.rs
+index f535def..546e5bc 100644
+--- a/packages/wm/src/events/handle_window_moved_or_resized_end.rs
++++ b/packages/wm/src/events/handle_window_moved_or_resized_end.rs
+@@ -1,7 +1,7 @@
+ use anyhow::Context;
+ use wm_common::{
+-  try_warn, ActiveDragOperation, FullscreenStateConfig, TilingDirection,
+-  WindowState,
++  try_warn, ActiveDrag, ActiveDragOperation, FullscreenStateConfig,
++  TilingDirection, WindowState,
+ };
+ use wm_platform::{LengthValue, Point, Rect};
+ 
+@@ -13,7 +13,7 @@ use crate::{
+   events::{update_floating_window_position, update_live_resize},
+   models::{
+     DirectionContainer, NonTilingWindow, SplitContainer, TilingContainer,
+-    WindowContainer,
++    TilingWindow, WindowContainer,
+   },
+   traits::{
+     CommonGetters, PositionGetters, TilingDirectionGetters, WindowGetters,
+@@ -115,55 +115,64 @@ pub fn handle_window_moved_or_resized_end(
+       }
+     }
+     WindowContainer::TilingWindow(window) => {
+-      tracing::info!(
+-        "Tiling window move/resize ended: {}",
+-        window.as_window_container()?
+-      );
+-
+-      let frame = window.native_properties().frame;
+-      let is_live_resize = active_drag.operation
+-        == Some(ActiveDragOperation::Resize)
+-        && state
+-          .live_resize_state
+-          .as_ref()
+-          .is_some_and(|resize| resize.window_id == window.id());
+-
+-      if is_live_resize {
+-        let container: WindowContainer = window.clone().into();
+-        update_live_resize(
+-          &container,
+-          &frame,
+-          &active_drag.initial_position,
+-          state,
+-        )?;
+-        state.clear_window_drag_state(window.id());
+-      } else {
+-        state.clear_window_drag_state(window.id());
++      finish_tiling_window_drag(window, &active_drag, state)?;
++    }
++  }
+ 
+-        // Update the window's size based on the new frame position. This
+-        // means we use the actual window dimensions as the source of
+-        // truth.
+-        set_window_size(
+-          window.clone().into(),
+-          Some(LengthValue::from_px(frame.width())),
+-          Some(LengthValue::from_px(frame.height())),
+-          state,
+-        )?;
+-      }
++  Ok(())
++}
+ 
+-      window.set_active_drag(None);
++fn finish_tiling_window_drag(
++  window: &TilingWindow,
++  active_drag: &ActiveDrag,
++  state: &mut WmState,
++) -> anyhow::Result<()> {
++  tracing::info!(
++    "Tiling window move/resize ended: {}",
++    window.as_window_container()?
++  );
+ 
+-      // Force a redraw of the window to snap it back to its original
+-      // position. This is necessary when:
+-      // - The window is the only tiling window in the workspace.
+-      // - The window is not past the movement threshold for transitioning
+-      //   to floating while being dragged.
+-      // - Resizing in a direction that doesn't change the window's tiling
+-      //   size.
+-      state.pending_sync.queue_container_to_redraw(window.clone());
+-    }
++  let frame = window.native_properties().frame;
++  let is_live_resize = active_drag.operation
++    == Some(ActiveDragOperation::Resize)
++    && state
++      .live_resize_state
++      .as_ref()
++      .is_some_and(|resize| resize.window_id == window.id());
++
++  if is_live_resize {
++    let container: WindowContainer = window.clone().into();
++    update_live_resize(
++      &container,
++      &frame,
++      &active_drag.initial_position,
++      state,
++    )?;
++    state.clear_window_drag_state(window.id());
++  } else {
++    state.clear_window_drag_state(window.id());
++
++    // Update the window's size based on the new frame position. This means
++    // we use the actual window dimensions as the source of truth.
++    set_window_size(
++      window.clone().into(),
++      Some(LengthValue::from_px(frame.width())),
++      Some(LengthValue::from_px(frame.height())),
++      state,
++    )?;
+   }
+ 
++  window.set_active_drag(None);
++
++  // Force a redraw of the window to snap it back to its original position.
++  // This is necessary when:
++  // - The window is the only tiling window in the workspace.
++  // - The window is not past the movement threshold for transitioning to
++  //   floating while being dragged.
++  // - Resizing in a direction that doesn't change the window's tiling
++  //   size.
++  state.pending_sync.queue_container_to_redraw(window.clone());
++
+   Ok(())
+ }
+ 
+diff --git a/packages/wm/src/wm_state.rs b/packages/wm/src/wm_state.rs
+index 2d1f9f9..bf20daf 100644
+--- a/packages/wm/src/wm_state.rs
++++ b/packages/wm/src/wm_state.rs
+@@ -93,8 +93,7 @@ pub struct WmState {
+   /// Whether the OS focused window is the same as the WM focused window.
+   pub is_focus_synced: bool,
+ 
+-  /// Candidate titlebar press on a maximized window awaiting drag
+-  /// threshold.
++  /// Pending titlebar click on a maximized window awaiting drag start.
+   #[cfg(target_os = "windows")]
+   pub pending_maximize_drag: Option<PendingMaximizeDrag>,
+ 

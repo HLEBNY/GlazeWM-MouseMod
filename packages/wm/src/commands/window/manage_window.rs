@@ -4,10 +4,9 @@ use wm_common::{
   try_warn, FullscreenStateConfig, InitialWindowState, WindowRuleEvent,
   WindowState, WmEvent,
 };
-#[cfg(not(target_os = "windows"))]
-use wm_platform::{NativeWindow, RectDelta};
 #[cfg(target_os = "windows")]
-use wm_platform::{NativeWindow, NativeWindowWindowsExt, Rect, RectDelta};
+use wm_platform::NativeWindowWindowsExt;
+use wm_platform::{NativeWindow, Rect, RectDelta};
 
 use crate::{
   commands::{
@@ -16,7 +15,7 @@ use crate::{
   },
   models::{
     Container, Monitor, NativeWindowProperties, NonTilingWindow,
-    TilingWindow, WindowContainer,
+    TilingWindow, WindowContainer, Workspace,
   },
   traits::{CommonGetters, PositionGetters, WindowGetters},
   user_config::UserConfig,
@@ -197,37 +196,11 @@ fn create_window(
   // when already maximized on Windows) and optionally center it.
   let is_same_workspace = nearest_workspace.id() == target_workspace.id();
   let floating_placement = {
-    let base_frame = {
-      #[cfg(target_os = "windows")]
-      if native_properties.is_maximized {
-        if let Ok((norm_w, norm_h)) = native_window.normal_frame_size() {
-          let sb = &native_properties.shadow_borders;
-          let w =
-            norm_w - sb.left.to_px(0, None) - sb.right.to_px(0, None);
-          let h =
-            norm_h - sb.top.to_px(0, None) - sb.bottom.to_px(0, None);
-          if w >= 250 && h >= 140 {
-            Rect::from_xy(
-              native_properties.frame.left,
-              native_properties.frame.top,
-              w,
-              h,
-            )
-            .translate_to_center(&target_workspace.to_rect()?)
-          } else {
-            native_properties.frame.clone()
-          }
-        } else {
-          native_properties.frame.clone()
-        }
-      } else {
-        native_properties.frame.clone()
-      }
-      #[cfg(not(target_os = "windows"))]
-      {
-        native_properties.frame.clone()
-      }
-    };
+    let base_frame = initial_floating_base_frame(
+      &native_window,
+      &native_properties,
+      &target_workspace,
+    )?;
 
     let placement = if !is_same_workspace || prefers_centered {
       base_frame.translate_to_center(&target_workspace.to_rect()?)
@@ -298,6 +271,44 @@ fn create_window(
 /// Gets the initial state for a window based on its native state.
 ///
 /// Note that maximized windows are initialized as tiling.
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+fn initial_floating_base_frame(
+  native_window: &NativeWindow,
+  native_properties: &NativeWindowProperties,
+  target_workspace: &Workspace,
+) -> anyhow::Result<Rect> {
+  #[cfg(target_os = "windows")]
+  {
+    if !native_properties.is_maximized {
+      return Ok(native_properties.frame.clone());
+    }
+
+    if let Ok((normal_width, normal_height)) =
+      native_window.normal_frame_size()
+    {
+      let borders = &native_properties.shadow_borders;
+      let width = normal_width
+        - borders.left.to_px(0, None)
+        - borders.right.to_px(0, None);
+      let height = normal_height
+        - borders.top.to_px(0, None)
+        - borders.bottom.to_px(0, None);
+
+      if width >= 250 && height >= 140 {
+        let rect = Rect::from_xy(
+          native_properties.frame.left,
+          native_properties.frame.top,
+          width,
+          height,
+        );
+        return Ok(rect.translate_to_center(&target_workspace.to_rect()?));
+      }
+    }
+  }
+
+  Ok(native_properties.frame.clone())
+}
+
 fn window_state_to_create(
   native_properties: &NativeWindowProperties,
   nearest_monitor: &Monitor,
