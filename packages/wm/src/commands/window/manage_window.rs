@@ -287,12 +287,12 @@ fn initial_floating_base_frame(
       native_window.normal_frame_size()
     {
       let borders = &native_properties.shadow_borders;
-      let width = normal_width
-        - borders.left.to_px(0, None)
-        - borders.right.to_px(0, None);
-      let height = normal_height
-        - borders.top.to_px(0, None)
-        - borders.bottom.to_px(0, None);
+      let border_width =
+        borders.left.to_px(0, None) + borders.right.to_px(0, None);
+      let border_height =
+        borders.top.to_px(0, None) + borders.bottom.to_px(0, None);
+      let width = normal_width - border_width;
+      let height = normal_height - border_height;
 
       if width >= 250 && height >= 140 {
         let rect = Rect::from_xy(

@@ -133,12 +133,10 @@ fn finish_tiling_window_drag(
   );
 
   let frame = window.native_properties().frame;
-  let is_live_resize = active_drag.operation
-    == Some(ActiveDragOperation::Resize)
-    && state
-      .live_resize_state
-      .as_ref()
-      .is_some_and(|resize| resize.window_id == window.id());
+  let is_resize =
+    active_drag.operation == Some(ActiveDragOperation::Resize);
+  let is_live_resize =
+    is_resize && state.is_live_resize_window(window.id());
 
   if is_live_resize {
     let container: WindowContainer = window.clone().into();
@@ -152,8 +150,7 @@ fn finish_tiling_window_drag(
   } else {
     state.clear_window_drag_state(window.id());
 
-    // Update the window's size based on the new frame position. This means
-    // we use the actual window dimensions as the source of truth.
+    // Update the window's size from its actual frame dimensions.
     set_window_size(
       window.clone().into(),
       Some(LengthValue::from_px(frame.width())),
@@ -164,13 +161,10 @@ fn finish_tiling_window_drag(
 
   window.set_active_drag(None);
 
-  // Force a redraw of the window to snap it back to its original position.
-  // This is necessary when:
-  // - The window is the only tiling window in the workspace.
-  // - The window is not past the movement threshold for transitioning to
-  //   floating while being dragged.
-  // - Resizing in a direction that doesn't change the window's tiling
-  //   size.
+  // Redraw the window so it snaps back when:
+  // - It is the only tiling window in the workspace.
+  // - The drag stayed below the floating movement threshold.
+  // - Resizing did not change the container's tiling size.
   state.pending_sync.queue_container_to_redraw(window.clone());
 
   Ok(())

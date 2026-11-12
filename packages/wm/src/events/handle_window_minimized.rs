@@ -6,7 +6,7 @@ use crate::{
   commands::{
     container::set_focused_descendant, window::update_window_state,
   },
-  traits::WindowGetters,
+  traits::{CommonGetters, WindowGetters},
   user_config::UserConfig,
   wm_state::WmState,
 };

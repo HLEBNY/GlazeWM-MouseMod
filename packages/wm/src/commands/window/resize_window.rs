@@ -29,11 +29,8 @@ pub fn resize_window(
               clippy::cast_possible_wrap,
               clippy::cast_possible_truncation
             )]
-            Some(
-              parent_width
-                - horizontal_gap
-                  * container.tiling_siblings().count() as i32,
-            )
+            let siblings = container.tiling_siblings().count() as i32;
+            Some(parent_width - horizontal_gap * siblings)
           }),
         _ => window.parent().and_then(|parent| {
           parent.to_rect().ok().map(|rect| rect.width())

@@ -640,11 +640,10 @@ pub fn update_live_resize(
       neighbor.set_tiling_size(new_neighbor_size);
 
       let dragged_id = tiling_window.id();
-      state.pending_sync.queue_containers_to_redraw(
-        parent
-          .descendants()
-          .filter(|c| c.is_tiling_window() && c.id() != dragged_id),
-      );
+      let siblings = parent
+        .descendants()
+        .filter(|c| c.is_tiling_window() && c.id() != dragged_id);
+      state.pending_sync.queue_containers_to_redraw(siblings);
     }
   }
 

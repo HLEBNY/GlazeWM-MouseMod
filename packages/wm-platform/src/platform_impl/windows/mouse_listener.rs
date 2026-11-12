@@ -279,21 +279,19 @@ impl MouseListener {
     is_dragging: bool,
     last_move_emission: Option<Instant>,
   ) -> bool {
-    let is_enabled = match event_kind {
-      MouseEventKind::Move => {
-        enabled_events.contains(&MouseEventKind::Move)
-          || (is_dragging
-            && enabled_events.contains(&MouseEventKind::DragMove))
-      }
-      _ => enabled_events.contains(&event_kind),
+    let is_enabled = if event_kind == MouseEventKind::Move {
+      let move_ok = enabled_events.contains(&MouseEventKind::Move);
+      let drag_ok = enabled_events.contains(&MouseEventKind::DragMove);
+      move_ok || (is_dragging && drag_ok)
+    } else {
+      enabled_events.contains(&event_kind)
     };
 
     if !is_enabled {
       return false;
     }
 
-    // Throttle passive move events to 50ms and drag moves to 8ms (~120Hz)
-    // for smooth tracking. Button events always pass through.
+    // Throttle passive moves (50ms) and drag moves (8ms), never buttons.
     match event_kind {
       MouseEventKind::Move => {
         let interval = if is_dragging {
@@ -301,8 +299,7 @@ impl MouseListener {
         } else {
           Duration::from_millis(50)
         };
-        last_move_emission
-          .is_none_or(|timestamp| timestamp.elapsed() >= interval)
+        last_move_emission.is_none_or(|t| t.elapsed() >= interval)
       }
       _ => true,
     }

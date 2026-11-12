@@ -83,12 +83,7 @@ pub fn handle_mouse_move(
   } = event
   {
     #[cfg(target_os = "windows")]
-    if handle_windows_drag_move(
-      position,
-      pressed_buttons,
-      state,
-      config,
-    )? {
+    if handle_drag_move(position, pressed_buttons, state, config)? {
       return Ok(());
     }
 
@@ -216,10 +211,10 @@ fn handle_windows_left_down(
     return Ok(());
   }
 
-  let max_frame = window
-    .native()
-    .frame()
-    .unwrap_or_else(|_| window.native_properties().frame);
+  let max_frame = match window.native().frame() {
+    Ok(frame) => frame,
+    Err(_) => window.native_properties().frame,
+  };
 
   state.pending_maximize_drag = Some(PendingMaximizeDrag {
     window_id: window.id(),
@@ -231,7 +226,7 @@ fn handle_windows_left_down(
 }
 
 #[cfg(target_os = "windows")]
-fn handle_windows_drag_move(
+fn handle_drag_move(
   position: &Point,
   pressed_buttons: &wm_platform::PressedButtons,
   state: &mut WmState,
@@ -247,21 +242,18 @@ fn handle_windows_drag_move(
       return Ok(false);
     }
 
-    let Some(window) = state
-      .windows()
-      .into_iter()
-      .find(|w| w.id() == drag.window_id)
-    else {
+    let Some(window) = state.window_by_id(drag.window_id) else {
       state.active_manual_drag = None;
       return Ok(false);
     };
 
-    if !window.native().is_valid() {
+    let native = window.native();
+    if !native.is_valid() {
       state.active_manual_drag = None;
       return Ok(false);
     }
 
-    let _ = window.native().move_without_resize(
+    let _ = native.move_without_resize(
       position.x - drag.cursor_offset_x,
       position.y - drag.cursor_offset_y,
     );
@@ -288,11 +280,7 @@ fn handle_windows_drag_move(
 
   state.pending_maximize_drag = None;
 
-  let Some(window) = state
-    .windows()
-    .into_iter()
-    .find(|w| w.id() == pending.window_id)
-  else {
+  let Some(window) = state.window_by_id(pending.window_id) else {
     return Ok(false);
   };
 
@@ -330,12 +318,12 @@ fn restored_window_size(
     window.native().normal_frame_size()
   {
     let borders = window.native_properties().shadow_borders;
-    let width = normal_width
-      - borders.left.to_px(0, None)
-      - borders.right.to_px(0, None);
-    let height = normal_height
-      - borders.top.to_px(0, None)
-      - borders.bottom.to_px(0, None);
+    let border_width =
+      borders.left.to_px(0, None) + borders.right.to_px(0, None);
+    let border_height =
+      borders.top.to_px(0, None) + borders.bottom.to_px(0, None);
+    let width = normal_width - border_width;
+    let height = normal_height - border_height;
     if fits_restored(width, height) {
       return (width, height);
     }
@@ -371,8 +359,8 @@ fn start_maximize_drag(
     (pending.start_cursor.y - pending.max_frame.top).clamp(8, 36);
 
   #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-  let frame_x =
-    position.x - (restored_width as f32 * rel_x).round() as i32;
+  let offset_x = (restored_width as f32 * rel_x).round() as i32;
+  let frame_x = position.x - offset_x;
   let frame_y = position.y - grab_offset_y;
   let restored_frame =
     Rect::from_xy(frame_x, frame_y, restored_width, restored_height);
@@ -425,11 +413,7 @@ fn finish_manual_drag(state: &mut WmState) -> anyhow::Result<()> {
     return Ok(());
   };
 
-  let Some(window) = state
-    .windows()
-    .into_iter()
-    .find(|w| w.id() == drag.window_id)
-  else {
+  let Some(window) = state.window_by_id(drag.window_id) else {
     return Ok(());
   };
 

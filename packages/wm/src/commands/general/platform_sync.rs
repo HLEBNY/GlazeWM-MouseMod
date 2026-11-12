@@ -562,8 +562,8 @@ fn reposition_maximized_window(
 
   let is_same_monitor = window.monitor().is_some_and(|monitor| {
     monitor.to_rect().is_ok_and(|monitor_rect| {
-      monitor_rect
-        .contains_point(&window.native_properties().frame.center_point())
+      let center = window.native_properties().frame.center_point();
+      monitor_rect.contains_point(&center)
     })
   });
 

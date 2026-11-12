@@ -174,6 +174,21 @@ impl WmState {
     }
   }
 
+  /// Finds a managed window by its container `window_id`.
+  #[must_use]
+  pub fn window_by_id(&self, window_id: Uuid) -> Option<WindowContainer> {
+    self.windows().into_iter().find(|w| w.id() == window_id)
+  }
+
+  /// Returns whether `window_id` has an active live tiling resize state.
+  #[must_use]
+  pub fn is_live_resize_window(&self, window_id: Uuid) -> bool {
+    let Some(resize) = &self.live_resize_state else {
+      return false;
+    };
+    resize.window_id == window_id
+  }
+
   /// Populates the initial WM state by creating containers for all
   /// existing windows and monitors.
   pub fn populate(
