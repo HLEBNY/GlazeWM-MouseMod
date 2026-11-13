@@ -241,6 +241,15 @@ pub fn resolve_drop_target(
   }))
 }
 
+fn clamp_rect_edges(rect: &Rect, bounds: &Rect) -> Rect {
+  let left = rect.left.max(bounds.left).min(bounds.right);
+  let top = rect.top.max(bounds.top).min(bounds.bottom);
+  let right = rect.right.min(bounds.right).max(left);
+  let bottom = rect.bottom.min(bounds.bottom).max(top);
+
+  Rect::from_ltrb(left, top, right, bottom)
+}
+
 /// Computes the exact preview rect in screen coordinates for `target`.
 pub fn compute_drop_preview_rect(
   target: &DropTarget,
@@ -248,28 +257,46 @@ pub fn compute_drop_preview_rect(
   active_drag: &ActiveDrag,
   state: &WmState,
 ) -> anyhow::Result<Option<Rect>> {
+  let border_delta = if state.dispatcher.is_openglass_active() {
+    dragged_window.total_border_delta()?
+  } else {
+    dragged_window.border_delta()
+  };
+
   match target {
     DropTarget::Maximize { workspace_id } => {
       let Some(workspace) = state.workspace_by_id(*workspace_id) else {
         return Ok(None);
       };
       let monitor = workspace.monitor().context("No monitor.")?;
+      let working_area = monitor.native_properties().working_area;
       let can_maximize =
         window_supports_native_maximize(dragged_window, state);
       let rect = if can_maximize {
-        monitor.native_properties().working_area
+        working_area
       } else {
-        workspace.max_workspace_rect()?
+        let max_rect =
+          workspace.max_workspace_rect()?.apply_delta(&border_delta, None);
+        clamp_rect_edges(&max_rect, &working_area)
       };
       Ok(Some(rect))
     }
     DropTarget::SwapTile {
-      target_window_id, ..
+      workspace_id,
+      target_window_id,
     } => {
+      let Some(workspace) = state.workspace_by_id(*workspace_id) else {
+        return Ok(None);
+      };
       let Some(container) = state.container_by_id(*target_window_id) else {
         return Ok(None);
       };
-      Ok(Some(container.to_rect()?))
+      let monitor = workspace.monitor().context("No monitor.")?;
+      let working_area = monitor.native_properties().working_area;
+      Ok(Some(clamp_rect_edges(
+        &container.to_rect()?.apply_delta(&border_delta, None),
+        &working_area,
+      )))
     }
     DropTarget::SplitTile {
       workspace_id,
@@ -282,6 +309,8 @@ pub fn compute_drop_preview_rect(
       let Some(container) = state.container_by_id(*target_window_id) else {
         return Ok(None);
       };
+      let monitor = workspace.monitor().context("No monitor.")?;
+      let working_area = monitor.native_properties().working_area;
       let (h_gap, v_gap) = workspace.workspace_inner_gaps()?;
       let rect = container.to_rect()?;
       let (dir, is_first, gap) = match side {
@@ -290,17 +319,23 @@ pub fn compute_drop_preview_rect(
         SplitSide::Top => (TilingDirection::Vertical, true, v_gap),
         SplitSide::Bottom => (TilingDirection::Vertical, false, v_gap),
       };
-      Ok(Some(split_half_rect(&rect, &dir, is_first, gap)))
+      let split = split_half_rect(&rect, &dir, is_first, gap)
+        .apply_delta(&border_delta, None);
+      Ok(Some(clamp_rect_edges(&split, &working_area)))
     }
     DropTarget::SnapZone { workspace_id, zone } => {
       let Some(workspace) = state.workspace_by_id(*workspace_id) else {
         return Ok(None);
       };
-      Ok(Some(compute_snap_zone_preview_rect(
+      let monitor = workspace.monitor().context("No monitor.")?;
+      let working_area = monitor.native_properties().working_area;
+      let preview = compute_snap_zone_preview_rect(
         &workspace,
         *zone,
         active_drag.origin_void_id,
-      )?))
+      )?
+      .apply_delta(&border_delta, None);
+      Ok(Some(clamp_rect_edges(&preview, &working_area)))
     }
   }
 }
@@ -491,6 +526,10 @@ fn commit_maximize_drop(
       .clone()
   };
 
+  // Clear `active_drag` before transitioning state so `prev_state`
+  // records the pre-maximize state (e.g. `Floating`) for later restore.
+  moved_window.set_active_drag(None);
+
   let maximized = update_window_state(
     moved_window.clone().into(),
     WindowState::Fullscreen(FullscreenStateConfig {
@@ -519,7 +558,6 @@ fn commit_maximize_drop(
   }
 
   set_focused_descendant(&maximized.clone().into(), None);
-  maximized.set_active_drag(None);
   state
     .pending_sync
     .queue_container_to_redraw(maximized.clone())
@@ -1953,5 +1991,101 @@ mod tests {
     ));
     assert!(first_void_slot(&workspace).is_none());
     assert_eq!(state.focused_container().unwrap().id(), w2_id);
+    let w2_prev = maxed_w2.prev_state();
+    assert!(matches!(w2_prev, Some(WindowState::Floating(_))));
+    assert!(maxed_w2.active_drag().is_none());
+  }
+
+  #[test]
+  fn maximize_drop_from_floating_preserves_floating_prev_state() {
+    let (mut state, config, workspace) = setup_state();
+    let w1 = add_floating(&workspace, Rect::from_xy(100, 100, 600, 400));
+    let drag = drag_move(true, None);
+    w1.set_active_drag(Some(drag.clone()));
+
+    let maxed = finalize_move_drag(
+      &w1,
+      Rect::from_xy(100, 100, 600, 400),
+      &drag,
+      Some(&Point { x: 960, y: 4 }),
+      &mut state,
+      &config,
+    )
+    .unwrap();
+
+    assert!(matches!(
+      maxed.state(),
+      WindowState::Fullscreen(FullscreenStateConfig {
+        maximized: true,
+        ..
+      })
+    ));
+    assert!(matches!(maxed.prev_state(), Some(WindowState::Floating(_))));
+    assert!(maxed.active_drag().is_none());
+  }
+
+  #[test]
+  fn drop_preview_clips_border_delta_edges_to_working_area() {
+    let (state, _config, workspace) = setup_state();
+    let work = Rect::from_ltrb(0, 0, 1920, 1032);
+    let delta = wm_platform::RectDelta::new(
+      wm_platform::LengthValue::from_px(7),
+      wm_platform::LengthValue::from_px(0),
+      wm_platform::LengthValue::from_px(7),
+      wm_platform::LengthValue::from_px(7),
+    );
+    let zero_left = Rect::from_ltrb(0, 0, 956, 1032);
+    assert_eq!(
+      clamp_rect_edges(&zero_left.apply_delta(&delta, None), &work),
+      Rect::from_ltrb(0, 0, 963, 1032)
+    );
+
+    let base = add_floating(&workspace, Rect::from_xy(100, 100, 600, 400));
+    let drag = drag_move(true, None);
+    let left_target = DropTarget::SnapZone {
+      workspace_id: workspace.id(),
+      zone: ScreenZone::Left,
+    };
+    let base_c: WindowContainer = base.clone().into();
+    let base_preview =
+      compute_drop_preview_rect(&left_target, &base_c, &drag, &state)
+        .unwrap()
+        .unwrap();
+
+    detach_container(base.clone().into()).unwrap();
+    let win = NonTilingWindow::new(
+      Some(base.id()),
+      base.native().clone(),
+      base.native_properties().clone(),
+      WindowState::Floating(FloatingStateConfig::default()),
+      None,
+      delta.clone(),
+      None,
+      base.floating_placement(),
+      false,
+      vec![],
+      None,
+    );
+    attach_container(&win.clone().into(), &workspace.clone().into(), None)
+      .unwrap();
+
+    let win_c: WindowContainer = win.into();
+    let preview =
+      compute_drop_preview_rect(&left_target, &win_c, &drag, &state)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+      preview,
+      clamp_rect_edges(&base_preview.apply_delta(&delta, None), &work)
+    );
+
+    let max_target = DropTarget::Maximize {
+      workspace_id: workspace.id(),
+    };
+    let max_preview =
+      compute_drop_preview_rect(&max_target, &win_c, &drag, &state)
+        .unwrap()
+        .unwrap();
+    assert_eq!(max_preview, work);
   }
 }

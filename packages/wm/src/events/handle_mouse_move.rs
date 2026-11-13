@@ -264,6 +264,15 @@ fn handle_drag_move(
       position.x - drag.cursor_offset_x,
       position.y - drag.cursor_offset_y,
     );
+    let is_maximized = native.is_maximized().unwrap_or(false);
+    if !is_maximized {
+      if let Ok(shadow_borders) = native.shadow_borders() {
+        window.update_native_properties(|properties| {
+          properties.is_maximized = false;
+          properties.shadow_borders = shadow_borders;
+        });
+      }
+    }
     drop(native);
 
     update_drag_snap_preview(&window, Some(position), state)?;
@@ -388,6 +397,7 @@ fn start_maximize_drag(
   window.update_native_properties(|properties| {
     properties.is_maximized = false;
     properties.frame = restored_frame.clone();
+    properties.pending_maximize_until = None;
   });
 
   window.set_active_drag(Some(ActiveDrag {
@@ -446,7 +456,9 @@ fn finish_manual_drag(
   window.update_native_properties(|properties| {
     properties.frame = frame.clone();
     properties.is_maximized = is_maximized;
-    if !is_maximized {
+    if is_maximized {
+      properties.pending_maximize_until = None;
+    } else {
       properties.shadow_borders = shadow_borders;
     }
   });

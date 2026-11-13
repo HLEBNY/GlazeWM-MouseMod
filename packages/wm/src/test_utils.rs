@@ -130,6 +130,7 @@ impl NativeWindowProperties {
       class_name: String::new(),
       #[cfg(target_os = "windows")]
       shadow_borders: mock_border_delta(),
+      pending_maximize_until: None,
     }
   }
 }

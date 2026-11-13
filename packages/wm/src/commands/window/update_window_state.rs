@@ -85,6 +85,9 @@ fn set_tiling(
     .or_else(|| first_void_slot(&workspace));
 
   let tiling_window = window.to_tiling(config.value.gaps.clone());
+  tiling_window.update_native_properties(|properties| {
+    properties.pending_maximize_until = None;
+  });
 
   if let Some(void_slot) = target_void {
     detach_container(window.into())?;
@@ -198,6 +201,15 @@ fn set_non_tiling(
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<WindowContainer> {
+  let is_maximize_target = matches!(
+    &target_state,
+    WindowState::Fullscreen(fullscreen) if fullscreen.maximized
+  );
+  if !is_maximize_target {
+    window.update_native_properties(|properties| {
+      properties.pending_maximize_until = None;
+    });
+  }
   // A window can only be updated to a minimized state if it is
   // natively minimized.
   // TODO: Consider doing the same for maximized and fullscreen states.

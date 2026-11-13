@@ -74,6 +74,9 @@ pub fn handle_window_moved_or_resized(
         let is_maximized = try_warn!(window.native().is_maximized());
         window.update_native_properties(|properties| {
           properties.is_maximized = is_maximized;
+          if is_maximized {
+            properties.pending_maximize_until = None;
+          }
         });
 
         if !is_maximized {
@@ -106,6 +109,9 @@ pub fn handle_window_moved_or_resized(
 
     window.update_native_properties(|properties| {
       properties.is_maximized = is_maximized;
+      if is_maximized {
+        properties.pending_maximize_until = None;
+      }
     });
 
     // If the window is not maximized, update its cached shadow borders.
@@ -187,6 +193,9 @@ pub fn handle_window_moved_or_resized(
 
     if is_drag_start {
       tracing::info!("Window started dragging: {window}");
+      window.update_native_properties(|properties| {
+        properties.pending_maximize_until = None;
+      });
 
       let is_from_floating = matches!(
         window.state(),
@@ -245,6 +254,22 @@ pub fn handle_window_moved_or_resized(
         window.set_display_state(display_state);
         return Ok(());
       }
+    }
+
+    let pending_until = window.native_properties().pending_maximize_until;
+    let is_pending_max =
+      pending_until.is_some_and(|until| std::time::Instant::now() < until);
+    if !is_maximized
+      && is_pending_max
+      && matches!(
+        window.state(),
+        WindowState::Fullscreen(FullscreenStateConfig {
+          maximized: true,
+          ..
+        })
+      )
+    {
+      return Ok(());
     }
 
     let should_fullscreen = {

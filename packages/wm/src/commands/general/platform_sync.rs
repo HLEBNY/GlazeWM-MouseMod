@@ -571,14 +571,55 @@ fn reposition_maximized_window(
   rect: &Rect,
   mut swp_flags: wm_platform::SET_WINDOW_POS_FLAGS,
 ) -> anyhow::Result<()> {
+  use std::time::{Duration, Instant};
+
   use wm_platform::{SWP_NOMOVE, SWP_NOSIZE};
+
+  const PENDING_MAXIMIZE_GRACE: Duration = Duration::from_millis(750);
+
+  let frame_fallback = window.native_properties().frame;
+  let actual_frame = window.native().frame().unwrap_or(frame_fallback);
 
   let is_same_monitor = window.monitor().is_some_and(|monitor| {
     monitor.to_rect().is_ok_and(|monitor_rect| {
-      let center = window.native_properties().frame.center_point();
-      monitor_rect.contains_point(&center)
+      let center = actual_frame.center_point();
+      if monitor_rect.contains_point(&center) {
+        return true;
+      }
+
+      let frame_area = i64::from(actual_frame.width().max(0))
+        * i64::from(actual_frame.height().max(0));
+      if frame_area == 0 {
+        return false;
+      }
+
+      let overlap = i64::from(actual_frame.x_overlap(&monitor_rect).max(0))
+        * i64::from(actual_frame.y_overlap(&monitor_rect).max(0));
+      overlap * 2 >= frame_area
     })
   });
+
+  let arm_pending_maximize = || {
+    window.update_native_properties(|properties| {
+      properties.pending_maximize_until =
+        Some(Instant::now() + PENDING_MAXIMIZE_GRACE);
+    });
+  };
+
+  let was_shown_on_top = matches!(
+    window.prev_state(),
+    Some(WindowState::Floating(prev)) if prev.shown_on_top
+  ) || matches!(
+    window.prev_state(),
+    Some(WindowState::Fullscreen(prev)) if prev.shown_on_top
+  );
+
+  let sync_z_order = || -> anyhow::Result<()> {
+    if !matches!(z_order, WindowZOrder::Normal) || was_shown_on_top {
+      window.native().set_z_order(z_order)?;
+    }
+    Ok(())
+  };
 
   if window.native().is_maximized()? {
     if is_same_monitor {
@@ -587,20 +628,22 @@ fn reposition_maximized_window(
     } else {
       let restore_rect =
         window.floating_placement().translate_to_center(rect);
+      arm_pending_maximize();
       window.native().restore(Some(&restore_rect))?;
       swp_flags |= SWP_NOSIZE;
-      window.native().set_window_pos(z_order, rect, swp_flags)?;
+      window.native().set_window_pos(z_order, &restore_rect, swp_flags)?;
       window.native().maximize()?;
-      if !matches!(z_order, WindowZOrder::Normal) {
-        window.native().set_z_order(z_order)?;
-      }
+      sync_z_order()?;
     }
   } else {
-    window.native().set_window_pos(z_order, rect, swp_flags)?;
-    window.native().maximize()?;
-    if !matches!(z_order, WindowZOrder::Normal) {
-      window.native().set_z_order(z_order)?;
+    if !is_same_monitor {
+      let target_rect = actual_frame.translate_to_center(rect);
+      let flags = swp_flags | SWP_NOSIZE;
+      window.native().set_window_pos(z_order, &target_rect, flags)?;
     }
+    arm_pending_maximize();
+    window.native().maximize()?;
+    sync_z_order()?;
   }
 
   Ok(())

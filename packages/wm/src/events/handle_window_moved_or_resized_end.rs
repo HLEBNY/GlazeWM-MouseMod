@@ -37,6 +37,9 @@ pub fn handle_window_moved_or_resized_end(
 
       window.update_native_properties(|properties| {
         properties.is_maximized = is_maximized;
+        if is_maximized {
+          properties.pending_maximize_until = None;
+        }
       });
 
       let nearest_monitor = state
@@ -64,6 +67,8 @@ pub fn handle_window_moved_or_resized_end(
             .clone()
         };
 
+        window.set_active_drag(None);
+
         let updated = update_window_state(
           window.clone().into(),
           WindowState::Fullscreen(FullscreenStateConfig {
@@ -85,8 +90,6 @@ pub fn handle_window_moved_or_resized_end(
             config,
           )?;
         }
-
-        updated.set_active_drag(None);
 
         if is_maximized {
           // Dequeue the window from redraw if it's maximized, since the

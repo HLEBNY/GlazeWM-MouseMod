@@ -642,6 +642,23 @@ impl Dispatcher {
     self.source.is_some()
   }
 
+  /// Returns `true` when `OpenGlass` is actively running in this session.
+  #[must_use]
+  pub fn is_openglass_active(&self) -> bool {
+    if self.source.is_none() {
+      return false;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+      platform_impl::is_openglass_active()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+      false
+    }
+  }
+
   /// Shows or updates the Aero snap preview overlay behind the given
   /// window.
   pub fn show_snap_overlay(
