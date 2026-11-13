@@ -1,69 +1,89 @@
 <div align="center">
 
-> V3 is finally out - check out the changelog [here](https://github.com/glzr-io/GlazeWM/releases) 🔥
-
   <br>
   <img src="./resources/assets/logo.svg" width="230" alt="GlazeWM logo" />
   <br>
 
-# GlazeWM
+# GlazeWM MouseMod
 
-**A tiling window manager for Windows inspired by i3wm.**
-
-[![Discord invite][discord-badge]][discord-link]
-[![Downloads][downloads-badge]][downloads-link]
-[![Good first issues][issues-badge]][issues-link]
-
-GlazeWM lets you easily organize windows and adjust their layout on the fly by using keyboard-driven commands.
-
-[Installation](#installation) •
-[Default keybindings](#default-keybindings) •
-[Config documentation](#config-documentation) •
-[FAQ](#faq) •
-[Contributing ↗](https://github.com/glzr-io/glazewm/blob/main/CONTRIBUTING.md)
-
-![Demo video][demo-video]
+**A tiling window manager for Windows 11 that pairs GlazeWM with dwm-level
+mouse control — and stays friendly with Aero glass (Aero10 / OpenGlass).**
 
 </div>
 
-### 🌟 Key features
+## About this fork
+
+This is a fork of [GlazeWM](https://github.com/glzr-io/GlazeWM) (by
+[glzr-io](https://github.com/glzr-io)), reworked around one idea: **tiling
+should be fully drivable with the mouse, without giving up the keyboard.**
+
+Why this fork exists:
+
+- **dwm** is the gold standard for tiling window managers, but on Windows 11
+  it fights with Aero glass themes such as
+  [Aero10](https://github.com/vaporvance/aero10) /
+  [OpenGlass](https://github.com/ALTaleX531/OpenGlass): glass borders,
+  titlebars and frame rendering get in the way of a classic dwm workflow.
+- **GlazeWM** is an excellent i3-style tiling manager for Windows, but it is
+  keyboard-driven. Moving, snapping and resizing windows all require
+  keybindings.
+- **MouseMod** keeps everything that makes GlazeWM great (workspaces, YAML
+  config, window rules, Zebar integration) and adds the mouse ergonomics of
+  dwm: drag windows to snap them, drag borders to resize them live, and let
+  the layout rebuild itself around your gestures — all while preserving Aero
+  glass frames and borders.
+
+## Key features
 
 - Simple YAML configuration
 - Multi-monitor support
 - Customizable rules for specific windows
-- Easy one-click installation
 - Integration with [Zebar](https://github.com/glzr-io/zebar) as a status bar
+- **Full mouse-driven tiling** (see below)
+- **Aero glass friendly**: snap previews and tiling respect native window
+  frames, so Aero10 / OpenGlass glass stays intact
+
+## Mouse controls
+
+GlazeWM's keyboard commands keep working as before. On top of that, the
+following mouse gestures are available:
+
+- **Drag a titlebar** to move a window. Dragging the titlebar of a maximized
+  window restores and moves it, even when Windows Snap is disabled.
+- **Drag a floating window to a screen edge or corner** to see a snap
+  preview (half screen, corner quarter, or top-center maximize) and release
+  to tile it there. Dragging to the top-center of the screen maximizes the
+  window.
+- **Drag a tiled window out** onto free space to make it float. Dropping it
+  on top of another tile swaps or splits; dropping it at a screen edge snaps
+  it there.
+- **Drag a window border** to resize it live: neighbors update in real time.
+  Resizing at a screen edge creates a *void slot* (an empty tiling slot);
+  resizing into a void absorbs it. Full-height and full-width windows stay
+  tiling while being dragged along their axis, rebuilding the grid with void
+  slots as needed.
+- **Void slots** keep the layout stable when windows close or are dragged
+  away: vertical neighbors expand to fill the freed slot, otherwise the void
+  remains as an empty slot you can drop windows into later.
 
 ## Installation
 
-**The latest version of GlazeWM is downloadable via [releases](https://github.com/glzr-io/GlazeWM/releases).** Zebar can optionally be installed as well via a checkbox during installation.
-
-GlazeWM is also available through several package managers:
-
-**Winget**
+Download the latest build from
+[Releases](https://github.com/HLEBNY/GlazeWM-MouseMod/releases), then start
+GlazeWM:
 
 ```sh
-winget install GlazeWM
+./glazewm.exe start
 ```
 
-**Chocolatey**
+On first launch you can optionally generate a default configuration at
+`%USERPROFILE%\.glzr\glazewm\config.yaml`.
+
+To build from source (Windows, Rust nightly toolchain):
 
 ```sh
-choco install glazewm
+cargo build --release
 ```
-
-**Scoop**
-
-```sh
-scoop bucket add extras
-scoop install extras/glazewm
-```
-
-## Contributing
-
-Help fix something that annoys you, or add a feature you've been wanting for a long time! Contributions are very welcome.
-
-Local development and guidelines are available in the [contributing guide](https://github.com/glzr-io/glazewm/blob/main/CONTRIBUTING.md).
 
 ## Default keybindings
 

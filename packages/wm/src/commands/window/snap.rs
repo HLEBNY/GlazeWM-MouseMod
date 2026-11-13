@@ -1592,7 +1592,7 @@ impl SimWorkspace {
         let avail = (parent_rect.height() - gap * sibling_gaps).max(1);
         let mut y = parent_rect.y();
         for node in nodes {
-          let h = (node.size * avail as f32) as i32;
+          let h = (node.size * avail as f32).round() as i32;
           let rect =
             Rect::from_xy(parent_rect.x(), y, parent_rect.width(), h);
           match &node.kind {
@@ -1876,7 +1876,7 @@ impl SimWorkspace {
           r
         }
         TilingDirection::Vertical => {
-          let h = (node.size * avail as f32) as i32;
+          let h = (node.size * avail as f32).round() as i32;
           let r = Rect::from_xy(
             parent_rect.x(),
             offset,
@@ -2731,7 +2731,7 @@ fn split_half_rect(
     }
     TilingDirection::Vertical => {
       let avail_h = (rect.height() - gap).max(1);
-      let half_h = (0.5 * avail_h as f32) as i32;
+      let half_h = (0.5 * avail_h as f32).round() as i32;
       let y = if is_first {
         rect.y()
       } else {

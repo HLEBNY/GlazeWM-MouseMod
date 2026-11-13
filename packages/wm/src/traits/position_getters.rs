@@ -39,8 +39,8 @@ macro_rules! impl_position_getters_as_resizable {
             let available_height = parent_rect.height()
               - inner_gap * self.tiling_siblings().count() as i32;
 
-            let height =
-              (self.tiling_size() * available_height as f32) as i32;
+            let height = (self.tiling_size() * available_height as f32)
+              .round() as i32;
 
             (parent_rect.width(), height)
           }
