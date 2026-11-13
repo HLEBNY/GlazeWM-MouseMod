@@ -1,0 +1,715 @@
+diff --git a/packages/wm-platform/src/platform_impl/windows/snap_overlay.rs b/packages/wm-platform/src/platform_impl/windows/snap_overlay.rs
+index 7c88989..823fbb9 100644
+--- a/packages/wm-platform/src/platform_impl/windows/snap_overlay.rs
++++ b/packages/wm-platform/src/platform_impl/windows/snap_overlay.rs
+@@ -18,27 +18,31 @@ use windows::{
+         DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMWA_BORDER_COLOR,
+         DWMWA_COLOR_NONE, DWMWA_EXCLUDED_FROM_PEEK,
+         DWMWA_NCRENDERING_POLICY, DWMWA_TRANSITIONS_FORCEDISABLED,
+-        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWM_BB_ENABLE,
+-        DWM_BLURBEHIND,
++        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
++        DWM_BB_BLURREGION, DWM_BB_ENABLE, DWM_BLURBEHIND,
+       },
+       Gdi::{
+-        BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC,
+-        DeleteObject, EndPaint, GetDC, InvalidateRect, ReleaseDC,
+-        SelectObject, UpdateWindow, AC_SRC_ALPHA, AC_SRC_OVER,
+-        BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
+-        DIB_RGB_COLORS, HBITMAP, HGDIOBJ, PAINTSTRUCT, SRCCOPY,
++        BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection,
++        CreateRoundRectRgn, DeleteDC, DeleteObject, EndPaint, GetDC,
++        InvalidateRect, MonitorFromPoint, ReleaseDC, SelectObject,
++        UpdateWindow, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO,
++        BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP,
++        HGDIOBJ, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY,
+       },
+     },
+     System::LibraryLoader::GetModuleHandleW,
+-    UI::WindowsAndMessaging::{
+-      CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowRect,
+-      RegisterClassW, SetWindowPos, ShowWindow, UpdateLayeredWindow,
+-      CS_HREDRAW, CS_VREDRAW, HTTRANSPARENT, HWND_TOP, MA_NOACTIVATE,
+-      SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER,
+-      SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, ULW_ALPHA, WINDOW_EX_STYLE,
+-      WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WNDCLASSW,
+-      WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+-      WS_POPUP,
++    UI::{
++      HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
++      WindowsAndMessaging::{
++        CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowRect,
++        RegisterClassW, SetWindowPos, ShowWindow, UpdateLayeredWindow,
++        CS_HREDRAW, CS_VREDRAW, HTTRANSPARENT, HWND_TOP, MA_NOACTIVATE,
++        SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER,
++        SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, ULW_ALPHA, WINDOW_EX_STYLE,
++        WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WNDCLASSW,
++        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
++        WS_EX_TRANSPARENT, WS_POPUP,
++      },
+     },
+   },
+ };
+@@ -49,6 +53,7 @@ const OVERLAY_CLASS_NAME: PCWSTR = w!("GlazeWM:SnapOverlay");
+ const OPENGLASS_HOST_PIPE: PCWSTR =
+   w!(r"\\.\pipe\Global\OpenGlassHostPipe");
+ const NMPWAIT_NOWAIT: u32 = 1;
++const DEFAULT_CORNER_RADIUS_PX: i32 = 6;
+ 
+ static SNAP_OVERLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
+ 
+@@ -66,6 +71,8 @@ struct OverlayState {
+   glass_visible: bool,
+   last_rect: Option<Rect>,
+   last_behind_hwnd: Option<isize>,
++  last_radius: Option<i32>,
++  last_blur_dims: Option<(i32, i32, i32)>,
+ }
+ 
+ #[derive(Default)]
+@@ -73,6 +80,7 @@ struct GlassBitmapCache {
+   bitmap: Option<HBITMAP>,
+   width: i32,
+   height: i32,
++  radius: i32,
+ }
+ 
+ thread_local! {
+@@ -165,6 +173,8 @@ pub(crate) fn cleanup_snap_overlay() {
+     state.glass_visible = false;
+     state.last_rect = None;
+     state.last_behind_hwnd = None;
++    state.last_radius = None;
++    state.last_blur_dims = None;
+     (layered, glass)
+   });
+ 
+@@ -188,6 +198,7 @@ pub(crate) fn cleanup_snap_overlay() {
+     }
+     cache.width = 0;
+     cache.height = 0;
++    cache.radius = 0;
+   });
+ }
+ 
+@@ -201,6 +212,7 @@ fn hide_snap_overlay_inner() {
+     state.glass_visible = false;
+     state.last_rect = None;
+     state.last_behind_hwnd = None;
++    state.last_blur_dims = None;
+     (layered, glass)
+   });
+ 
+@@ -212,7 +224,40 @@ fn hide_snap_overlay_inner() {
+   }
+ }
+ 
++fn overlay_corner_radius(rect: &Rect) -> i32 {
++  let center = POINT {
++    x: rect.left + rect.width() / 2,
++    y: rect.top + rect.height() / 2,
++  };
++
++  // SAFETY: `MonitorFromPoint` is valid for any screen coordinate.
++  let hmonitor = unsafe {
++    MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST)
++  };
++  let mut dpi_x = 96u32;
++  let mut dpi_y = 96u32;
++  if hmonitor.0 != 0 {
++    // SAFETY: `hmonitor` is valid and `dpi_x`/`dpi_y` are writable.
++    let _ = unsafe {
++      GetDpiForMonitor(
++        hmonitor,
++        MDT_EFFECTIVE_DPI,
++        &raw mut dpi_x,
++        &raw mut dpi_y,
++      )
++    };
++  }
++
++  let dpi = dpi_y.max(96);
++  let scaled = ((6 * dpi + 48) / 96).clamp(4, 24);
++  i32::try_from(scaled).unwrap_or(DEFAULT_CORNER_RADIUS_PX)
++}
++
+ fn show_glass_overlay(rect: &Rect, behind_hwnd: Option<isize>) {
++  let radius = overlay_corner_radius(rect);
++  let width = rect.width();
++  let height = rect.height();
++
+   let prep = OVERLAY_STATE.with(|state| {
+     let mut state = state.borrow_mut();
+ 
+@@ -225,13 +270,18 @@ fn show_glass_overlay(rect: &Rect, behind_hwnd: Option<isize>) {
+ 
+     let glass_hwnd = ensure_glass_overlay_window(&mut state)?;
+     let was_visible = state.glass_visible;
+-    let needs_geometry =
+-      !was_visible || state.last_rect.as_ref() != Some(rect);
++    let needs_geometry = !was_visible
++      || state.last_rect.as_ref() != Some(rect)
++      || state.last_radius != Some(radius);
++    let needs_blur_rgn = !was_visible
++      || state.last_blur_dims != Some((width, height, radius));
+     let needs_zorder =
+       needs_geometry || state.last_behind_hwnd != behind_hwnd;
+ 
+     state.glass_visible = true;
+     state.last_rect = Some(rect.clone());
++    state.last_radius = Some(radius);
++    state.last_blur_dims = Some((width, height, radius));
+     state.last_behind_hwnd = behind_hwnd;
+ 
+     Some((
+@@ -239,6 +289,7 @@ fn show_glass_overlay(rect: &Rect, behind_hwnd: Option<isize>) {
+       hide_layered,
+       was_visible,
+       needs_geometry,
++      needs_blur_rgn,
+       needs_zorder,
+     ))
+   });
+@@ -248,6 +299,7 @@ fn show_glass_overlay(rect: &Rect, behind_hwnd: Option<isize>) {
+     hide_layered,
+     was_visible,
+     needs_geometry,
++    needs_blur_rgn,
+     needs_zorder,
+   )) = prep
+   else {
+@@ -264,17 +316,23 @@ fn show_glass_overlay(rect: &Rect, behind_hwnd: Option<isize>) {
+   if needs_geometry {
+     GLASS_BITMAP_CACHE.with(|cache| {
+       let mut cache = cache.borrow_mut();
+-      let _ = ensure_glass_bitmap(&mut cache, rect.width(), rect.height());
++      let _ = ensure_glass_bitmap(&mut cache, width, height, radius);
+     });
+ 
+-    position_glass_overlay(glass_hwnd, rect, behind_hwnd);
++    position_glass_overlay(glass_hwnd, rect, behind_hwnd, was_visible);
++  }
+ 
++  if needs_blur_rgn {
++    enable_dwm_glass_behind(glass_hwnd, width, height, radius);
++  }
++
++  if needs_geometry || needs_blur_rgn {
+     if !was_visible {
+-      enable_dwm_glass_behind(glass_hwnd);
++      apply_z_order_and_show(glass_hwnd, behind_hwnd);
+     }
+ 
+     // SAFETY: `glass_hwnd` belongs to this thread; force immediate
+-    // repaint so the first shown frame displays crisp glass bevels.
++    // repaint so the shown frame displays rounded glass bevels.
+     unsafe {
+       let _ = InvalidateRect(glass_hwnd, None, false);
+       let _ = UpdateWindow(glass_hwnd);
+@@ -285,24 +343,29 @@ fn show_glass_overlay(rect: &Rect, behind_hwnd: Option<isize>) {
+ }
+ 
+ fn show_layered_overlay(rect: &Rect, behind_hwnd: Option<isize>) {
++  let radius = overlay_corner_radius(rect);
++
+   let prep = OVERLAY_STATE.with(|state| {
+     let mut state = state.borrow_mut();
+ 
+     let hide_glass = if state.glass_visible {
+       state.glass_visible = false;
++      state.last_blur_dims = None;
+       state.glass_hwnd
+     } else {
+       None
+     };
+ 
+     let layered_hwnd = ensure_layered_overlay_window(&mut state)?;
+-    let needs_redraw =
+-      !state.layered_visible || state.last_rect.as_ref() != Some(rect);
++    let needs_redraw = !state.layered_visible
++      || state.last_rect.as_ref() != Some(rect)
++      || state.last_radius != Some(radius);
+     let needs_zorder =
+       needs_redraw || state.last_behind_hwnd != behind_hwnd;
+ 
+     state.layered_visible = true;
+     state.last_rect = Some(rect.clone());
++    state.last_radius = Some(radius);
+     state.last_behind_hwnd = behind_hwnd;
+ 
+     Some((layered_hwnd, hide_glass, needs_redraw, needs_zorder))
+@@ -320,11 +383,12 @@ fn show_layered_overlay(rect: &Rect, behind_hwnd: Option<isize>) {
+     }
+   }
+ 
+-  if needs_redraw && !paint_layered_overlay(layered_hwnd, rect) {
++  if needs_redraw && !paint_layered_overlay(layered_hwnd, rect, radius) {
+     OVERLAY_STATE.with(|state| {
+       let mut state = state.borrow_mut();
+       state.layered_visible = false;
+       state.last_rect = None;
++      state.last_radius = None;
+       state.last_behind_hwnd = None;
+     });
+     return;
+@@ -464,32 +528,62 @@ fn ensure_glass_overlay_window(state: &mut OverlayState) -> Option<HWND> {
+     );
+   }
+ 
+-  enable_dwm_glass_behind(hwnd);
++  enable_dwm_glass_behind(hwnd, 1, 1, DEFAULT_CORNER_RADIUS_PX);
+   state.glass_hwnd = Some(hwnd.0);
+   Some(hwnd)
+ }
+ 
+-fn enable_dwm_glass_behind(hwnd: HWND) {
++fn enable_dwm_glass_behind(
++  hwnd: HWND,
++  width: i32,
++  height: i32,
++  radius: i32,
++) {
++  let eff_radius = radius.min(width / 2).min(height / 2);
++  let blur_rgn = if width > 4 && height > 4 && eff_radius > 1 {
++    let diameter = (eff_radius - 1) * 2;
++    // SAFETY: Creating a temporary rounded `HRGN` inset 1px inside the
++    // outer border; deleted immediately after DWM copies it.
++    let rgn = unsafe {
++      CreateRoundRectRgn(1, 1, width, height, diameter, diameter)
++    };
++    (rgn.0 != 0).then_some(rgn)
++  } else {
++    None
++  };
++
+   let blur = DWM_BLURBEHIND {
+-    dwFlags: DWM_BB_ENABLE,
++    dwFlags: if blur_rgn.is_some() {
++      DWM_BB_ENABLE | DWM_BB_BLURREGION
++    } else {
++      DWM_BB_ENABLE
++    },
+     fEnable: BOOL(1),
+-    hRgnBlur: Default::default(),
++    hRgnBlur: blur_rgn.unwrap_or_default(),
+     fTransitionOnMaximized: BOOL(0),
+   };
+ 
+   // SAFETY: `hwnd` is valid and `blur` lives for the duration of the call.
+   let _ = unsafe { DwmEnableBlurBehindWindow(hwnd, &raw const blur) };
++
++  if let Some(rgn) = blur_rgn {
++    // SAFETY: `rgn` is owned locally and DWM copies the region data.
++    unsafe {
++      DeleteObject(rgn);
++    }
++  }
+ }
+ 
+ fn position_glass_overlay(
+   hwnd: HWND,
+   rect: &Rect,
+   behind_hwnd: Option<isize>,
++  show_now: bool,
+ ) {
+-  let flags = SWP_NOACTIVATE
+-    | SWP_NOCOPYBITS
+-    | SWP_SHOWWINDOW
+-    | SWP_NOOWNERZORDER;
++  let mut flags = SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_NOOWNERZORDER;
++  if show_now {
++    flags |= SWP_SHOWWINDOW;
++  }
+ 
+   let insert_after = behind_hwnd.map_or(HWND_TOP, HWND);
+   // SAFETY: `hwnd` is owned by this thread; fallback to `HWND_TOP` if the
+@@ -618,6 +712,7 @@ fn ensure_glass_bitmap(
+   cache: &mut GlassBitmapCache,
+   width: i32,
+   height: i32,
++  radius: i32,
+ ) -> bool {
+   if width <= 0 || height <= 0 {
+     return false;
+@@ -625,6 +720,7 @@ fn ensure_glass_bitmap(
+ 
+   if cache.width == width
+     && cache.height == height
++    && cache.radius == radius
+     && cache.bitmap.is_some()
+   {
+     return true;
+@@ -638,16 +734,18 @@ fn ensure_glass_bitmap(
+   }
+   cache.width = 0;
+   cache.height = 0;
++  cache.radius = 0;
+ 
+-  let Some(bitmap) =
+-    create_32bpp_dib_with(width, height, fill_glass_frame_pixels)
+-  else {
++  let Some(bitmap) = create_32bpp_dib_with(width, height, |bits, w, h| {
++    fill_glass_frame_pixels(bits, w, h, radius);
++  }) else {
+     return false;
+   };
+ 
+   cache.bitmap = Some(bitmap);
+   cache.width = width;
+   cache.height = height;
++  cache.radius = radius;
+   true
+ }
+ 
+@@ -677,10 +775,18 @@ fn paint_glass_window(hwnd: HWND) {
+     )
+   };
+ 
++  let radius = OVERLAY_STATE.with(|state| {
++    state
++      .try_borrow()
++      .ok()
++      .and_then(|s| s.last_radius)
++      .unwrap_or(DEFAULT_CORNER_RADIUS_PX)
++  });
++
+   if width > 0 && height > 0 {
+     GLASS_BITMAP_CACHE.with(|cache| {
+       let mut cache = cache.borrow_mut();
+-      if !ensure_glass_bitmap(&mut cache, width, height) {
++      if !ensure_glass_bitmap(&mut cache, width, height, radius) {
+         return;
+       }
+       let Some(bitmap) = cache.bitmap else {
+@@ -708,16 +814,16 @@ fn paint_glass_window(hwnd: HWND) {
+   let _ = unsafe { EndPaint(hwnd, &raw const ps) };
+ }
+ 
+-fn paint_layered_overlay(hwnd: HWND, rect: &Rect) -> bool {
++fn paint_layered_overlay(hwnd: HWND, rect: &Rect, radius: i32) -> bool {
+   let width = rect.width();
+   let height = rect.height();
+   if width <= 0 || height <= 0 {
+     return false;
+   }
+ 
+-  let Some(bitmap) =
+-    create_32bpp_dib_with(width, height, fill_aero_glass_pixels)
+-  else {
++  let Some(bitmap) = create_32bpp_dib_with(width, height, |bits, w, h| {
++    fill_aero_glass_pixels(bits, w, h, radius);
++  }) else {
+     return false;
+   };
+ 
+@@ -793,18 +899,90 @@ fn paint_layered_overlay(hwnd: HWND, rect: &Rect) -> bool {
+   true
+ }
+ 
++fn effective_corner_radius(
++  cols: usize,
++  rows: usize,
++  radius: i32,
++) -> usize {
++  let max_r = (cols / 2).min(rows / 2);
++  usize::try_from(radius.max(0)).unwrap_or(0).min(max_r)
++}
++
++#[inline]
++fn corner_inward_distance(
++  local_x: usize,
++  local_y: usize,
++  sub_x: usize,
++  sub_y: usize,
++  radius_f: f32,
++) -> f32 {
++  #[allow(clippy::cast_precision_loss)]
++  let sx = (local_x * 8 + sub_x * 2 + 1) as f32 * 0.125;
++  #[allow(clippy::cast_precision_loss)]
++  let sy = (local_y * 8 + sub_y * 2 + 1) as f32 * 0.125;
++  radius_f - (radius_f - sx).hypot(radius_f - sy)
++}
++
++#[inline]
++#[allow(clippy::cast_possible_truncation)]
++fn average_16_bgra(acc: [u32; 4]) -> u32 {
++  u32::from_le_bytes([
++    ((acc[0] + 8) >> 4) as u8,
++    ((acc[1] + 8) >> 4) as u8,
++    ((acc[2] + 8) >> 4) as u8,
++    ((acc[3] + 8) >> 4) as u8,
++  ])
++}
++
++fn render_corner_pixel(
++  local_x: usize,
++  local_y: usize,
++  corner_r: usize,
++  palette: [[u8; 4]; 4],
++) -> u32 {
++  #[allow(clippy::cast_precision_loss)]
++  let radius_f = corner_r as f32;
++  let mut acc = [0u32; 4];
++
++  for sub_y in 0..4 {
++    for sub_x in 0..4 {
++      let dist =
++        corner_inward_distance(local_x, local_y, sub_x, sub_y, radius_f);
++      let sample = if dist < 0.0 {
++        [0, 0, 0, 0]
++      } else if dist < 1.0 {
++        palette[0]
++      } else if dist < 2.0 {
++        palette[1]
++      } else if dist < 3.0 {
++        palette[2]
++      } else {
++        palette[3]
++      };
++
++      acc[0] += u32::from(sample[0]);
++      acc[1] += u32::from(sample[1]);
++      acc[2] += u32::from(sample[2]);
++      acc[3] += u32::from(sample[3]);
++    }
++  }
++
++  average_16_bgra(acc)
++}
++
+ fn fill_glass_frame_pixels(
+   bits: *mut std::ffi::c_void,
+   width: i32,
+   height: i32,
++  radius: i32,
+ ) {
+-  let Ok(width_usize) = usize::try_from(width) else {
++  let Ok(cols) = usize::try_from(width) else {
+     return;
+   };
+-  let Ok(height_usize) = usize::try_from(height) else {
++  let Ok(rows) = usize::try_from(height) else {
+     return;
+   };
+-  let Some(pixel_count) = width_usize.checked_mul(height_usize) else {
++  let Some(pixel_count) = cols.checked_mul(rows) else {
+     return;
+   };
+ 
+@@ -813,17 +991,36 @@ fn fill_glass_frame_pixels(
+     std::slice::from_raw_parts_mut(bits.cast::<u32>(), pixel_count)
+   };
+ 
+-  for row in 0..height_usize {
+-    let dist_y = row.min(height_usize - 1 - row);
+-    let row_offset = row * width_usize;
+-    for col in 0..width_usize {
+-      let dist = dist_y.min(col).min(width_usize - 1 - col);
++  let corner_r = effective_corner_radius(cols, rows, radius);
++  let outer = premultiply_bgra_bytes(20, 24, 28, 175);
++  let highlight = premultiply_bgra_bytes(255, 255, 255, 220);
++  let inner = premultiply_bgra_bytes(244, 248, 252, 75);
++  let palette = [outer, highlight, inner, [0, 0, 0, 0]];
++  let outer_u32 = u32::from_le_bytes(outer);
++  let highlight_u32 = u32::from_le_bytes(highlight);
++  let inner_u32 = u32::from_le_bytes(inner);
++
++  for row in 0..rows {
++    let dist_y = row.min(rows - 1 - row);
++    let in_corner_y = row < corner_r || row >= rows - corner_r;
++    let row_offset = row * cols;
++
++    for col in 0..cols {
++      let in_corner_x = col < corner_r || col >= cols - corner_r;
++      if in_corner_x && in_corner_y {
++        let local_x = col.min(cols - 1 - col);
++        pixels[row_offset + col] =
++          render_corner_pixel(local_x, dist_y, corner_r, palette);
++        continue;
++      }
++
++      let dist = dist_y.min(col).min(cols - 1 - col);
+       // Alpha=0 interior allows `DwmEnableBlurBehindWindow` to render
+       // real `OpenGlass` Aero glass with a crisp 3px window bevel.
+       pixels[row_offset + col] = match dist {
+-        0 => premultiply_bgra(20, 24, 28, 175),
+-        1 => premultiply_bgra(255, 255, 255, 220),
+-        2 => premultiply_bgra(244, 248, 252, 75),
++        0 => outer_u32,
++        1 => highlight_u32,
++        2 => inner_u32,
+         _ => 0x0000_0000,
+       };
+     }
+@@ -834,14 +1031,15 @@ fn fill_aero_glass_pixels(
+   bits: *mut std::ffi::c_void,
+   width: i32,
+   height: i32,
++  radius: i32,
+ ) {
+-  let Ok(width_usize) = usize::try_from(width) else {
++  let Ok(cols) = usize::try_from(width) else {
+     return;
+   };
+-  let Ok(height_usize) = usize::try_from(height) else {
++  let Ok(rows) = usize::try_from(height) else {
+     return;
+   };
+-  let Some(pixel_count) = width_usize.checked_mul(height_usize) else {
++  let Some(pixel_count) = cols.checked_mul(rows) else {
+     return;
+   };
+ 
+@@ -850,29 +1048,53 @@ fn fill_aero_glass_pixels(
+     std::slice::from_raw_parts_mut(bits.cast::<u32>(), pixel_count)
+   };
+ 
+-  let denom = height_usize.saturating_sub(1).max(1);
+-  for row in 0..height_usize {
+-    let dist_y = row.min(height_usize - 1 - row);
++  let corner_r = effective_corner_radius(cols, rows, radius);
++  let outer = premultiply_bgra_bytes(16, 18, 20, 120);
++  let highlight = premultiply_bgra_bytes(255, 255, 255, 220);
++  let inner = premultiply_bgra_bytes(236, 240, 244, 105);
++  let outer_u32 = u32::from_le_bytes(outer);
++  let highlight_u32 = u32::from_le_bytes(highlight);
++  let inner_u32 = u32::from_le_bytes(inner);
++
++  let denom = rows.saturating_sub(1).max(1);
++  for row in 0..rows {
++    let dist_y = row.min(rows - 1 - row);
+     #[allow(clippy::cast_possible_truncation)]
+     // Colorless clear Aero glass sheen: slightly stronger near top edge.
+     let sheen_alpha = (52usize - (22usize * row) / denom) as u8;
+-    let fill_pixel = premultiply_bgra(246, 248, 250, sheen_alpha);
++    let fill = premultiply_bgra_bytes(246, 248, 250, sheen_alpha);
++    let fill_u32 = u32::from_le_bytes(fill);
++    let palette = [outer, highlight, inner, fill];
++    let in_corner_y = row < corner_r || row >= rows - corner_r;
++
++    let row_offset = row * cols;
++    for col in 0..cols {
++      let in_corner_x = col < corner_r || col >= cols - corner_r;
++      if in_corner_x && in_corner_y {
++        let local_x = col.min(cols - 1 - col);
++        pixels[row_offset + col] =
++          render_corner_pixel(local_x, dist_y, corner_r, palette);
++        continue;
++      }
+ 
+-    let row_offset = row * width_usize;
+-    for col in 0..width_usize {
+-      let dist = dist_y.min(col).min(width_usize - 1 - col);
++      let dist = dist_y.min(col).min(cols - 1 - col);
+       pixels[row_offset + col] = match dist {
+-        0 => premultiply_bgra(16, 18, 20, 120),
+-        1 => premultiply_bgra(255, 255, 255, 220),
+-        2 => premultiply_bgra(236, 240, 244, 105),
+-        _ => fill_pixel,
++        0 => outer_u32,
++        1 => highlight_u32,
++        2 => inner_u32,
++        _ => fill_u32,
+       };
+     }
+   }
+ }
+ 
+ #[inline]
+-fn premultiply_bgra(red: u8, green: u8, blue: u8, alpha: u8) -> u32 {
++fn premultiply_bgra_bytes(
++  red: u8,
++  green: u8,
++  blue: u8,
++  alpha: u8,
++) -> [u8; 4] {
+   let alpha_u32 = u32::from(alpha);
+   #[allow(clippy::cast_possible_truncation)]
+   let premul_red = ((u32::from(red) * alpha_u32 + 127) / 255) as u8;
+@@ -881,7 +1103,7 @@ fn premultiply_bgra(red: u8, green: u8, blue: u8, alpha: u8) -> u32 {
+   #[allow(clippy::cast_possible_truncation)]
+   let premul_blue = ((u32::from(blue) * alpha_u32 + 127) / 255) as u8;
+ 
+-  u32::from_le_bytes([premul_blue, premul_green, premul_red, alpha])
++  [premul_blue, premul_green, premul_red, alpha]
+ }
+ 
+ unsafe extern "system" fn overlay_wnd_proc(
+@@ -904,3 +1126,44 @@ unsafe extern "system" fn overlay_wnd_proc(
+     _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+   }
+ }
++
++#[cfg(test)]
++mod tests {
++  use super::{fill_aero_glass_pixels, fill_glass_frame_pixels};
++
++  #[test]
++  fn glass_frame_rounds_all_four_corners_symmetrically() {
++    const WIDTH: usize = 40;
++    const HEIGHT: usize = 30;
++    let mut buf = vec![0xFFFF_FFFFu32; WIDTH * HEIGHT];
++
++    fill_glass_frame_pixels(buf.as_mut_ptr().cast(), 40, 30, 6);
++
++    assert_eq!(buf[0], 0);
++    assert_eq!(buf[WIDTH - 1], 0);
++    assert_eq!(buf[(HEIGHT - 1) * WIDTH], 0);
++    assert_eq!(buf[HEIGHT * WIDTH - 1], 0);
++
++    // Straight top edge has non-zero outer border, highlight, and inner
++    // bevel, while the interior stays alpha=0 for DWM blur.
++    assert_ne!(buf[10], 0);
++    assert_ne!(buf[WIDTH + 10], 0);
++    assert_ne!(buf[2 * WIDTH + 10], 0);
++    assert_eq!(buf[5 * WIDTH + 20], 0);
++  }
++
++  #[test]
++  fn aero_layered_rounds_corners_and_fills_interior() {
++    const WIDTH: usize = 40;
++    const HEIGHT: usize = 30;
++    let mut buf = vec![0xFFFF_FFFFu32; WIDTH * HEIGHT];
++
++    fill_aero_glass_pixels(buf.as_mut_ptr().cast(), 40, 30, 6);
++
++    assert_eq!(buf[0], 0);
++    assert_eq!(buf[WIDTH - 1], 0);
++    assert_eq!(buf[(HEIGHT - 1) * WIDTH], 0);
++    assert_eq!(buf[HEIGHT * WIDTH - 1], 0);
++    assert_ne!(buf[5 * WIDTH + 20], 0);
++  }
++}
+diff --git a/packages/wm/src/events/handle_mouse_move.rs b/packages/wm/src/events/handle_mouse_move.rs
+index 2d25cd4..915dded 100644
+--- a/packages/wm/src/events/handle_mouse_move.rs
++++ b/packages/wm/src/events/handle_mouse_move.rs
+@@ -265,16 +265,20 @@ fn handle_drag_move(
+       position.y - drag.cursor_offset_y,
+     );
+     let is_maximized = native.is_maximized().unwrap_or(false);
+-    if !is_maximized {
+-      if let Ok(shadow_borders) = native.shadow_borders() {
+-        window.update_native_properties(|properties| {
+-          properties.is_maximized = false;
+-          properties.shadow_borders = shadow_borders;
+-        });
+-      }
+-    }
++    let shadow_borders = if is_maximized {
++      None
++    } else {
++      native.shadow_borders().ok()
++    };
+     drop(native);
+ 
++    if let Some(shadow_borders) = shadow_borders {
++      window.update_native_properties(|properties| {
++        properties.is_maximized = false;
++        properties.shadow_borders = shadow_borders;
++      });
++    }
++
+     update_drag_snap_preview(&window, Some(position), state)?;
+ 
+     return Ok(true);

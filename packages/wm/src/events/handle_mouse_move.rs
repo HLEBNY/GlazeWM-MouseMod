@@ -265,15 +265,19 @@ fn handle_drag_move(
       position.y - drag.cursor_offset_y,
     );
     let is_maximized = native.is_maximized().unwrap_or(false);
-    if !is_maximized {
-      if let Ok(shadow_borders) = native.shadow_borders() {
-        window.update_native_properties(|properties| {
-          properties.is_maximized = false;
-          properties.shadow_borders = shadow_borders;
-        });
-      }
-    }
+    let shadow_borders = if is_maximized {
+      None
+    } else {
+      native.shadow_borders().ok()
+    };
     drop(native);
+
+    if let Some(shadow_borders) = shadow_borders {
+      window.update_native_properties(|properties| {
+        properties.is_maximized = false;
+        properties.shadow_borders = shadow_borders;
+      });
+    }
 
     update_drag_snap_preview(&window, Some(position), state)?;
 
