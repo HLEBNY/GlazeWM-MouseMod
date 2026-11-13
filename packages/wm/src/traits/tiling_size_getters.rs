@@ -101,7 +101,10 @@ pub trait TilingSizeGetters: CommonGetters {
         continue;
       };
 
-      let Some(parent) = tiling_container.direction_container() else {
+      let Some(parent) = tiling_container
+        .parent()
+        .and_then(|parent| parent.as_direction_container().ok())
+      else {
         break;
       };
 

@@ -9,9 +9,10 @@ use wm_platform::{MouseButton, Point, Rect};
 #[cfg(target_os = "windows")]
 use super::{compute_drop_preview_rect_at, DropTarget, ScreenZone};
 use super::{
-  absorb_void_into_sibling, detect_single_axis_breakaway_zone,
-  finalize_move_drag, normalize_workspace_voids, reorder_tiling_sibling,
-  update_window_state,
+  absorb_unfillable_void_slivers, absorb_void_into_sibling,
+  detect_single_axis_breakaway_zone, finalize_move_drag,
+  normalize_workspace_voids, reorder_tiling_sibling, update_window_state,
+  MIN_VOID_SPAN_PX,
 };
 use crate::{
   commands::container::set_focused_descendant,
@@ -592,8 +593,13 @@ fn step_into_adjacent_void(
     return Ok(false);
   }
 
-  let min_create_step = (gap + 12).max(14);
-  if step >= total_slide || ahead_old_f - step_f < 4.0 {
+  #[allow(clippy::cast_precision_loss)]
+  let min_void_f = MIN_VOID_SPAN_PX as f32;
+  let min_create_step = (gap + MIN_VOID_SPAN_PX).max(14);
+  if step >= total_slide
+    || ahead_old_f - step_f < 4.0
+    || (step >= (gap + 12).max(14) && ahead_old_f - step_f < min_void_f)
+  {
     reorder_tiling_sibling(
       &window.clone().into(),
       &void_ahead.clone().into(),
@@ -609,7 +615,7 @@ fn step_into_adjacent_void(
   let gap_f = gap as f32;
   let ahead_new_f = ahead_old_f - step_f;
   let behind_f = ahead_old_f - gap_f - ahead_new_f;
-  if behind_f < 4.0 || ahead_new_f < 4.0 {
+  if behind_f < min_void_f || ahead_new_f < min_void_f {
     return Ok(false);
   }
 
@@ -759,6 +765,8 @@ pub fn finish_single_axis_drag(
   }
 
   normalize_workspace_voids(&workspace)?;
+  snap_single_axis_sliver_voids(&tiling_win, &workspace, drag.axis)?;
+  absorb_unfillable_void_slivers(&workspace)?;
   tiling_win.set_active_drag(None);
   set_focused_descendant(&tiling_win.into(), None);
 
@@ -766,6 +774,70 @@ pub fn finish_single_axis_drag(
     .pending_sync
     .queue_containers_to_redraw(workspace.tiling_children())
     .queue_workspace_to_reorder(workspace);
+
+  Ok(())
+}
+
+fn snap_single_axis_sliver_voids(
+  window: &TilingWindow,
+  workspace: &Workspace,
+  axis: SingleAxisKind,
+) -> anyhow::Result<()> {
+  let Some(parent) = window
+    .parent()
+    .and_then(|parent| parent.as_direction_container().ok())
+  else {
+    return Ok(());
+  };
+
+  let is_horiz = matches!(axis, SingleAxisKind::Horizontal);
+  let ws_rect = workspace.multi_window_workspace_rect()?;
+  let (h_gap, v_gap) = workspace.workspace_inner_gaps()?;
+  let gap = if is_horiz { h_gap } else { v_gap };
+  let parent_axis_px = axis_len(&ws_rect, is_horiz);
+
+  for _ in 0..2 {
+    let prev_sib = window
+      .prev_siblings()
+      .find_map(|s| s.as_tiling_container().ok());
+    let next_sib = window
+      .next_siblings()
+      .find_map(|s| s.as_tiling_container().ok());
+
+    let (Some(prev), Some(next)) = (prev_sib, next_sib) else {
+      break;
+    };
+
+    let (Some(prev_v), Some(next_v)) = (prev.as_void(), next.as_void())
+    else {
+      break;
+    };
+
+    let prev_len = axis_len(&prev_v.to_rect()?, is_horiz);
+    let next_len = axis_len(&next_v.to_rect()?, is_horiz);
+
+    if prev_len < MIN_VOID_SPAN_PX && next_len >= MIN_VOID_SPAN_PX {
+      absorb_void_into_sibling(
+        prev_v,
+        &next,
+        &parent,
+        gap,
+        parent_axis_px,
+      )?;
+      normalize_workspace_voids(workspace)?;
+    } else if next_len < MIN_VOID_SPAN_PX && prev_len >= MIN_VOID_SPAN_PX {
+      absorb_void_into_sibling(
+        next_v,
+        &prev,
+        &parent,
+        gap,
+        parent_axis_px,
+      )?;
+      normalize_workspace_voids(workspace)?;
+    } else {
+      break;
+    }
+  }
 
   Ok(())
 }
@@ -847,10 +919,10 @@ mod tests {
       .tiling_size(0.5)
       .gaps_config(config.value.gaps.clone())
       .call();
-    let void_r = VoidSlot::new(config.value.gaps.clone());
-    void_r.set_tiling_size(0.5);
+    let right_void = VoidSlot::new(config.value.gaps.clone());
+    right_void.set_tiling_size(0.5);
     attach_container(&win.clone().into(), &ws_c, None).unwrap();
-    attach_container(&void_r.into(), &ws_c, None).unwrap();
+    attach_container(&right_void.into(), &ws_c, None).unwrap();
 
     assert_eq!(
       single_axis_kind_for_window(&win).unwrap(),
@@ -986,10 +1058,10 @@ mod tests {
       .tiling_size(0.5)
       .gaps_config(config.value.gaps.clone())
       .call();
-    let void_r = VoidSlot::new(config.value.gaps.clone());
-    void_r.set_tiling_size(0.5);
+    let right_void = VoidSlot::new(config.value.gaps.clone());
+    right_void.set_tiling_size(0.5);
     attach_container(&win.clone().into(), &ws_c, None).unwrap();
-    attach_container(&void_r.into(), &ws_c, None).unwrap();
+    attach_container(&right_void.into(), &ws_c, None).unwrap();
 
     let start_rect = win.to_rect().unwrap();
     let start_cursor = Point { x: 200, y: 18 };
@@ -1035,22 +1107,22 @@ mod tests {
   fn pulling_single_axis_away_from_neighbor_leaves_neighbor_intact() {
     let (mut state, config, workspace) = setup_workspace();
     let ws_c: Container = workspace.clone().into();
-    let void_l = VoidSlot::new(config.value.gaps.clone());
+    let left_void = VoidSlot::new(config.value.gaps.clone());
     let win_a = TilingWindow::mock()
       .gaps_config(config.value.gaps.clone())
       .call();
     let win_b = TilingWindow::mock()
       .gaps_config(config.value.gaps.clone())
       .call();
-    let void_r = VoidSlot::new(config.value.gaps.clone());
-    attach_container(&void_l.clone().into(), &ws_c, None).unwrap();
+    let right_void = VoidSlot::new(config.value.gaps.clone());
+    attach_container(&left_void.clone().into(), &ws_c, None).unwrap();
     attach_container(&win_a.clone().into(), &ws_c, None).unwrap();
     attach_container(&win_b.clone().into(), &ws_c, None).unwrap();
-    attach_container(&void_r.clone().into(), &ws_c, None).unwrap();
-    void_l.set_tiling_size(0.2);
+    attach_container(&right_void.clone().into(), &ws_c, None).unwrap();
+    left_void.set_tiling_size(0.2);
     win_a.set_tiling_size(0.25);
     win_b.set_tiling_size(0.25);
-    void_r.set_tiling_size(0.3);
+    right_void.set_tiling_size(0.3);
 
     let a_before = win_a.to_rect().unwrap();
     let b_before = win_b.to_rect().unwrap();
@@ -1087,5 +1159,47 @@ mod tests {
     assert_eq!(win_a.to_rect().unwrap(), a_before);
     let b_after = win_b.to_rect().unwrap();
     assert!((b_after.width() - b_before.width()).abs() <= 1);
+  }
+
+  #[test]
+  fn single_axis_release_near_edge_snaps_sliver_without_shrinking() {
+    use crate::commands::window::MIN_VOID_SPAN_PX;
+
+    let (mut state, config, workspace) = setup_workspace();
+    let ws_c: Container = workspace.clone().into();
+    let left_void = VoidSlot::new(config.value.gaps.clone());
+    let win = TilingWindow::mock()
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let right_void = VoidSlot::new(config.value.gaps.clone());
+    attach_container(&left_void.clone().into(), &ws_c, None).unwrap();
+    attach_container(&win.clone().into(), &ws_c, None).unwrap();
+    attach_container(&right_void.clone().into(), &ws_c, None).unwrap();
+    left_void.set_tiling_size(0.49);
+    win.set_tiling_size(0.5);
+    right_void.set_tiling_size(0.01);
+
+    let win_before = win.to_rect().unwrap();
+    assert!(right_void.to_rect().unwrap().width() < MIN_VOID_SPAN_PX);
+
+    let start_cursor = Point { x: 1000, y: 18 };
+    assert!(try_start_single_axis_drag(
+      &win,
+      Some(&start_cursor),
+      &mut state,
+    )
+    .unwrap());
+    finish_single_axis_drag(Some(&start_cursor), &mut state, &config)
+      .unwrap();
+
+    let win_after = win.to_rect().unwrap();
+    assert!((win_after.width() - win_before.width()).abs() <= 2);
+    assert!(workspace
+      .descendants()
+      .filter_map(|c| c.as_void().cloned())
+      .all(|v| {
+        let r = v.to_rect().unwrap();
+        r.width() >= MIN_VOID_SPAN_PX && r.height() >= MIN_VOID_SPAN_PX
+      }));
   }
 }

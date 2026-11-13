@@ -15,12 +15,16 @@ use crate::{
     TilingWindow, VoidSlot, Workspace,
   },
   traits::{
-    CommonGetters, TilingDirectionGetters, TilingSizeGetters,
-    MIN_TILING_SIZE,
+    CommonGetters, PositionGetters, TilingDirectionGetters,
+    TilingSizeGetters, MIN_TILING_SIZE,
   },
   user_config::UserConfig,
   wm_state::WmState,
 };
+
+/// Minimum width and height in pixels for a `VoidSlot` to remain fillable
+/// across snap drops and live resizes.
+pub const MIN_VOID_SPAN_PX: i32 = 32;
 
 /// Returns the first `VoidSlot` descendant within `workspace`, if any.
 #[must_use]
@@ -607,6 +611,16 @@ pub fn absorb_void_into_sibling(
   gap: i32,
   parent_axis_px: i32,
 ) -> anyhow::Result<()> {
+  if !void_slot
+    .parent()
+    .is_some_and(|p| p.id() == parent.id())
+    || !beneficiary
+      .parent()
+      .is_some_and(|p| p.id() == parent.id())
+  {
+    anyhow::bail!("Void slot and beneficiary must share the given parent.");
+  }
+
   let children: Vec<TilingContainer> = parent.tiling_children().collect();
   if children.len() < 2 {
     return Ok(());
@@ -676,11 +690,11 @@ pub fn insert_void_preserving_siblings(
   let target_old_px =
     (target.tiling_size() * old_avail as f32).round() as i32;
   let max_void_px = target_old_px - gap - 40;
-  if max_void_px < 4 {
+  if max_void_px < MIN_VOID_SPAN_PX {
     return Ok(None);
   }
 
-  let clamped_void_px = void_px.clamp(4, max_void_px);
+  let clamped_void_px = void_px.clamp(MIN_VOID_SPAN_PX, max_void_px);
 
   #[allow(clippy::cast_precision_loss)]
   let old_avail_f = old_avail as f32;
@@ -721,4 +735,80 @@ pub fn insert_void_preserving_siblings(
   *void_container.borrow_parent_mut() = Some(parent.clone().into());
 
   Ok(Some(void_slot))
+}
+
+/// Absorbs any `VoidSlot` in `workspace` narrower or shorter than
+/// `MIN_VOID_SPAN_PX` into an adjacent sibling so unfillable sliver voids
+/// cannot persist after resizes or layout updates.
+pub fn absorb_unfillable_void_slivers(
+  workspace: &Workspace,
+) -> anyhow::Result<bool> {
+  normalize_workspace_voids(workspace)?;
+  let mut absorbed = false;
+
+  for _ in 0..32 {
+    let sliver = workspace
+      .descendants()
+      .filter_map(|c| c.as_void().cloned())
+      .find(|slot| {
+        slot.to_rect().is_ok_and(|rect| {
+          rect.width() < MIN_VOID_SPAN_PX
+            || rect.height() < MIN_VOID_SPAN_PX
+        })
+      });
+
+    let Some(sliver) = sliver else {
+      break;
+    };
+
+    let Some(parent) = sliver
+      .parent()
+      .and_then(|p| p.as_direction_container().ok())
+    else {
+      break;
+    };
+
+    let children: Vec<TilingContainer> =
+      parent.tiling_children().collect();
+    let Some(idx) = children.iter().position(|c| c.id() == sliver.id())
+    else {
+      break;
+    };
+
+    let prev = idx.checked_sub(1).and_then(|i| children.get(i));
+    let next = children.get(idx + 1);
+    let beneficiary = [prev, next]
+      .into_iter()
+      .flatten()
+      .find(|c| !c.is_void())
+      .or(prev.or(next));
+
+    let Some(beneficiary) = beneficiary else {
+      normalize_workspace_voids(workspace)?;
+      break;
+    };
+
+    let is_horiz =
+      parent.tiling_direction() == TilingDirection::Horizontal;
+    let (h_gap, v_gap) = workspace.workspace_inner_gaps()?;
+    let gap = if is_horiz { h_gap } else { v_gap };
+    let parent_rect = parent.to_rect()?;
+    let parent_axis_px = if is_horiz {
+      parent_rect.width()
+    } else {
+      parent_rect.height()
+    };
+
+    absorb_void_into_sibling(
+      &sliver,
+      beneficiary,
+      &parent,
+      gap,
+      parent_axis_px,
+    )?;
+    normalize_workspace_voids(workspace)?;
+    absorbed = true;
+  }
+
+  Ok(absorbed)
 }

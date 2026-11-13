@@ -20,10 +20,10 @@ use crate::{
       wrap_in_split_container,
     },
     window::{
-      absorb_void_into_sibling, finish_single_axis_drag,
-      insert_void_preserving_siblings, normalize_workspace_voids,
-      try_start_single_axis_drag, update_drag_snap_preview,
-      update_window_state,
+      absorb_unfillable_void_slivers, absorb_void_into_sibling,
+      finish_single_axis_drag, insert_void_preserving_siblings,
+      normalize_workspace_voids, try_start_single_axis_drag,
+      update_drag_snap_preview, update_window_state, MIN_VOID_SPAN_PX,
     },
   },
   events::handle_window_moved_or_resized_end,
@@ -132,13 +132,18 @@ pub fn handle_window_moved_or_resized(
         return handle_window_moved_or_resized_end(&window, state, config);
       }
 
-      return update_drag_state(
+      let drag_result = update_drag_state(
         &window,
         &frame_position,
         None,
         state,
         config,
       );
+      if drag_result.is_err() {
+        window.set_active_drag(None);
+        state.clear_window_drag_state(window.id());
+      }
+      return drag_result;
     }
 
     let old_is_maximized = window.native_properties().is_maximized;
@@ -898,7 +903,11 @@ pub fn update_live_resize_with_finalize(
     }
   }
 
-  if !is_final {
+  if is_final {
+    if let Some(workspace) = tiling_window.workspace() {
+      mutated |= absorb_unfillable_void_slivers(&workspace)?;
+    }
+  } else {
     state.pending_sync.dequeue_container_from_redraw(window.clone());
   }
 
@@ -942,9 +951,11 @@ fn resize_into_void_neighbor(
     far_edge - dragged_coord
   };
 
+  let min_release_span =
+    (gap + MIN_VOID_SPAN_PX).max(VOID_SNAP_RELEASE_PX + 1);
   let pushed_through = remaining_px <= VOID_PUSH_THROUGH_PX;
   let should_absorb =
-    pushed_through || (is_final && remaining_px <= VOID_SNAP_RELEASE_PX);
+    pushed_through || (is_final && remaining_px < min_release_span);
 
   if should_absorb {
     absorb_void_into_sibling(
@@ -1105,7 +1116,7 @@ fn try_create_outer_edge_void(
     ws_edge - dragged_coord
   };
 
-  let min_create = (gap + 12).max(OUTER_VOID_CREATE_MIN_PX);
+  let min_create = (gap + MIN_VOID_SPAN_PX).max(OUTER_VOID_CREATE_MIN_PX);
   if inward_px < min_create {
     return Ok(is_final);
   }
@@ -1117,7 +1128,8 @@ fn try_create_outer_edge_void(
   };
 
   let parent = tiling_window
-    .direction_container()
+    .parent()
+    .and_then(|parent| parent.as_direction_container().ok())
     .context("Tiling window has no direction parent.")?;
   let gaps_config = workspace.gaps_config();
 
@@ -1138,7 +1150,8 @@ fn try_create_outer_edge_void(
   }
 
   let new_parent = tiling_window
-    .direction_container()
+    .parent()
+    .and_then(|parent| parent.as_direction_container().ok())
     .context("Tiling window has no direction parent after wrap.")?;
   let parent_axis_px = if new_parent.as_workspace().is_some() {
     if is_horizontal {
@@ -1167,6 +1180,7 @@ fn try_create_outer_edge_void(
   )?;
 
   if inserted.is_some() {
+    normalize_workspace_voids(&workspace)?;
     let dragged_id = tiling_window.id();
     let others = workspace
       .tiling_windows()
@@ -1611,5 +1625,125 @@ mod tests {
     assert!((sum_end - 1.0).abs() < 0.001);
     assert!(win_a.to_rect().unwrap().left <= initial.left + 2);
     assert_eq!(win_b.to_rect().unwrap(), b_initial);
+  }
+
+  #[test]
+  fn nested_vert_splitoid_resize_and_sliver_cleanup_remain_valid() {
+    use tokio::sync::mpsc;
+    use wm_common::{TilingDirection, WindowState};
+    use wm_platform::Dispatcher;
+
+    use super::update_live_resize_with_finalize;
+    use crate::{
+      commands::{
+        container::{attach_container, set_focused_descendant},
+        window::{first_void_slot, MIN_VOID_SPAN_PX},
+      },
+      models::{
+        Monitor, SplitContainer, TilingWindow, VoidSlot, WindowContainer,
+        Workspace,
+      },
+      traits::{CommonGetters, PositionGetters, WindowGetters},
+      user_config::UserConfig,
+      wm_state::WmState,
+    };
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+    let mut state = WmState::new(Dispatcher::mock(), event_tx, exit_tx);
+    let config = UserConfig::mock();
+
+    let workspace = Workspace::mock()
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let monitor = Monitor::mock()
+      .bounds(Rect::from_xy(0, 0, 1920, 1080))
+      .working_area(Rect::from_xy(0, 0, 1920, 1032))
+      .workspaces(vec![workspace.clone()])
+      .call();
+    attach_container(
+      &monitor.into(),
+      &state.root_container.clone().into(),
+      None,
+    )
+    .unwrap();
+    set_focused_descendant(&workspace.clone().into(), None);
+
+    // Nested SplitContainer(H) inside SplitContainer(V) beside outer Void.
+    workspace.set_tiling_direction(TilingDirection::Horizontal);
+    let outer_void = VoidSlot::new(config.value.gaps.clone());
+    let vert_split = SplitContainer::new(
+      TilingDirection::Vertical,
+      config.value.gaps.clone(),
+    );
+    let horiz_split = SplitContainer::new(
+      TilingDirection::Horizontal,
+      config.value.gaps.clone(),
+    );
+    let w1 = TilingWindow::mock()
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let w2 = TilingWindow::mock()
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let w3 = TilingWindow::mock()
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    attach_container(&outer_void.into(), &workspace.clone().into(), None)
+      .unwrap();
+    attach_container(
+      &vert_split.clone().into(),
+      &workspace.clone().into(),
+      None,
+    )
+    .unwrap();
+    attach_container(
+      &horiz_split.clone().into(),
+      &vert_split.clone().into(),
+      None,
+    )
+    .unwrap();
+    attach_container(&w3.into(), &vert_split.into(), None).unwrap();
+    attach_container(&w1.clone().into(), &horiz_split.clone().into(), None)
+      .unwrap();
+    attach_container(&w2.into(), &horiz_split.into(), None).unwrap();
+
+    // Resizing w1's outer left edge toward screen edge must find void
+    // in workspace rather than panicking with "Parent does not have a
+    // tiling direction."
+    let init = w1.to_rect().unwrap();
+    let moved = Rect::from_ltrb(15, init.top, init.right, init.bottom);
+    let w1_c: WindowContainer = w1.clone().into();
+    assert!(update_live_resize_with_finalize(
+      &w1_c, &moved, &init, true, &mut state,
+    )
+    .unwrap());
+    assert!(first_void_slot(&workspace).is_none());
+    assert_eq!(w1.state(), WindowState::Tiling);
+    let _ = w1.to_rect().unwrap();
+
+    // Small pull (< MIN_VOID_SPAN_PX) snaps back without leaving slivers.
+    let before_small = w1.to_rect().unwrap();
+    let small_pull = Rect::from_ltrb(
+      before_small.left + 12,
+      before_small.top,
+      before_small.right,
+      before_small.bottom,
+    );
+    assert!(update_live_resize_with_finalize(
+      &w1_c,
+      &small_pull,
+      &before_small,
+      true,
+      &mut state,
+    )
+    .unwrap());
+    assert!(workspace
+      .descendants()
+      .filter_map(|c| c.as_void().cloned())
+      .all(|v| {
+        let r = v.to_rect().unwrap();
+        r.width() >= MIN_VOID_SPAN_PX && r.height() >= MIN_VOID_SPAN_PX
+      }));
   }
 }

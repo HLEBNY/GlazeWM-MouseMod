@@ -9,8 +9,9 @@ use wm_platform::{NativeWindowWindowsExt, WS_MAXIMIZEBOX};
 use wm_platform::{Point, Rect};
 
 use super::{
-  clear_workspace_voids, collapse_origin_void, normalize_workspace_voids,
-  replace_tiling_slot, swap_tiling_containers, update_window_state,
+  absorb_unfillable_void_slivers, clear_workspace_voids,
+  collapse_origin_void, normalize_workspace_voids, replace_tiling_slot,
+  swap_tiling_containers, update_window_state, MIN_VOID_SPAN_PX,
 };
 use crate::{
   commands::container::{
@@ -19,12 +20,12 @@ use crate::{
   },
   events::update_floating_window_position,
   models::{
-    NonTilingWindow, SplitContainer, TilingContainer, TilingWindow,
-    VoidSlot, WindowContainer, Workspace,
+    Container, NonTilingWindow, SplitContainer, TilingContainer,
+    TilingWindow, VoidSlot, WindowContainer, Workspace,
   },
   traits::{
     CommonGetters, PositionGetters, TilingDirectionGetters,
-    TilingSizeGetters, WindowGetters,
+    TilingSizeGetters, WindowGetters, MIN_TILING_SIZE,
   },
   user_config::UserConfig,
   wm_state::{SingleAxisKind, WmState},
@@ -167,6 +168,7 @@ pub fn detect_screen_zone(
 /// drag, gating perpendicular edges so sliding along the locked track to a
 /// grid edge never triggers an unintended corner/edge breakaway.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn detect_single_axis_breakaway_zone(
   cursor: &Point,
   working_area: &Rect,
@@ -220,6 +222,9 @@ pub fn detect_single_axis_breakaway_zone(
       None
     }
     SingleAxisKind::Vertical => {
+      let near_top_rail = cursor.y <= working_area.top + rail_px
+        && (start_cursor.y > working_area.top + rail_px
+          || cursor.y <= working_area.top + 1);
       let near_left_rail = cursor.x <= working_area.left + rail_px
         && (start_cursor.x > working_area.left + rail_px
           || cursor.x <= working_area.left + 1);
@@ -258,6 +263,9 @@ pub fn detect_single_axis_breakaway_zone(
         || (near_right_rail && cursor.y >= working_area.bottom - corner_h)
       {
         return Some(ScreenZone::BottomRight);
+      }
+      if near_top_rail && cursor.x >= mid_left && cursor.x <= mid_right {
+        return Some(ScreenZone::TopCenter);
       }
       if near_left_rail {
         return Some(ScreenZone::Left);
@@ -1005,6 +1013,7 @@ fn finish_snap_zone_commit(
   state: &mut WmState,
 ) -> anyhow::Result<WindowContainer> {
   normalize_workspace_voids(workspace)?;
+  absorb_unfillable_void_slivers(workspace)?;
   tiling_window.set_active_drag(None);
   set_focused_descendant(&tiling_window.clone().into(), None);
 
@@ -1151,6 +1160,244 @@ fn insert_beside_sole_window(
   Ok(())
 }
 
+struct VoidEdgeAllocation {
+  absorbed_void_ids: Vec<Uuid>,
+  shrunk_voids: Vec<(Uuid, f32)>,
+  preserved_voids: Vec<(Uuid, f32)>,
+  non_void_scale: f32,
+  new_win_size: f32,
+}
+
+#[allow(
+  clippy::cast_possible_truncation,
+  clippy::cast_possible_wrap,
+  clippy::cast_precision_loss
+)]
+fn allocate_void_surplus(
+  children: &[(Uuid, bool, f32)],
+  direct_voids: &[(Uuid, f32)],
+  non_void_count: usize,
+  is_first: bool,
+  axis_px: i32,
+  gap: i32,
+) -> VoidEdgeAllocation {
+  let old_avail =
+    (axis_px - gap * (children.len() as i32 - 1)).max(1) as f32;
+  let gap_f = gap as f32;
+  let min_void_f = MIN_VOID_SPAN_PX as f32;
+  let ideal_avail = (axis_px - gap * non_void_count as i32).max(1) as f32;
+  let ideal_win_px = ideal_avail / (non_void_count + 1) as f32;
+  let mut rem_need = ideal_win_px + gap_f;
+
+  let mut absorbed_void_ids = Vec::new();
+  let mut shrunk_map: Vec<(Uuid, f32)> = Vec::new();
+  let ordered: Vec<(Uuid, f32)> = if is_first {
+    direct_voids.iter().copied().rev().collect()
+  } else {
+    direct_voids.to_vec()
+  };
+
+  for (vid, vsize) in ordered {
+    if rem_need <= 0.5 {
+      break;
+    }
+    let v_px = vsize * old_avail;
+    if v_px + gap_f <= rem_need + min_void_f - 1.0 {
+      absorbed_void_ids.push(vid);
+      rem_need -= v_px + gap_f;
+    } else {
+      let new_v_px = v_px - rem_need;
+      if new_v_px < min_void_f {
+        absorbed_void_ids.push(vid);
+        rem_need -= v_px + gap_f;
+      } else {
+        shrunk_map.push((vid, new_v_px));
+        rem_need = 0.0;
+      }
+    }
+  }
+
+  let kept_count = children.len() - absorbed_void_ids.len();
+  let new_avail = (axis_px - gap * kept_count as i32).max(1) as f32;
+  let non_void_total_px: f32 = children
+    .iter()
+    .filter(|(_, is_void, _)| !*is_void)
+    .map(|(_, _, size)| *size * old_avail)
+    .sum();
+
+  let mut shrunk_voids = Vec::new();
+  let mut preserved_voids = Vec::new();
+  let mut other_voids_px = 0.0_f32;
+  for &(vid, vsize) in direct_voids {
+    if absorbed_void_ids.contains(&vid) {
+      continue;
+    }
+    if let Some(&(_, px)) = shrunk_map.iter().find(|&&(id, _)| id == vid) {
+      other_voids_px += px;
+      shrunk_voids.push((vid, px / new_avail));
+    } else {
+      let px = vsize * old_avail;
+      other_voids_px += px;
+      preserved_voids.push((vid, px / new_avail));
+    }
+  }
+
+  let raw_win_px = new_avail - non_void_total_px - other_voids_px;
+  let (non_void_scale, new_win_size) =
+    if rem_need < 0.0 || raw_win_px < ideal_win_px * 0.5 {
+      let usable = (new_avail - other_voids_px).max(1.0);
+      let scale = usable / (non_void_total_px + ideal_win_px).max(1.0);
+      ((old_avail * scale) / new_avail, (ideal_win_px * scale) / new_avail)
+    } else {
+      (old_avail / new_avail, raw_win_px / new_avail)
+    };
+
+  VoidEdgeAllocation {
+    absorbed_void_ids,
+    shrunk_voids,
+    preserved_voids,
+    non_void_scale,
+    new_win_size,
+  }
+}
+
+#[allow(
+  clippy::cast_possible_truncation,
+  clippy::cast_possible_wrap,
+  clippy::cast_precision_loss
+)]
+fn compute_edge_void_allocation(
+  children: &[(Uuid, bool, f32)],
+  is_first: bool,
+  axis_px: i32,
+  gap: i32,
+) -> VoidEdgeAllocation {
+  let direct_voids: Vec<(Uuid, f32)> = children
+    .iter()
+    .filter(|(_, is_void, _)| *is_void)
+    .map(|(id, _, size)| (*id, *size))
+    .collect();
+  let non_void_count = children.iter().filter(|(_, v, _)| !*v).count();
+  let void_sum: f32 = direct_voids.iter().map(|(_, s)| *s).sum();
+  let target_frac = 1.0_f32 / (non_void_count + 1) as f32;
+
+  if void_sum >= target_frac - 0.02 {
+    return allocate_void_surplus(
+      children,
+      &direct_voids,
+      non_void_count,
+      is_first,
+      axis_px,
+      gap,
+    );
+  }
+
+  let old_n = children.len() as i32;
+  let old_avail = (axis_px - gap * (old_n - 1)).max(1) as f32;
+  let new_avail = (axis_px - gap * old_n).max(1) as f32;
+
+  let mut voids_px = 0.0_f32;
+  let mut preserved_voids = Vec::new();
+  for &(vid, vsize) in &direct_voids {
+    let px = vsize * old_avail;
+    voids_px += px;
+    preserved_voids.push((vid, px / new_avail));
+  }
+
+  let non_void_total_px: f32 = children
+    .iter()
+    .filter(|(_, is_void, _)| !*is_void)
+    .map(|(_, _, size)| *size * old_avail)
+    .sum();
+  let usable = (new_avail - voids_px).max(1.0);
+  let win_px = usable / (non_void_count + 1) as f32;
+  let scale = (usable - win_px) / non_void_total_px.max(1.0);
+
+  VoidEdgeAllocation {
+    absorbed_void_ids: Vec::new(),
+    shrunk_voids: Vec::new(),
+    preserved_voids,
+    non_void_scale: (old_avail * scale) / new_avail,
+    new_win_size: win_px / new_avail,
+  }
+}
+
+fn insert_along_workspace_direction(
+  tiling_window: &TilingWindow,
+  workspace: &Workspace,
+  existing_children: &[TilingContainer],
+  edge_dir: TilingDirection,
+  is_first: bool,
+) -> anyhow::Result<()> {
+  let ws_container: Container = workspace.clone().into();
+  let child_meta: Vec<(Uuid, bool, f32)> = existing_children
+    .iter()
+    .map(|c| (c.id(), c.is_void(), c.tiling_size()))
+    .collect();
+  let has_voids = child_meta.iter().any(|(_, is_void, _)| *is_void);
+  let has_non_voids = child_meta.iter().any(|(_, is_void, _)| !*is_void);
+
+  if !has_voids || !has_non_voids {
+    let insert_idx = if is_first { 0 } else { workspace.child_count() };
+    attach_container(
+      &tiling_window.clone().into(),
+      &ws_container,
+      Some(insert_idx),
+    )?;
+    return Ok(());
+  }
+
+  let ws_rect = workspace.multi_window_workspace_rect()?;
+  let (h_gap, v_gap) = workspace.workspace_inner_gaps()?;
+  let gap = gap_for_dir(&edge_dir, h_gap, v_gap);
+  let axis_px = match edge_dir {
+    TilingDirection::Horizontal => ws_rect.width(),
+    TilingDirection::Vertical => ws_rect.height(),
+  };
+
+  let alloc =
+    compute_edge_void_allocation(&child_meta, is_first, axis_px, gap);
+
+  for vid in &alloc.absorbed_void_ids {
+    if let Some(void_c) =
+      existing_children.iter().find(|c| c.id() == *vid)
+    {
+      workspace.borrow_children_mut().retain(|c| c.id() != *vid);
+      workspace
+        .borrow_child_focus_order_mut()
+        .retain(|id| *id != *vid);
+      *void_c.borrow_parent_mut() = None;
+    }
+  }
+
+  let insert_idx = if is_first { 0 } else { workspace.child_count() };
+  attach_container(
+    &tiling_window.clone().into(),
+    &ws_container,
+    Some(insert_idx),
+  )?;
+
+  for child in existing_children {
+    let cid = child.id();
+    if alloc.absorbed_void_ids.contains(&cid) {
+      continue;
+    }
+    if let Some(&(_, sz)) = alloc
+      .shrunk_voids
+      .iter()
+      .chain(alloc.preserved_voids.iter())
+      .find(|&&(id, _)| id == cid)
+    {
+      child.set_tiling_size(sz);
+    } else if !child.is_void() {
+      child.set_tiling_size(child.tiling_size() * alloc.non_void_scale);
+    }
+  }
+  tiling_window.set_tiling_size(alloc.new_win_size);
+
+  Ok(())
+}
+
 fn insert_into_populated_workspace(
   tiling_window: &TilingWindow,
   workspace: &Workspace,
@@ -1168,12 +1415,12 @@ fn insert_into_populated_workspace(
     | ScreenZone::Bottom => {
       let (edge_dir, is_first) = edge_direction_and_side(zone);
       if workspace.tiling_direction() == edge_dir {
-        let insert_idx =
-          if is_first { 0 } else { existing_children.len() };
-        attach_container(
-          &tiling_window.clone().into(),
-          &ws_container,
-          Some(insert_idx),
+        insert_along_workspace_direction(
+          tiling_window,
+          workspace,
+          existing_children,
+          edge_dir,
+          is_first,
         )?;
       } else {
         let old_dir = workspace.tiling_direction();
@@ -1197,7 +1444,7 @@ fn insert_into_populated_workspace(
     | ScreenZone::BottomLeft
     | ScreenZone::BottomRight => {
       let ws_rect = workspace.multi_window_workspace_rect()?;
-      let leaf = find_corner_leaf(workspace, None, zone, &ws_rect)?;
+      let leaf = find_corner_leaf(workspace, zone, &ws_rect)?;
       let leaf_rect = leaf.to_rect()?;
       let split_dir = corner_split_direction(&leaf_rect);
       let insert_first = corner_leaf_insert_first(zone, &split_dir);
@@ -1219,6 +1466,909 @@ fn insert_into_populated_workspace(
   Ok(())
 }
 
+#[derive(Clone)]
+enum SimKind {
+  Window,
+  Void,
+  Split {
+    direction: TilingDirection,
+    children: Vec<SimNode>,
+  },
+}
+
+#[derive(Clone)]
+struct SimNode {
+  id: Uuid,
+  size: f32,
+  kind: SimKind,
+}
+
+impl SimNode {
+  const fn is_void(&self) -> bool {
+    matches!(self.kind, SimKind::Void)
+  }
+
+  const fn is_window(&self) -> bool {
+    matches!(self.kind, SimKind::Window)
+  }
+
+  const fn is_split(&self) -> bool {
+    matches!(self.kind, SimKind::Split { .. })
+  }
+
+  fn from_tiling(container: &TilingContainer) -> Self {
+    let kind = match container {
+      TilingContainer::TilingWindow(_) => SimKind::Window,
+      TilingContainer::VoidSlot(_) => SimKind::Void,
+      TilingContainer::SplitContainer(split) => SimKind::Split {
+        direction: split.tiling_direction(),
+        children: split
+          .tiling_children()
+          .map(|child| Self::from_tiling(&child))
+          .collect(),
+      },
+    };
+    Self {
+      id: container.id(),
+      size: container.tiling_size(),
+      kind,
+    }
+  }
+}
+
+struct SimWorkspace {
+  direction: TilingDirection,
+  ws_rect: Rect,
+  h_gap: i32,
+  v_gap: i32,
+  children: Vec<SimNode>,
+}
+
+impl SimWorkspace {
+  fn from_workspace(
+    workspace: &Workspace,
+    ws_rect: Rect,
+    h_gap: i32,
+    v_gap: i32,
+  ) -> Self {
+    Self {
+      direction: workspace.tiling_direction(),
+      ws_rect,
+      h_gap,
+      v_gap,
+      children: workspace
+        .tiling_children()
+        .map(|child| SimNode::from_tiling(&child))
+        .collect(),
+    }
+  }
+
+  fn has_real_windows(&self) -> bool {
+    sim_has_window(&self.children)
+  }
+
+  fn has_voids(&self) -> bool {
+    sim_has_void(&self.children)
+  }
+
+  fn real_window_count(&self) -> usize {
+    sim_count_windows(&self.children)
+  }
+
+  fn collect_rects(
+    &self,
+    nodes: &[SimNode],
+    parent_rect: &Rect,
+    dir: TilingDirection,
+    out: &mut Vec<(Uuid, Rect, bool, bool)>,
+  ) {
+    let Ok(sibling_gaps) = i32::try_from(nodes.len().saturating_sub(1))
+    else {
+      return;
+    };
+    let gap = gap_for_dir(&dir, self.h_gap, self.v_gap);
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    match dir {
+      TilingDirection::Horizontal => {
+        let avail = (parent_rect.width() - gap * sibling_gaps).max(1);
+        let mut x = parent_rect.x();
+        for node in nodes {
+          let w = (avail as f32 * node.size).round() as i32;
+          let rect =
+            Rect::from_xy(x, parent_rect.y(), w, parent_rect.height());
+          match &node.kind {
+            SimKind::Split { direction, children } => {
+              out.push((node.id, rect.clone(), false, false));
+              self.collect_rects(children, &rect, *direction, out);
+            }
+            SimKind::Window => out.push((node.id, rect, true, false)),
+            SimKind::Void => out.push((node.id, rect, false, true)),
+          }
+          x += w + gap;
+        }
+      }
+      TilingDirection::Vertical => {
+        let avail = (parent_rect.height() - gap * sibling_gaps).max(1);
+        let mut y = parent_rect.y();
+        for node in nodes {
+          let h = (node.size * avail as f32) as i32;
+          let rect =
+            Rect::from_xy(parent_rect.x(), y, parent_rect.width(), h);
+          match &node.kind {
+            SimKind::Split { direction, children } => {
+              out.push((node.id, rect.clone(), false, false));
+              self.collect_rects(children, &rect, *direction, out);
+            }
+            SimKind::Window => out.push((node.id, rect, true, false)),
+            SimKind::Void => out.push((node.id, rect, false, true)),
+          }
+          y += h + gap;
+        }
+      }
+    }
+  }
+
+  fn all_rects(&self) -> Vec<(Uuid, Rect, bool, bool)> {
+    let mut out = Vec::new();
+    self.collect_rects(
+      &self.children,
+      &self.ws_rect,
+      self.direction,
+      &mut out,
+    );
+    out
+  }
+
+  fn rect_of(&self, id: Uuid) -> Option<Rect> {
+    self
+      .all_rects()
+      .into_iter()
+      .find(|(nid, _, _, _)| *nid == id)
+      .map(|(_, r, _, _)| r)
+  }
+
+  fn attach_node(
+    children: &mut Vec<SimNode>,
+    mut node: SimNode,
+    idx: usize,
+  ) {
+    let clamped = idx.min(children.len());
+    if children.is_empty() {
+      node.size = 1.0;
+      children.insert(clamped, node);
+      return;
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    let target_size = (1.0 / (children.len() + 1) as f32).clamp(
+      MIN_TILING_SIZE,
+      1.0 - (children.len() as f32 * MIN_TILING_SIZE),
+    );
+    let available: f32 = children
+      .iter()
+      .map(|c| c.size - MIN_TILING_SIZE)
+      .sum();
+    if available > f32::EPSILON {
+      for child in children.iter_mut() {
+        let factor = (child.size - MIN_TILING_SIZE) / available;
+        child.size -= factor * target_size;
+      }
+    } else {
+      #[allow(clippy::cast_precision_loss)]
+      let even_delta = target_size / children.len() as f32;
+      for child in children.iter_mut() {
+        child.size -= even_delta;
+      }
+    }
+
+    node.size = target_size;
+    children.insert(clamped, node);
+  }
+
+  fn detach_preferring_non_void_in(
+    children: &mut Vec<SimNode>,
+    target_id: Uuid,
+  ) -> bool {
+    if let Some(pos) = children.iter().position(|c| c.id == target_id) {
+      let removed = children.remove(pos);
+      let freed = removed.size;
+      let has_non_void = children.iter().any(|c| !c.is_void());
+      let avail: f32 = children
+        .iter()
+        .filter(|c| !has_non_void || !c.is_void())
+        .map(|c| c.size - MIN_TILING_SIZE)
+        .sum();
+      let rec_count = children
+        .iter()
+        .filter(|c| !has_non_void || !c.is_void())
+        .count();
+
+      if rec_count > 0 {
+        if avail > f32::EPSILON {
+          for child in children.iter_mut() {
+            if !has_non_void || !child.is_void() {
+              let factor = (child.size - MIN_TILING_SIZE) / avail;
+              child.size += factor * freed;
+            }
+          }
+        } else {
+          #[allow(clippy::cast_precision_loss)]
+          let even = freed / rec_count as f32;
+          for child in children.iter_mut() {
+            if !has_non_void || !child.is_void() {
+              child.size += even;
+            }
+          }
+        }
+      }
+      return true;
+    }
+
+    for child in children.iter_mut() {
+      if let SimKind::Split { children: sub, .. } = &mut child.kind {
+        if Self::detach_preferring_non_void_in(sub, target_id) {
+          return true;
+        }
+      }
+    }
+    false
+  }
+
+  fn normalize(&mut self) {
+    if !self.has_real_windows() {
+      self.children.clear();
+      return;
+    }
+
+    loop {
+      let changed = Self::normalize_level(
+        &mut self.direction,
+        &mut self.children,
+      );
+      if !changed {
+        break;
+      }
+    }
+  }
+
+  fn normalize_level(
+    parent_dir: &mut TilingDirection,
+    children: &mut Vec<SimNode>,
+  ) -> bool {
+    let mut changed = false;
+
+    for child in children.iter_mut() {
+      if let SimKind::Split {
+        direction,
+        children: sub,
+      } = &mut child.kind
+      {
+        if Self::normalize_level(direction, sub) {
+          changed = true;
+        }
+      }
+    }
+
+    let mut i = 0;
+    while i + 1 < children.len() {
+      if children[i].is_void() && children[i + 1].is_void() {
+        let extra = children.remove(i + 1).size;
+        children[i].size += extra;
+        changed = true;
+      } else {
+        i += 1;
+      }
+    }
+
+    let before_len = children.len();
+    children.retain(|c| match &c.kind {
+      SimKind::Split { children: sub, .. } => !sub.is_empty(),
+      _ => true,
+    });
+    if children.len() != before_len {
+      changed = true;
+    }
+
+    if children.len() == 1 && children[0].is_split() {
+      let sole = children.remove(0);
+      if let SimKind::Split { direction, children: sub } = sole.kind {
+        *parent_dir = direction;
+        *children = sub;
+        changed = true;
+      }
+    } else {
+      let mut out = Vec::with_capacity(children.len());
+      for child in children.drain(..) {
+        match child.kind {
+          SimKind::Split {
+            direction,
+            children: sub,
+          } if sub.len() == 1 || direction == *parent_dir => {
+            for mut grand in sub {
+              grand.size *= child.size;
+              out.push(grand);
+            }
+            changed = true;
+          }
+          other => out.push(SimNode {
+            id: child.id,
+            size: child.size,
+            kind: other,
+          }),
+        }
+      }
+      *children = out;
+    }
+
+    changed
+  }
+
+  fn vacate_origin(&mut self, origin_id: Uuid) -> Option<Uuid> {
+    match sim_inspect_origin(&self.children, self.direction, origin_id)? {
+      SimOriginKind::Void => Some(origin_id),
+      SimOriginKind::WinWithVertNeighbor => {
+        Self::detach_preferring_non_void_in(&mut self.children, origin_id);
+        self.normalize();
+        if !self.has_voids() && self.real_window_count() == 1 {
+          self.children.clear();
+        }
+        None
+      }
+      SimOriginKind::WinWithoutVertNeighbor => {
+        sim_turn_to_void(&mut self.children, origin_id);
+        Some(origin_id)
+      }
+    }
+  }
+
+  fn absorb_void_pair_in(
+    nodes: &mut Vec<SimNode>,
+    dir: TilingDirection,
+    parent_rect: &Rect,
+    sliver_id: Uuid,
+    h_gap: i32,
+    v_gap: i32,
+  ) -> bool {
+    if let Some(pos) = nodes.iter().position(|n| n.id == sliver_id) {
+      return sim_absorb_void_at(
+        nodes,
+        dir,
+        parent_rect,
+        pos,
+        h_gap,
+        v_gap,
+      );
+    }
+
+    let gap = gap_for_dir(&dir, h_gap, v_gap);
+    let Ok(sib_gaps) = i32::try_from(nodes.len().saturating_sub(1)) else {
+      return false;
+    };
+    let mut offset = match dir {
+      TilingDirection::Horizontal => parent_rect.x(),
+      TilingDirection::Vertical => parent_rect.y(),
+    };
+    let avail = match dir {
+      TilingDirection::Horizontal => {
+        (parent_rect.width() - gap * sib_gaps).max(1)
+      }
+      TilingDirection::Vertical => {
+        (parent_rect.height() - gap * sib_gaps).max(1)
+      }
+    };
+
+    for node in nodes.iter_mut() {
+      #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss
+      )]
+      let child_rect = match dir {
+        TilingDirection::Horizontal => {
+          let w = (avail as f32 * node.size).round() as i32;
+          let r = Rect::from_xy(
+            offset,
+            parent_rect.y(),
+            w,
+            parent_rect.height(),
+          );
+          offset += w + gap;
+          r
+        }
+        TilingDirection::Vertical => {
+          let h = (node.size * avail as f32) as i32;
+          let r = Rect::from_xy(
+            parent_rect.x(),
+            offset,
+            parent_rect.width(),
+            h,
+          );
+          offset += h + gap;
+          r
+        }
+      };
+
+      if let SimKind::Split { direction, children } = &mut node.kind {
+        if Self::absorb_void_pair_in(
+          children,
+          *direction,
+          &child_rect,
+          sliver_id,
+          h_gap,
+          v_gap,
+        ) {
+          return true;
+        }
+      }
+    }
+    false
+  }
+
+  fn absorb_slivers(&mut self) {
+    self.normalize();
+    for _ in 0..32 {
+      let sliver = self.all_rects().into_iter().find_map(
+        |(id, rect, _, is_void)| {
+          (is_void
+            && (rect.width() < MIN_VOID_SPAN_PX
+              || rect.height() < MIN_VOID_SPAN_PX))
+            .then_some(id)
+        },
+      );
+      let Some(sliver_id) = sliver else {
+        break;
+      };
+      if !Self::absorb_void_pair_in(
+        &mut self.children,
+        self.direction,
+        &self.ws_rect,
+        sliver_id,
+        self.h_gap,
+        self.v_gap,
+      ) {
+        break;
+      }
+      self.normalize();
+    }
+  }
+
+  fn find_matching_void(
+    &self,
+    zone: ScreenZone,
+    origin_void_id: Option<Uuid>,
+    cursor: Option<&Point>,
+  ) -> Option<(Uuid, VoidMatchKind)> {
+    let mut best: Option<(u8, (Uuid, VoidMatchKind))> = None;
+    for (id, rect, _, is_void) in self.all_rects() {
+      if !is_void || Some(id) == origin_void_id {
+        continue;
+      }
+      if let Some((rank, kind)) = match_void_slot_rect(
+        &rect,
+        zone,
+        cursor,
+        &self.ws_rect,
+        self.h_gap,
+        self.v_gap,
+      ) {
+        if best.as_ref().is_none_or(|(br, _)| rank < *br) {
+          best = Some((rank, (id, kind)));
+        }
+      }
+    }
+    best.map(|(_, matched)| matched)
+  }
+
+  fn apply_void_match(
+    &mut self,
+    new_win_id: Uuid,
+    slot_id: Uuid,
+    kind: VoidMatchKind,
+  ) {
+    sim_apply_void_match(&mut self.children, new_win_id, slot_id, kind);
+  }
+
+  fn cleanup_origin_void_after_match(&mut self, origin_id: Uuid) {
+    match sim_has_adjacent_void(&self.children, origin_id) {
+      Some(true) => self.normalize(),
+      Some(false) => {
+        Self::detach_preferring_non_void_in(&mut self.children, origin_id);
+        self.normalize();
+      }
+      None => {}
+    }
+  }
+
+  fn insert_populated(&mut self, new_win_id: Uuid, zone: ScreenZone) {
+    match zone {
+      ScreenZone::Left
+      | ScreenZone::Right
+      | ScreenZone::Top
+      | ScreenZone::Bottom => {
+        self.insert_populated_edge(new_win_id, zone);
+      }
+      ScreenZone::TopLeft
+      | ScreenZone::TopRight
+      | ScreenZone::BottomLeft
+      | ScreenZone::BottomRight => {
+        self.insert_populated_corner(new_win_id, zone);
+      }
+      ScreenZone::TopCenter => {}
+    }
+  }
+
+  fn insert_populated_edge(&mut self, new_win_id: Uuid, zone: ScreenZone) {
+    let (edge_dir, is_first) = edge_direction_and_side(zone);
+    if self.direction != edge_dir {
+      let old_children = std::mem::take(&mut self.children);
+      let wrapper = SimNode {
+        id: Uuid::new_v4(),
+        size: 0.5,
+        kind: SimKind::Split {
+          direction: self.direction,
+          children: old_children,
+        },
+      };
+      let inserted = SimNode {
+        id: new_win_id,
+        size: 0.5,
+        kind: SimKind::Window,
+      };
+      self.direction = edge_dir;
+      self.children = if is_first {
+        vec![inserted, wrapper]
+      } else {
+        vec![wrapper, inserted]
+      };
+      return;
+    }
+
+    let meta: Vec<(Uuid, bool, f32)> = self
+      .children
+      .iter()
+      .map(|c| (c.id, c.is_void(), c.size))
+      .collect();
+    let has_voids = meta.iter().any(|(_, v, _)| *v);
+    let has_non_voids = meta.iter().any(|(_, v, _)| !*v);
+    let mut new_node = SimNode {
+      id: new_win_id,
+      size: 1.0,
+      kind: SimKind::Window,
+    };
+    if !has_voids || !has_non_voids {
+      let idx = if is_first { 0 } else { self.children.len() };
+      Self::attach_node(&mut self.children, new_node, idx);
+      return;
+    }
+
+    let gap = gap_for_dir(&edge_dir, self.h_gap, self.v_gap);
+    let axis_px = match edge_dir {
+      TilingDirection::Horizontal => self.ws_rect.width(),
+      TilingDirection::Vertical => self.ws_rect.height(),
+    };
+    let alloc =
+      compute_edge_void_allocation(&meta, is_first, axis_px, gap);
+    self
+      .children
+      .retain(|c| !alloc.absorbed_void_ids.contains(&c.id));
+    for child in &mut self.children {
+      if let Some(&(_, sz)) = alloc
+        .shrunk_voids
+        .iter()
+        .chain(alloc.preserved_voids.iter())
+        .find(|&&(id, _)| id == child.id)
+      {
+        child.size = sz;
+      } else if !child.is_void() {
+        child.size *= alloc.non_void_scale;
+      }
+    }
+    let idx = if is_first { 0 } else { self.children.len() };
+    new_node.size = alloc.new_win_size;
+    self.children.insert(idx, new_node);
+  }
+
+  fn insert_populated_corner(
+    &mut self,
+    new_win_id: Uuid,
+    zone: ScreenZone,
+  ) {
+    let target_pt = corner_target_point(zone, &self.ws_rect);
+    let Some((leaf_id, leaf_rect)) = self
+      .all_rects()
+      .into_iter()
+      .filter(|(_, _, is_win, is_void)| *is_win || *is_void)
+      .min_by_key(|(_, rect, _, _)| {
+        let pt = corner_rect_point(zone, rect);
+        (pt.x - target_pt.x).abs() + (pt.y - target_pt.y).abs()
+      })
+      .map(|(id, rect, _, _)| (id, rect))
+    else {
+      return;
+    };
+
+    let split_dir = corner_split_direction(&leaf_rect);
+    let insert_first = corner_leaf_insert_first(zone, &split_dir);
+    sim_wrap_leaf(
+      &mut self.children,
+      leaf_id,
+      new_win_id,
+      split_dir,
+      insert_first,
+    );
+  }
+}
+
+enum SimOriginKind {
+  Void,
+  WinWithVertNeighbor,
+  WinWithoutVertNeighbor,
+}
+
+fn sim_has_window(nodes: &[SimNode]) -> bool {
+  nodes.iter().any(|n| match &n.kind {
+    SimKind::Window => true,
+    SimKind::Void => false,
+    SimKind::Split { children, .. } => sim_has_window(children),
+  })
+}
+
+fn sim_has_void(nodes: &[SimNode]) -> bool {
+  nodes.iter().any(|n| match &n.kind {
+    SimKind::Window => false,
+    SimKind::Void => true,
+    SimKind::Split { children, .. } => sim_has_void(children),
+  })
+}
+
+fn sim_count_windows(nodes: &[SimNode]) -> usize {
+  nodes
+    .iter()
+    .map(|n| match &n.kind {
+      SimKind::Window => 1,
+      SimKind::Void => 0,
+      SimKind::Split { children, .. } => sim_count_windows(children),
+    })
+    .sum()
+}
+
+fn sim_inspect_origin(
+  nodes: &[SimNode],
+  dir: TilingDirection,
+  origin_id: Uuid,
+) -> Option<SimOriginKind> {
+  for node in nodes {
+    if node.id == origin_id {
+      if node.is_void() {
+        return Some(SimOriginKind::Void);
+      }
+      let has_vert = dir == TilingDirection::Vertical
+        && nodes.iter().any(|c| c.id != origin_id && !c.is_void());
+      return Some(if has_vert {
+        SimOriginKind::WinWithVertNeighbor
+      } else {
+        SimOriginKind::WinWithoutVertNeighbor
+      });
+    }
+    if let SimKind::Split { direction, children } = &node.kind {
+      if let Some(found) =
+        sim_inspect_origin(children, *direction, origin_id)
+      {
+        return Some(found);
+      }
+    }
+  }
+  None
+}
+
+fn sim_turn_to_void(nodes: &mut [SimNode], origin_id: Uuid) -> bool {
+  for node in nodes.iter_mut() {
+    if node.id == origin_id {
+      node.kind = SimKind::Void;
+      return true;
+    }
+    if let SimKind::Split { children, .. } = &mut node.kind {
+      if sim_turn_to_void(children, origin_id) {
+        return true;
+      }
+    }
+  }
+  false
+}
+
+fn sim_absorb_void_at(
+  nodes: &mut Vec<SimNode>,
+  dir: TilingDirection,
+  parent_rect: &Rect,
+  pos: usize,
+  h_gap: i32,
+  v_gap: i32,
+) -> bool {
+  if nodes.len() < 2 {
+    return false;
+  }
+  let prev = pos.checked_sub(1);
+  let next = (pos + 1 < nodes.len()).then_some(pos + 1);
+  let Some(ben_idx) = [prev, next]
+    .into_iter()
+    .flatten()
+    .find(|&idx| !nodes[idx].is_void())
+    .or(prev.or(next))
+  else {
+    return false;
+  };
+
+  let gap = gap_for_dir(&dir, h_gap, v_gap);
+  let axis_px = match dir {
+    TilingDirection::Horizontal => parent_rect.width(),
+    TilingDirection::Vertical => parent_rect.height(),
+  };
+  let Ok(sib_gaps) = i32::try_from(nodes.len().saturating_sub(1)) else {
+    return false;
+  };
+  #[allow(clippy::cast_precision_loss)]
+  let old_avail = (axis_px - gap * sib_gaps).max(1) as f32;
+  #[allow(clippy::cast_precision_loss)]
+  let gap_f = gap as f32;
+  let new_avail = (old_avail + gap_f).max(1.0);
+  let merged =
+    ((nodes[ben_idx].size + nodes[pos].size) * old_avail + gap_f)
+      / new_avail;
+
+  for (idx, node) in nodes.iter_mut().enumerate() {
+    if idx != pos && idx != ben_idx {
+      node.size = (node.size * old_avail) / new_avail;
+    }
+  }
+  nodes[ben_idx].size = merged;
+  nodes.remove(pos);
+  true
+}
+
+fn sim_apply_void_match(
+  nodes: &mut [SimNode],
+  new_win_id: Uuid,
+  slot_id: Uuid,
+  kind: VoidMatchKind,
+) -> bool {
+  for node in nodes.iter_mut() {
+    if node.id == slot_id {
+      match kind {
+        VoidMatchKind::Exact => {
+          node.id = new_win_id;
+          node.kind = SimKind::Window;
+        }
+        VoidMatchKind::SplitHalf { split_dir, insert_first } => {
+          let void_half = SimNode {
+            id: slot_id,
+            size: 0.5,
+            kind: SimKind::Void,
+          };
+          let win_half = SimNode {
+            id: new_win_id,
+            size: 0.5,
+            kind: SimKind::Window,
+          };
+          let pair = if insert_first {
+            vec![win_half, void_half]
+          } else {
+            vec![void_half, win_half]
+          };
+          node.id = Uuid::new_v4();
+          node.kind = SimKind::Split {
+            direction: split_dir,
+            children: pair,
+          };
+        }
+      }
+      return true;
+    }
+    if let SimKind::Split { children, .. } = &mut node.kind {
+      if sim_apply_void_match(children, new_win_id, slot_id, kind) {
+        return true;
+      }
+    }
+  }
+  false
+}
+
+fn sim_has_adjacent_void(
+  nodes: &[SimNode],
+  origin_id: Uuid,
+) -> Option<bool> {
+  if let Some(pos) = nodes.iter().position(|n| n.id == origin_id) {
+    let prev_v = pos > 0 && nodes[pos - 1].is_void();
+    let next_v = pos + 1 < nodes.len() && nodes[pos + 1].is_void();
+    return Some(prev_v || next_v);
+  }
+  for node in nodes {
+    if let SimKind::Split { children, .. } = &node.kind {
+      if let Some(found) = sim_has_adjacent_void(children, origin_id) {
+        return Some(found);
+      }
+    }
+  }
+  None
+}
+
+fn sim_wrap_leaf(
+  nodes: &mut [SimNode],
+  leaf_id: Uuid,
+  new_win_id: Uuid,
+  split_dir: TilingDirection,
+  insert_first: bool,
+) -> bool {
+  for node in nodes.iter_mut() {
+    if node.id == leaf_id {
+      let mut leaf_node = SimNode {
+        id: leaf_id,
+        size: 0.5,
+        kind: SimKind::Void,
+      };
+      std::mem::swap(&mut leaf_node.kind, &mut node.kind);
+      let win_node = SimNode {
+        id: new_win_id,
+        size: 0.5,
+        kind: SimKind::Window,
+      };
+      node.id = Uuid::new_v4();
+      node.kind = SimKind::Split {
+        direction: split_dir,
+        children: if insert_first {
+          vec![win_node, leaf_node]
+        } else {
+          vec![leaf_node, win_node]
+        },
+      };
+      return true;
+    }
+    if let SimKind::Split { children, .. } = &mut node.kind {
+      if sim_wrap_leaf(
+        children,
+        leaf_id,
+        new_win_id,
+        split_dir,
+        insert_first,
+      ) {
+        return true;
+      }
+    }
+  }
+  false
+}
+
+fn empty_workspace_snap_rect(
+  ws_rect: &Rect,
+  zone: ScreenZone,
+  h_gap: i32,
+  v_gap: i32,
+) -> Rect {
+  match zone {
+    ScreenZone::Left
+    | ScreenZone::Right
+    | ScreenZone::Top
+    | ScreenZone::Bottom => {
+      let (dir, is_first) = edge_direction_and_side(zone);
+      let gap = gap_for_dir(&dir, h_gap, v_gap);
+      split_half_rect(ws_rect, &dir, is_first, gap)
+    }
+    ScreenZone::TopLeft
+    | ScreenZone::TopRight
+    | ScreenZone::BottomLeft
+    | ScreenZone::BottomRight => {
+      let (is_left, is_top) = corner_sides(zone);
+      let half = split_half_rect(
+        ws_rect,
+        &TilingDirection::Horizontal,
+        is_left,
+        h_gap,
+      );
+      split_half_rect(&half, &TilingDirection::Vertical, is_top, v_gap)
+    }
+    ScreenZone::TopCenter => ws_rect.clone(),
+  }
+}
+
 fn compute_snap_zone_preview_rect(
   workspace: &Workspace,
   zone: ScreenZone,
@@ -1228,139 +2378,155 @@ fn compute_snap_zone_preview_rect(
   let ws_rect = workspace.multi_window_workspace_rect()?;
   let (h_gap, v_gap) = workspace.workspace_inner_gaps()?;
 
-  let origin_in_ws = exclude_slot_id.filter(|id| {
-    workspace
-      .descendants()
-      .any(|c| c.id() == *id && c.as_tiling_container().is_ok())
-  });
-
-  let has_other_real_windows = workspace
-    .tiling_windows()
-    .any(|win| Some(win.id()) != origin_in_ws);
-
-  if has_other_real_windows {
-    if let Some(void_match) = find_matching_void(
-      workspace,
-      zone,
-      origin_in_ws,
-      cursor,
-      &ws_rect,
-      h_gap,
-      v_gap,
-    )? {
-    return match void_match {
-      VoidMatch::Exact(slot) => slot.to_rect(),
-      VoidMatch::SplitHalf {
-        slot,
-        split_dir,
-        insert_first,
-      } => {
-        let slot_rect = slot.to_rect()?;
-        let gap = gap_for_dir(&split_dir, h_gap, v_gap);
-        Ok(split_half_rect(&slot_rect, &split_dir, insert_first, gap))
-      }
-    };
-    }
+  if zone == ScreenZone::TopCenter {
+    return Ok(ws_rect);
   }
 
-  let effective_children: Vec<TilingContainer> =
-    if has_other_real_windows {
-    workspace
-      .tiling_children()
-      .filter(|c| Some(c.id()) != origin_in_ws)
-      .collect()
-  } else {
-    Vec::new()
-  };
+  let mut sim =
+    SimWorkspace::from_workspace(workspace, ws_rect.clone(), h_gap, v_gap);
 
-  if effective_children.is_empty()
-    || (effective_children.len() == 1
-      && effective_children[0].is_tiling_window())
+  let origin_void_id = exclude_slot_id.and_then(|id| sim.vacate_origin(id));
+
+  if !sim.has_real_windows() {
+    return Ok(empty_workspace_snap_rect(&ws_rect, zone, h_gap, v_gap));
+  }
+
+  let new_win_id = Uuid::new_v4();
+  if let Some((slot_id, kind)) =
+    sim.find_matching_void(zone, origin_void_id, cursor)
   {
-    return Ok(match zone {
-      ScreenZone::Left
-      | ScreenZone::Right
-      | ScreenZone::Top
-      | ScreenZone::Bottom => {
-        let (dir, is_first) = edge_direction_and_side(zone);
-        let gap = gap_for_dir(&dir, h_gap, v_gap);
-        split_half_rect(&ws_rect, &dir, is_first, gap)
-      }
-      ScreenZone::TopLeft
-      | ScreenZone::TopRight
-      | ScreenZone::BottomLeft
-      | ScreenZone::BottomRight => {
-        let (is_left, is_top) = corner_sides(zone);
-        let half = split_half_rect(
-          &ws_rect,
-          &TilingDirection::Horizontal,
-          is_left,
-          h_gap,
-        );
-        split_half_rect(&half, &TilingDirection::Vertical, is_top, v_gap)
-      }
-      ScreenZone::TopCenter => ws_rect,
-    });
+    sim.apply_void_match(new_win_id, slot_id, kind);
+    if let Some(oid) = origin_void_id {
+      sim.cleanup_origin_void_after_match(oid);
+    }
+    sim.normalize();
+    sim.absorb_slivers();
+    let fallback = empty_workspace_snap_rect(&ws_rect, zone, h_gap, v_gap);
+    return Ok(sim.rect_of(new_win_id).unwrap_or(fallback));
   }
 
-  compute_populated_snap_zone_preview(
-    workspace,
-    zone,
-    origin_in_ws,
-    &ws_rect,
-    effective_children.len(),
-    h_gap,
-    v_gap,
-  )
+  if let Some(oid) = origin_void_id {
+    SimWorkspace::detach_preferring_non_void_in(&mut sim.children, oid);
+    sim.normalize();
+  }
+
+  if sim.children.is_empty()
+    || (sim.children.len() == 1 && sim.children[0].is_window())
+  {
+    return Ok(empty_workspace_snap_rect(&ws_rect, zone, h_gap, v_gap));
+  }
+
+  sim.insert_populated(new_win_id, zone);
+  sim.normalize();
+  sim.absorb_slivers();
+  let fallback = empty_workspace_snap_rect(&ws_rect, zone, h_gap, v_gap);
+  Ok(sim.rect_of(new_win_id).unwrap_or(fallback))
 }
 
-fn compute_populated_snap_zone_preview(
-  workspace: &Workspace,
+#[derive(Copy, Clone)]
+enum VoidMatchKind {
+  Exact,
+  SplitHalf {
+    split_dir: TilingDirection,
+    insert_first: bool,
+  },
+}
+
+#[allow(clippy::too_many_lines)]
+fn match_void_slot_rect(
+  rect: &Rect,
   zone: ScreenZone,
-  origin_in_ws: Option<Uuid>,
+  cursor: Option<&Point>,
   ws_rect: &Rect,
-  sibling_count: usize,
   h_gap: i32,
   v_gap: i32,
-) -> anyhow::Result<Rect> {
+) -> Option<(u8, VoidMatchKind)> {
+  if rect.width() < MIN_VOID_SPAN_PX || rect.height() < MIN_VOID_SPAN_PX {
+    return None;
+  }
+
+  let near_l = rect.left <= ws_rect.left + h_gap + 8;
+  let near_r = rect.right >= ws_rect.right - h_gap - 8;
+  let near_t = rect.top <= ws_rect.top + v_gap + 8;
+  let near_b = rect.bottom >= ws_rect.bottom - v_gap - 8;
+  let is_full_h = rect.height() >= (ws_rect.height() * 2) / 3;
+  let is_full_w = rect.width() >= (ws_rect.width() * 2) / 3;
+  let is_partial_w = rect.width() < ws_rect.width() - 40;
+  let is_partial_h = rect.height() < ws_rect.height() - 40;
+  let contains_y = cursor.is_some_and(|pt| {
+    pt.y >= rect.top - v_gap - 8 && pt.y <= rect.bottom + v_gap + 8
+  });
+  let contains_x = cursor.is_some_and(|pt| {
+    pt.x >= rect.left - h_gap - 8 && pt.x <= rect.right + h_gap + 8
+  });
+
   match zone {
-    ScreenZone::Left
-    | ScreenZone::Right
-    | ScreenZone::Top
-    | ScreenZone::Bottom => {
-      let (edge_dir, is_first) = edge_direction_and_side(zone);
-      let gap = gap_for_dir(&edge_dir, h_gap, v_gap);
-      if workspace.tiling_direction() == edge_dir {
-        #[allow(clippy::cast_precision_loss)]
-        let new_fraction = 1.0 / (sibling_count + 1) as f32;
-        Ok(edge_insertion_rect(
-          ws_rect,
-          &edge_dir,
-          is_first,
-          gap,
-          sibling_count,
-          new_fraction,
-        ))
+    ScreenZone::Left if near_l && is_partial_w => {
+      let rank = if contains_y {
+        0
       } else {
-        Ok(split_half_rect(ws_rect, &edge_dir, is_first, gap))
-      }
+        u8::from(!is_full_h) + 1
+      };
+      Some((rank, VoidMatchKind::Exact))
+    }
+    ScreenZone::Right if near_r && is_partial_w => {
+      let rank = if contains_y {
+        0
+      } else {
+        u8::from(!is_full_h) + 1
+      };
+      Some((rank, VoidMatchKind::Exact))
+    }
+    ScreenZone::Top if near_t && is_partial_h => {
+      let rank = if contains_x {
+        0
+      } else {
+        u8::from(!is_full_w) + 1
+      };
+      Some((rank, VoidMatchKind::Exact))
+    }
+    ScreenZone::Bottom if near_b && is_partial_h => {
+      let rank = if contains_x {
+        0
+      } else {
+        u8::from(!is_full_w) + 1
+      };
+      Some((rank, VoidMatchKind::Exact))
     }
     ScreenZone::TopLeft
     | ScreenZone::TopRight
     | ScreenZone::BottomLeft
     | ScreenZone::BottomRight => {
-      let leaf = find_corner_leaf(workspace, origin_in_ws, zone, ws_rect)?;
-      let leaf_rect = effective_leaf_rect(&leaf, origin_in_ws)?;
-      let split_dir = corner_split_direction(&leaf_rect);
-      let insert_first = corner_leaf_insert_first(zone, &split_dir);
-      let gap = gap_for_dir(&split_dir, h_gap, v_gap);
-      Ok(split_half_rect(&leaf_rect, &split_dir, insert_first, gap))
+      let (is_left, is_top) = corner_sides(zone);
+      let horiz_ok = if is_left { near_l } else { near_r };
+      let vert_ok = if is_top { near_t } else { near_b };
+
+      if horiz_ok && vert_ok && is_partial_w && is_partial_h {
+        Some((0, VoidMatchKind::Exact))
+      } else if horiz_ok && is_full_h && is_partial_w {
+        Some((
+          1,
+          VoidMatchKind::SplitHalf {
+            split_dir: TilingDirection::Vertical,
+            insert_first: is_top,
+          },
+        ))
+      } else if vert_ok && is_full_w && is_partial_h {
+        Some((
+          1,
+          VoidMatchKind::SplitHalf {
+            split_dir: TilingDirection::Horizontal,
+            insert_first: is_left,
+          },
+        ))
+      } else {
+        None
+      }
     }
-    ScreenZone::TopCenter => Ok(ws_rect.clone()),
+    _ => None,
   }
 }
 
-#[allow(clippy::too_many_lines)]
 fn find_matching_void(
   workspace: &Workspace,
   zone: ScreenZone,
@@ -1370,8 +2536,6 @@ fn find_matching_void(
   h_gap: i32,
   v_gap: i32,
 ) -> anyhow::Result<Option<VoidMatch>> {
-  const MIN_VOID_SPAN_PX: i32 = 32;
-
   let slots: Vec<VoidSlot> = workspace
     .descendants()
     .filter_map(|c| c.as_void().cloned())
@@ -1382,96 +2546,25 @@ fn find_matching_void(
 
   for slot in slots {
     let rect = slot.to_rect()?;
-    if rect.width() < MIN_VOID_SPAN_PX
-      || rect.height() < MIN_VOID_SPAN_PX
-    {
-      continue;
-    }
-
-    let near_l = rect.left <= ws_rect.left + h_gap + 8;
-    let near_r = rect.right >= ws_rect.right - h_gap - 8;
-    let near_t = rect.top <= ws_rect.top + v_gap + 8;
-    let near_b = rect.bottom >= ws_rect.bottom - v_gap - 8;
-    let is_full_h = rect.height() >= (ws_rect.height() * 2) / 3;
-    let is_full_w = rect.width() >= (ws_rect.width() * 2) / 3;
-    let is_partial_w = rect.width() < ws_rect.width() - 40;
-    let is_partial_h = rect.height() < ws_rect.height() - 40;
-    let contains_y = cursor.is_some_and(|pt| {
-      pt.y >= rect.top - v_gap - 8 && pt.y <= rect.bottom + v_gap + 8
-    });
-    let contains_x = cursor.is_some_and(|pt| {
-      pt.x >= rect.left - h_gap - 8 && pt.x <= rect.right + h_gap + 8
-    });
-
-    let candidate: Option<(u8, VoidMatch)> = match zone {
-      ScreenZone::Left if near_l && is_partial_w => {
-        let rank = if contains_y {
-          0
-        } else {
-          u8::from(!is_full_h) + 1
-        };
-        Some((rank, VoidMatch::Exact(slot)))
-      }
-      ScreenZone::Right if near_r && is_partial_w => {
-        let rank = if contains_y {
-          0
-        } else {
-          u8::from(!is_full_h) + 1
-        };
-        Some((rank, VoidMatch::Exact(slot)))
-      }
-      ScreenZone::Top if near_t && is_partial_h => {
-        let rank = if contains_x {
-          0
-        } else {
-          u8::from(!is_full_w) + 1
-        };
-        Some((rank, VoidMatch::Exact(slot)))
-      }
-      ScreenZone::Bottom if near_b && is_partial_h => {
-        let rank = if contains_x {
-          0
-        } else {
-          u8::from(!is_full_w) + 1
-        };
-        Some((rank, VoidMatch::Exact(slot)))
-      }
-      ScreenZone::TopLeft
-      | ScreenZone::TopRight
-      | ScreenZone::BottomLeft
-      | ScreenZone::BottomRight => {
-        let (is_left, is_top) = corner_sides(zone);
-        let horiz_ok = if is_left { near_l } else { near_r };
-        let vert_ok = if is_top { near_t } else { near_b };
-
-        if horiz_ok && vert_ok && is_partial_w && is_partial_h {
-          Some((0, VoidMatch::Exact(slot)))
-        } else if horiz_ok && is_full_h && is_partial_w {
-          Some((
-            1,
-            VoidMatch::SplitHalf {
-              slot,
-              split_dir: TilingDirection::Vertical,
-              insert_first: is_top,
-            },
-          ))
-        } else if vert_ok && is_full_w && is_partial_h {
-          Some((
-            1,
-            VoidMatch::SplitHalf {
-              slot,
-              split_dir: TilingDirection::Horizontal,
-              insert_first: is_left,
-            },
-          ))
-        } else {
-          None
-        }
-      }
-      _ => None,
-    };
-
-    if let Some((rank, matched)) = candidate {
+    if let Some((rank, kind)) = match_void_slot_rect(
+      &rect,
+      zone,
+      cursor,
+      ws_rect,
+      h_gap,
+      v_gap,
+    ) {
+      let matched = match kind {
+        VoidMatchKind::Exact => VoidMatch::Exact(slot),
+        VoidMatchKind::SplitHalf {
+          split_dir,
+          insert_first,
+        } => VoidMatch::SplitHalf {
+          slot,
+          split_dir,
+          insert_first,
+        },
+      };
       if best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
         best = Some((rank, matched));
       }
@@ -1481,13 +2574,8 @@ fn find_matching_void(
   Ok(best.map(|(_, matched)| matched))
 }
 
-fn find_corner_leaf(
-  workspace: &Workspace,
-  exclude_void_id: Option<Uuid>,
-  zone: ScreenZone,
-  ws_rect: &Rect,
-) -> anyhow::Result<TilingContainer> {
-  let target_pt = match zone {
+const fn corner_target_point(zone: ScreenZone, ws_rect: &Rect) -> Point {
+  match zone {
     ScreenZone::TopLeft => Point {
       x: ws_rect.left,
       y: ws_rect.top,
@@ -1504,36 +2592,48 @@ fn find_corner_leaf(
       x: ws_rect.right,
       y: ws_rect.bottom,
     },
-  };
+  }
+}
+
+const fn corner_rect_point(zone: ScreenZone, rect: &Rect) -> Point {
+  match zone {
+    ScreenZone::TopLeft => Point {
+      x: rect.left,
+      y: rect.top,
+    },
+    ScreenZone::TopRight => Point {
+      x: rect.right,
+      y: rect.top,
+    },
+    ScreenZone::BottomLeft => Point {
+      x: rect.left,
+      y: rect.bottom,
+    },
+    _ => Point {
+      x: rect.right,
+      y: rect.bottom,
+    },
+  }
+}
+
+fn find_corner_leaf(
+  workspace: &Workspace,
+  zone: ScreenZone,
+  ws_rect: &Rect,
+) -> anyhow::Result<TilingContainer> {
+  let target_pt = corner_target_point(zone, ws_rect);
 
   let mut best: Option<(i32, TilingContainer)> = None;
   for descendant in workspace.descendants() {
     let Ok(tiling) = descendant.as_tiling_container() else {
       continue;
     };
-    if tiling.is_split() || Some(tiling.id()) == exclude_void_id {
+    if tiling.is_split() {
       continue;
     }
 
     let rect = tiling.to_rect()?;
-    let corner_pt = match zone {
-      ScreenZone::TopLeft => Point {
-        x: rect.left,
-        y: rect.top,
-      },
-      ScreenZone::TopRight => Point {
-        x: rect.right,
-        y: rect.top,
-      },
-      ScreenZone::BottomLeft => Point {
-        x: rect.left,
-        y: rect.bottom,
-      },
-      _ => Point {
-        x: rect.right,
-        y: rect.bottom,
-      },
-    };
+    let corner_pt = corner_rect_point(zone, &rect);
 
     let dist = (corner_pt.x - target_pt.x).abs()
       + (corner_pt.y - target_pt.y).abs();
@@ -1545,103 +2645,6 @@ fn find_corner_leaf(
   best
     .map(|(_, leaf)| leaf)
     .context("No tiling leaf container found in workspace.")
-}
-
-fn effective_leaf_rect(
-  leaf: &TilingContainer,
-  origin_void_id: Option<Uuid>,
-) -> anyhow::Result<Rect> {
-  let rect = leaf.to_rect()?;
-  let Some(origin_id) = origin_void_id else {
-    return Ok(rect);
-  };
-
-  let Some(parent) = leaf.direction_container() else {
-    return Ok(rect);
-  };
-
-  let Some(origin_void) = parent
-    .tiling_children()
-    .find(|child| child.id() == origin_id)
-  else {
-    return Ok(rect);
-  };
-
-  let remaining_sum: f32 = parent
-    .tiling_children()
-    .filter(|child| child.id() != origin_id)
-    .map(|child| child.tiling_size())
-    .sum();
-  if remaining_sum <= f32::EPSILON {
-    return Ok(rect);
-  }
-
-  let scale = (remaining_sum + origin_void.tiling_size()) / remaining_sum;
-  let parent_rect = parent.to_rect()?;
-  let (h_gap, v_gap) = parent.as_tiling_container().ok().map_or_else(
-    || {
-      leaf
-        .workspace()
-        .and_then(|ws| ws.workspace_inner_gaps().ok())
-        .unwrap_or((0, 0))
-    },
-    |tc| tc.inner_gaps().unwrap_or((0, 0)),
-  );
-  let remaining_siblings = parent
-    .tiling_children()
-    .filter(|child| child.id() != origin_id)
-    .count()
-    .saturating_sub(1);
-
-  #[allow(
-    clippy::cast_possible_wrap,
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss
-  )]
-  match parent.tiling_direction() {
-    TilingDirection::Horizontal => {
-      let avail = parent_rect.width() - h_gap * remaining_siblings as i32;
-      let mut x = parent_rect.x();
-      for sibling in parent
-        .tiling_children()
-        .filter(|child| child.id() != origin_id)
-      {
-        let width =
-          (avail as f32 * sibling.tiling_size() * scale).round() as i32;
-        if sibling.id() == leaf.id() {
-          return Ok(Rect::from_xy(
-            x,
-            parent_rect.y(),
-            width,
-            parent_rect.height(),
-          ));
-        }
-        x += width + h_gap;
-      }
-      Ok(rect)
-    }
-    TilingDirection::Vertical => {
-      let avail = parent_rect.height() - v_gap * remaining_siblings as i32;
-      let mut y = parent_rect.y();
-      for sibling in parent
-        .tiling_children()
-        .filter(|child| child.id() != origin_id)
-      {
-        let height =
-          (sibling.tiling_size() * scale * avail as f32) as i32;
-        if sibling.id() == leaf.id() {
-          return Ok(Rect::from_xy(
-            parent_rect.x(),
-            y,
-            parent_rect.width(),
-            height,
-          ));
-        }
-        y += height + v_gap;
-      }
-      Ok(rect)
-    }
-  }
 }
 
 fn split_side_for_cursor(cursor: &Point, rect: &Rect) -> SplitSide {
@@ -1734,43 +2737,6 @@ fn split_half_rect(
         rect.y() + half_h + gap
       };
       Rect::from_xy(rect.x(), y, rect.width(), half_h)
-    }
-  }
-}
-
-#[allow(
-  clippy::cast_possible_truncation,
-  clippy::cast_possible_wrap,
-  clippy::cast_precision_loss
-)]
-fn edge_insertion_rect(
-  ws_rect: &Rect,
-  direction: &TilingDirection,
-  is_first: bool,
-  gap: i32,
-  sibling_count: usize,
-  tiling_size: f32,
-) -> Rect {
-  match direction {
-    TilingDirection::Horizontal => {
-      let avail_w = (ws_rect.width() - gap * sibling_count as i32).max(1);
-      let width = (avail_w as f32 * tiling_size).round() as i32;
-      let x = if is_first {
-        ws_rect.x()
-      } else {
-        ws_rect.right - width
-      };
-      Rect::from_xy(x, ws_rect.y(), width, ws_rect.height())
-    }
-    TilingDirection::Vertical => {
-      let avail_h = (ws_rect.height() - gap * sibling_count as i32).max(1);
-      let height = (tiling_size * avail_h as f32) as i32;
-      let y = if is_first {
-        ws_rect.y()
-      } else {
-        ws_rect.bottom - height
-      };
-      Rect::from_xy(ws_rect.x(), y, ws_rect.width(), height)
     }
   }
 }
@@ -2597,5 +3563,148 @@ mod tests {
       drop_at(&w3, &Point { x: 1300, y: 400 }, &mut state, &config);
     assert!((rect3.right - prev3.right).abs() <= 2);
     assert!((rect3.right - ws_rect.right).abs() <= 2);
+  }
+
+  #[test]
+  fn full_height_and_width_edge_entries_do_not_shrink_against_voids() {
+    // 1) Full-height W1=Left(0.5), W2=TopRight(0.5) + Void_BR ->
+    // breaking away W1 to Top consumes Void_BR, keeps half height.
+    let (mut state, config, workspace) = setup_state();
+    let ws_c: Container = workspace.clone().into();
+    workspace.set_tiling_direction(TilingDirection::Horizontal);
+    let w1 = TilingWindow::mock()
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let split_r = SplitContainer::new(
+      TilingDirection::Vertical,
+      config.value.gaps.clone(),
+    );
+    let w2 = TilingWindow::mock()
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let void_br = VoidSlot::new(config.value.gaps.clone());
+    attach_container(&w1.clone().into(), &ws_c, None).unwrap();
+    attach_container(&split_r.clone().into(), &ws_c, None).unwrap();
+    attach_container(&w2.into(), &split_r.clone().into(), None).unwrap();
+    attach_container(&void_br.into(), &split_r.into(), None).unwrap();
+
+    let ws_rect = workspace.multi_window_workspace_rect().unwrap();
+    let drag1 = drag_move(false, None);
+    let top_target = DropTarget::SnapZone {
+      workspace_id: workspace.id(),
+      zone: ScreenZone::Top,
+    };
+    let preview_top = compute_drop_preview_rect_at(
+      &top_target,
+      &w1.clone().into(),
+      &drag1,
+      Some(&Point { x: 200, y: 4 }),
+      &state,
+    )
+    .unwrap()
+    .unwrap();
+    w1.set_active_drag(Some(drag1));
+    let w1_float = update_window_state(
+      w1.into(),
+      WindowState::Floating(FloatingStateConfig::default()),
+      &mut state,
+      &config,
+    )
+    .unwrap()
+    .as_non_tiling_window()
+    .unwrap()
+    .clone();
+    let w1_drag = w1_float.active_drag().unwrap();
+    let comm_w1 = finalize_move_drag(
+      &w1_float,
+      Rect::from_xy(100, 100, 400, 400),
+      &w1_drag,
+      Some(&Point { x: 200, y: 4 }),
+      &mut state,
+      &config,
+    )
+    .unwrap();
+    let rect_w1 = comm_w1.to_rect().unwrap();
+    assert_eq!(rect_w1, preview_top);
+    assert!((rect_w1.height() - ws_rect.height() / 2).abs() <= 20);
+
+    // 2) Full-width W_top=Top(0.5), W_bl=BottomLeft(0.5) + Void_BR ->
+    // breaking away W_top to Left consumes Void_BR, keeps half width.
+    let (mut vert_state, vert_cfg, vert_ws) = setup_state();
+    let vert_ws_c: Container = vert_ws.clone().into();
+    vert_ws.set_tiling_direction(TilingDirection::Vertical);
+    let w_top = TilingWindow::mock()
+      .gaps_config(vert_cfg.value.gaps.clone())
+      .call();
+    let split_b = SplitContainer::new(
+      TilingDirection::Horizontal,
+      vert_cfg.value.gaps.clone(),
+    );
+    let w_bl = TilingWindow::mock()
+      .gaps_config(vert_cfg.value.gaps.clone())
+      .call();
+    let void_b_r = VoidSlot::new(vert_cfg.value.gaps.clone());
+    attach_container(&w_top.clone().into(), &vert_ws_c, None).unwrap();
+    attach_container(&split_b.clone().into(), &vert_ws_c, None).unwrap();
+    attach_container(&w_bl.into(), &split_b.clone().into(), None).unwrap();
+    attach_container(&void_b_r.into(), &split_b.into(), None).unwrap();
+
+    let vert_ws_rect = vert_ws.multi_window_workspace_rect().unwrap();
+    let vert_drag = drag_move(false, None);
+    let left_target = DropTarget::SnapZone {
+      workspace_id: vert_ws.id(),
+      zone: ScreenZone::Left,
+    };
+    let preview_left = compute_drop_preview_rect_at(
+      &left_target,
+      &w_top.clone().into(),
+      &vert_drag,
+      Some(&Point { x: 4, y: 200 }),
+      &vert_state,
+    )
+    .unwrap()
+    .unwrap();
+    w_top.set_active_drag(Some(vert_drag));
+    let w_top_float = update_window_state(
+      w_top.into(),
+      WindowState::Floating(FloatingStateConfig::default()),
+      &mut vert_state,
+      &vert_cfg,
+    )
+    .unwrap()
+    .as_non_tiling_window()
+    .unwrap()
+    .clone();
+    let w_top_drag = w_top_float.active_drag().unwrap();
+    let comm_wt = finalize_move_drag(
+      &w_top_float,
+      Rect::from_xy(100, 100, 400, 400),
+      &w_top_drag,
+      Some(&Point { x: 4, y: 200 }),
+      &mut vert_state,
+      &vert_cfg,
+    )
+    .unwrap();
+    let rect_wt = comm_wt.to_rect().unwrap();
+    assert_eq!(rect_wt, preview_left);
+    assert!((rect_wt.width() - vert_ws_rect.width() / 2).abs() <= 20);
+  }
+
+  #[test]
+  fn horizontal_full_width_single_axis_supports_top_center_maximize() {
+    let work = Rect::from_xy(0, 0, 1920, 1032);
+    let bounds = Rect::from_xy(0, 0, 1920, 1080);
+    let start_v = Point { x: 960, y: 20 };
+
+    assert_eq!(
+      detect_single_axis_breakaway_zone(
+        &Point { x: 960, y: 2 },
+        &work,
+        Some(&bounds),
+        SingleAxisKind::Vertical,
+        &start_v,
+      ),
+      Some(ScreenZone::TopCenter)
+    );
   }
 }

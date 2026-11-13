@@ -108,26 +108,33 @@ pub fn handle_window_moved_or_resized_end(
         return Ok(());
       }
 
-      if active_drag.operation == Some(ActiveDragOperation::Resize) {
-        update_floating_window_position(
-          window,
-          window.native_properties().frame,
-          &nearest_monitor,
-          state,
-        )?;
-        window.set_active_drag(None);
-      } else {
-        finalize_move_drag(
-          window,
-          window.native_properties().frame,
-          &active_drag,
-          None,
-          state,
-          config,
-        )?;
-      }
+      let end_result =
+        if active_drag.operation == Some(ActiveDragOperation::Resize) {
+          let res = update_floating_window_position(
+            window,
+            window.native_properties().frame,
+            &nearest_monitor,
+            state,
+          );
+          window.set_active_drag(None);
+          res
+        } else {
+          let res = finalize_move_drag(
+            window,
+            window.native_properties().frame,
+            &active_drag,
+            None,
+            state,
+            config,
+          );
+          if res.is_err() {
+            window.set_active_drag(None);
+          }
+          res.map(|_| ())
+        };
 
       state.clear_window_drag_state(window.id());
+      end_result?;
     }
     WindowContainer::TilingWindow(window) => {
       if state.is_single_axis_drag_window(window.id()) {
@@ -157,34 +164,33 @@ fn finish_tiling_window_drag(
   let is_live_resize =
     is_resize && state.is_live_resize_window(window.id());
 
-  let mut resized_workspace_redraw = false;
-
-  if is_live_resize || (is_resize && frame != active_drag.initial_position)
+  let resize_result = if is_live_resize
+    || (is_resize && frame != active_drag.initial_position)
   {
     let container: WindowContainer = window.clone().into();
-    resized_workspace_redraw = update_live_resize_with_finalize(
+    update_live_resize_with_finalize(
       &container,
       &frame,
       &active_drag.initial_position,
       true,
       state,
-    )?;
-    state.clear_window_drag_state(window.id());
+    )
   } else if is_resize {
-    state.clear_window_drag_state(window.id());
-
     // Update the window's size from its actual frame dimensions.
     set_window_size(
       window.clone().into(),
       Some(LengthValue::from_px(frame.width())),
       Some(LengthValue::from_px(frame.height())),
       state,
-    )?;
+    )
+    .map(|()| false)
   } else {
-    state.clear_window_drag_state(window.id());
-  }
+    Ok(false)
+  };
 
+  state.clear_window_drag_state(window.id());
   window.set_active_drag(None);
+  let resized_workspace_redraw = resize_result?;
 
   if resized_workspace_redraw {
     if let Some(workspace) = window.workspace() {
