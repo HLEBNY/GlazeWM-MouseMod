@@ -91,6 +91,8 @@ pub fn handle_window_moved_or_resized_end(
           )?;
         }
 
+        state.clear_window_drag_state(updated.id());
+
         if is_maximized {
           // Dequeue the window from redraw if it's maximized, since the
           // window is already in the correct state.
@@ -122,6 +124,8 @@ pub fn handle_window_moved_or_resized_end(
           config,
         )?;
       }
+
+      state.clear_window_drag_state(window.id());
     }
     WindowContainer::TilingWindow(window) => {
       finish_tiling_window_drag(window, &active_drag, state)?;
@@ -156,7 +160,7 @@ fn finish_tiling_window_drag(
       state,
     )?;
     state.clear_window_drag_state(window.id());
-  } else {
+  } else if is_resize {
     state.clear_window_drag_state(window.id());
 
     // Update the window's size from its actual frame dimensions.
@@ -166,6 +170,8 @@ fn finish_tiling_window_drag(
       Some(LengthValue::from_px(frame.height())),
       state,
     )?;
+  } else {
+    state.clear_window_drag_state(window.id());
   }
 
   window.set_active_drag(None);
@@ -177,4 +183,73 @@ fn finish_tiling_window_drag(
   state.pending_sync.queue_container_to_redraw(window.clone());
 
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use tokio::sync::mpsc;
+  use wm_common::{ActiveDrag, ActiveDragOperation};
+  use wm_platform::{Dispatcher, Rect};
+
+  use super::finish_tiling_window_drag;
+  use crate::{
+    commands::container::{attach_container, set_focused_descendant},
+    models::{Monitor, TilingWindow, Workspace},
+    traits::{TilingSizeGetters, WindowGetters},
+    user_config::UserConfig,
+    wm_state::WmState,
+  };
+
+  #[test]
+  fn aborted_min_size_move_drag_preserves_tiling_size() {
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+    let mut state = WmState::new(Dispatcher::mock(), event_tx, exit_tx);
+    let config = UserConfig::mock();
+
+    let workspace = Workspace::mock()
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let monitor = Monitor::mock()
+      .bounds(Rect::from_xy(0, 0, 1920, 1080))
+      .working_area(Rect::from_xy(0, 0, 1920, 1032))
+      .workspaces(vec![workspace.clone()])
+      .call();
+    attach_container(
+      &monitor.into(),
+      &state.root_container.clone().into(),
+      None,
+    )
+    .unwrap();
+    set_focused_descendant(&workspace.clone().into(), None);
+
+    let win = TilingWindow::mock()
+      .tiling_size(0.25)
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let sibling = TilingWindow::mock()
+      .tiling_size(0.75)
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    attach_container(&win.clone().into(), &workspace.clone().into(), None)
+      .unwrap();
+    attach_container(&sibling.into(), &workspace.into(), None).unwrap();
+
+    // Simulate OS min-size expansion during a sub-threshold Move click.
+    win.update_native_properties(|props| {
+      props.frame = Rect::from_xy(0, 0, 800, 1032);
+    });
+    let active_drag = ActiveDrag {
+      operation: Some(ActiveDragOperation::Move),
+      is_from_floating: false,
+      initial_position: Rect::from_xy(0, 0, 480, 1032),
+      origin_void_id: None,
+    };
+    win.set_active_drag(Some(active_drag.clone()));
+
+    finish_tiling_window_drag(&win, &active_drag, &mut state).unwrap();
+
+    assert!((win.tiling_size() - 0.25).abs() < 0.001);
+    assert!(win.active_drag().is_none());
+  }
 }

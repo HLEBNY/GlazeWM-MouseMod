@@ -1,13 +1,16 @@
+#[cfg(target_os = "windows")]
+use std::time::Duration;
+
 use anyhow::Context;
 use wm_common::{
   try_warn, ActiveDrag, ActiveDragOperation, DisplayState,
   FloatingStateConfig, FullscreenStateConfig, HideMethod, WindowState,
 };
 #[cfg(target_os = "windows")]
-use wm_platform::NativeWindowWindowsExt;
+use wm_platform::{NativeWindowWindowsExt, WindowHitTest};
 #[cfg(target_os = "macos")]
-use wm_platform::{LengthValue, MouseButton, RectDelta};
-use wm_platform::{NativeWindow, Rect};
+use wm_platform::{LengthValue, RectDelta};
+use wm_platform::{MouseButton, NativeWindow, Point, Rect};
 
 use crate::{
   commands::{
@@ -91,7 +94,13 @@ pub fn handle_window_moved_or_resized(
         return handle_window_moved_or_resized_end(&window, state, config);
       }
 
-      return update_drag_state(&window, &frame_position, state, config);
+      return update_drag_state(
+        &window,
+        &frame_position,
+        None,
+        state,
+        config,
+      );
     }
 
     let old_is_maximized = window.native_properties().is_maximized;
@@ -203,8 +212,64 @@ pub fn handle_window_moved_or_resized(
       ) || (matches!(window.state(), WindowState::Fullscreen(_))
         && !matches!(window.prev_state(), Some(WindowState::Tiling)));
 
+      let is_maximized_origin = old_is_maximized
+        || matches!(
+          window.state(),
+          WindowState::Fullscreen(FullscreenStateConfig {
+            maximized: true,
+            ..
+          })
+        );
+
+      #[cfg(target_os = "windows")]
+      let cached_hit = state.last_left_button_down.take().filter(|hit| {
+        hit.window_id == window.id()
+          && hit.timestamp.elapsed() < Duration::from_secs(2)
+      });
+
+      #[cfg(target_os = "windows")]
+      let initial_operation = if is_maximized_origin {
+        Some(ActiveDragOperation::Move)
+      } else {
+        cached_hit.as_ref().and_then(|hit| match hit.hit_test {
+          WindowHitTest::Caption => Some(ActiveDragOperation::Move),
+          WindowHitTest::ResizeBorder => {
+            Some(ActiveDragOperation::Resize)
+          }
+          WindowHitTest::Client if !hit.is_near_resize_border => {
+            Some(ActiveDragOperation::Move)
+          }
+          WindowHitTest::Client | WindowHitTest::Other => None,
+        })
+      };
+
+      #[cfg(not(target_os = "windows"))]
+      let initial_operation = if is_maximized_origin {
+        Some(ActiveDragOperation::Move)
+      } else {
+        None
+      };
+
+      #[cfg(target_os = "windows")]
+      let cached_cursor = cached_hit.map(|hit| hit.cursor);
+      #[cfg(not(target_os = "windows"))]
+      let cached_cursor: Option<Point> = None;
+
+      let start_cursor = cached_cursor.or_else(|| {
+        if state.dispatcher.has_event_loop()
+          && state.dispatcher.is_mouse_down(&MouseButton::Left)
+        {
+          state.dispatcher.cursor_position().ok()
+        } else {
+          None
+        }
+      });
+
+      state.active_drag_start_cursor =
+        start_cursor.map(|cursor| (window.id(), cursor));
+
       window.set_active_drag(Some(ActiveDrag {
-        operation: None,
+        operation: initial_operation,
         is_from_floating,
         #[cfg(target_os = "windows")]
         initial_position: old_frame_position.clone(),
@@ -220,7 +285,7 @@ pub fn handle_window_moved_or_resized(
       }));
 
       #[cfg(target_os = "windows")]
-      update_drag_state(&window, &frame_position, state, config)?;
+      update_drag_state(&window, &frame_position, None, state, config)?;
 
       return Ok(());
     }
@@ -452,10 +517,23 @@ pub fn update_floating_window_position(
 /// This function determines whether a window is being moved or resized and
 /// updates its operation state accordingly. If the window is being moved,
 /// it's set to floating mode.
+fn frame_displacement_distance(frame: &Rect, initial: &Rect) -> f32 {
+  if frame.width() == initial.width() && frame.height() == initial.height()
+  {
+    frame.center_point().distance_between(&initial.center_point())
+  } else {
+    Point { x: frame.left, y: frame.top }.distance_between(&Point {
+      x: initial.left,
+      y: initial.top,
+    })
+  }
+}
+
 #[allow(clippy::too_many_lines)]
 fn update_drag_state(
   window: &WindowContainer,
   frame_position: &Rect,
+  cursor_override: Option<&Point>,
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
@@ -472,9 +550,23 @@ fn update_drag_state(
   let is_move = if let Some(operation) = active_drag.operation {
     matches!(operation, ActiveDragOperation::Move)
   } else {
-    let is_move = *frame_position != active_drag.initial_position
-      && frame_position.height() == active_drag.initial_position.height()
-      && frame_position.width() == active_drag.initial_position.width();
+    let initial = &active_drag.initial_position;
+    let same_size = frame_position.height() == initial.height()
+      && frame_position.width() == initial.width();
+    let translated_x = frame_position.left != initial.left
+      && frame_position.right != initial.right
+      && (frame_position.left - initial.left).signum()
+        == (frame_position.right - initial.right).signum()
+      && frame_position.height() == initial.height();
+    let translated_y = frame_position.top != initial.top
+      && frame_position.bottom != initial.bottom
+      && (frame_position.top - initial.top).signum()
+        == (frame_position.bottom - initial.bottom).signum()
+      && frame_position.width() == initial.width();
+
+    let is_move = (*frame_position != *initial && same_size)
+      || translated_x
+      || translated_y;
 
     let operation = if is_move {
       ActiveDragOperation::Move
@@ -497,9 +589,34 @@ fn update_drag_state(
   let active_window = if is_move
     && !matches!(window.state(), WindowState::Floating(_))
   {
-    let move_distance = frame_position
-      .center_point()
-      .distance_between(&active_drag.initial_position.center_point());
+    let move_distance = match &state.active_drag_start_cursor {
+      Some((drag_window_id, start_cursor))
+        if *drag_window_id == window.id() =>
+      {
+        if let Some(cursor) = cursor_override {
+          cursor.distance_between(start_cursor)
+        } else if state.dispatcher.has_event_loop() {
+          state.dispatcher.cursor_position().map_or_else(
+            |_| {
+              frame_displacement_distance(
+                frame_position,
+                &active_drag.initial_position,
+              )
+            },
+            |cursor| cursor.distance_between(start_cursor),
+          )
+        } else {
+          frame_displacement_distance(
+            frame_position,
+            &active_drag.initial_position,
+          )
+        }
+      }
+      _ => frame_displacement_distance(
+        frame_position,
+        &active_drag.initial_position,
+      ),
+    };
 
     // Dragging operations on a maximized window can only occur on Windows.
     // The OS immediately restores it while it's being dragged, so we need
@@ -559,7 +676,7 @@ fn update_drag_state(
   };
 
   if is_move && matches!(active_window.state(), WindowState::Floating(_)) {
-    update_drag_snap_preview(&active_window, None, state)?;
+    update_drag_snap_preview(&active_window, cursor_override, state)?;
   } else if !is_move {
     update_live_resize(
       &active_window,
@@ -737,5 +854,173 @@ mod tests {
     let frame = Rect::from_xy(100, 100, 800, 600);
 
     assert!(!is_in_corner(&frame, &monitor));
+  }
+
+  #[test]
+  fn min_size_constrained_tiling_drag_transitions_to_floating() {
+    use tokio::sync::mpsc;
+    use wm_common::{ActiveDrag, ActiveDragOperation, WindowState};
+    use wm_platform::{Dispatcher, Point};
+
+    use super::update_drag_state;
+    use crate::{
+      commands::container::{attach_container, set_focused_descendant},
+      models::{Monitor, TilingWindow, Workspace},
+      traits::{TilingSizeGetters, WindowGetters},
+      user_config::UserConfig,
+      wm_state::WmState,
+    };
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+    let mut state = WmState::new(Dispatcher::mock(), event_tx, exit_tx);
+    let config = UserConfig::mock();
+
+    let workspace = Workspace::mock()
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let monitor = Monitor::mock()
+      .bounds(Rect::from_xy(0, 0, 1920, 1080))
+      .working_area(Rect::from_xy(0, 0, 1920, 1032))
+      .workspaces(vec![workspace.clone()])
+      .call();
+    attach_container(
+      &monitor.into(),
+      &state.root_container.clone().into(),
+      None,
+    )
+    .unwrap();
+    set_focused_descendant(&workspace.clone().into(), None);
+
+    let win = TilingWindow::mock()
+      .tiling_size(0.25)
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let sibling = TilingWindow::mock()
+      .tiling_size(0.75)
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    attach_container(&win.clone().into(), &workspace.clone().into(), None)
+      .unwrap();
+    attach_container(&sibling.into(), &workspace.clone().into(), None)
+      .unwrap();
+
+    // Tiled slot is 480px wide, below a hypothetical 800px minimum width.
+    let tile_rect = Rect::from_xy(0, 0, 480, 1032);
+    win.set_active_drag(Some(ActiveDrag {
+      operation: Some(ActiveDragOperation::Move),
+      is_from_floating: false,
+      initial_position: tile_rect,
+      origin_void_id: None,
+    }));
+    state.active_drag_start_cursor =
+      Some((win.id(), Point { x: 240, y: 20 }));
+
+    // OS enforces minimum width (480 -> 800) before 10px cursor travel.
+    let expanded_rect = Rect::from_xy(0, 0, 800, 1032);
+    let small_move_cursor = Point { x: 245, y: 22 };
+    update_drag_state(
+      &win.clone().into(),
+      &expanded_rect,
+      Some(&small_move_cursor),
+      &mut state,
+      &config,
+    )
+    .unwrap();
+
+    // Remain Tiling below 10px cursor movement without false resize.
+    assert!(matches!(win.state(), WindowState::Tiling));
+    assert!(state.live_resize_state.is_none());
+
+    // Once cursor travels >= 10px, window transitions to Floating cleanly.
+    let drag_out_cursor = Point { x: 270, y: 35 };
+    let moved_rect = Rect::from_xy(30, 15, 800, 1032);
+    update_drag_state(
+      &win.clone().into(),
+      &moved_rect,
+      Some(&drag_out_cursor),
+      &mut state,
+      &config,
+    )
+    .unwrap();
+
+    let updated = state.window_by_id(win.id()).unwrap();
+    assert!(matches!(updated.state(), WindowState::Floating(_)));
+    assert!(state.live_resize_state.is_none());
+  }
+
+  #[test]
+  fn maximized_origin_move_drag_ignores_restored_size_shrink() {
+    use tokio::sync::mpsc;
+    use wm_common::{
+      ActiveDrag, ActiveDragOperation, FullscreenStateConfig, WindowState,
+    };
+    use wm_platform::{Dispatcher, Point};
+
+    use super::update_drag_state;
+    use crate::{
+      commands::container::{attach_container, set_focused_descendant},
+      models::{Monitor, NonTilingWindow, Workspace},
+      traits::WindowGetters,
+      user_config::UserConfig,
+      wm_state::WmState,
+    };
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+    let mut state = WmState::new(Dispatcher::mock(), event_tx, exit_tx);
+    let config = UserConfig::mock();
+
+    let workspace = Workspace::mock()
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let monitor = Monitor::mock()
+      .bounds(Rect::from_xy(0, 0, 1920, 1080))
+      .working_area(Rect::from_xy(0, 0, 1920, 1032))
+      .workspaces(vec![workspace.clone()])
+      .call();
+    attach_container(
+      &monitor.into(),
+      &state.root_container.clone().into(),
+      None,
+    )
+    .unwrap();
+    set_focused_descendant(&workspace.clone().into(), None);
+
+    let win = NonTilingWindow::mock()
+      .state(WindowState::Fullscreen(FullscreenStateConfig {
+        maximized: true,
+        ..Default::default()
+      }))
+      .call();
+    attach_container(&win.clone().into(), &workspace.into(), None)
+      .unwrap();
+
+    win.set_active_drag(Some(ActiveDrag {
+      operation: Some(ActiveDragOperation::Move),
+      is_from_floating: true,
+      initial_position: Rect::from_xy(0, 0, 1920, 1032),
+      origin_void_id: None,
+    }));
+    state.active_drag_start_cursor =
+      Some((win.id(), Point { x: 960, y: 15 }));
+
+    let restored_rect = Rect::from_xy(360, 4, 1200, 800);
+    let drag_cursor = Point { x: 960, y: 19 };
+    update_drag_state(
+      &win.clone().into(),
+      &restored_rect,
+      Some(&drag_cursor),
+      &mut state,
+      &config,
+    )
+    .unwrap();
+
+    let updated = state.window_by_id(win.id()).unwrap();
+    assert!(matches!(updated.state(), WindowState::Floating(_)));
+    assert_eq!(
+      updated.active_drag().and_then(|d| d.operation),
+      Some(ActiveDragOperation::Move)
+    );
   }
 }

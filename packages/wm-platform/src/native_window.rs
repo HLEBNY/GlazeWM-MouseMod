@@ -139,6 +139,16 @@ impl NativeWindowExtMacOs for NativeWindow {
   }
 }
 
+/// High-level `WM_NCHITTEST` classification for a screen coordinate.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowHitTest {
+  Caption,
+  ResizeBorder,
+  Client,
+  Other,
+}
+
 /// Windows-specific extensions for [`NativeWindow`].
 #[cfg(target_os = "windows")]
 pub trait NativeWindowWindowsExt {
@@ -339,6 +349,53 @@ pub trait NativeWindowWindowsExt {
   /// This method is only available on Windows.
   fn move_without_resize(&self, x: i32, y: i32) -> crate::Result<()>;
 
+  /// Sets the window position and size while preserving z-order and
+  /// forcing a `SWP_FRAMECHANGED` recalculation.
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on Windows.
+  fn set_bounds_preserving_zorder(&self, rect: &Rect) -> crate::Result<()>;
+
+  /// Gets the window's owner handle (`GW_OWNER`), if any.
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on Windows.
+  fn owner_window(&self) -> Option<NativeWindow>;
+
+  /// Gets the effective DPI of the window (defaulting to `96`).
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on Windows.
+  fn dpi(&self) -> u32;
+
+  /// Returns whether this window is a captionless, tool, no-activate, or
+  /// hit-transparent overlay rather than a standalone captioned window.
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on Windows.
+  fn is_non_standalone_overlay(&self) -> bool;
+
+  /// Returns whether `point` hits a transparent or caption-forwarding
+  /// overlay region (`HTTRANSPARENT`, `HTNOWHERE`, `HTERROR`, or
+  /// `HTCAPTION`) rather than an interactive client region.
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on Windows.
+  fn is_overlay_hit_passthrough(&self, point: &Point) -> bool;
+
+  /// Classifies `WM_NCHITTEST` at `point` for this window, walking past
+  /// disabled, invisible, or hit-transparent child windows.
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on Windows.
+  fn hit_test_at_point(&self, point: &Point) -> WindowHitTest;
+
   /// Returns whether `point` lies on the draggable caption (`HTCAPTION`)
   /// area of this window.
   ///
@@ -354,6 +411,14 @@ pub trait NativeWindowWindowsExt {
   ///
   /// This method is only available on Windows.
   fn is_in_native_movesize(&self) -> bool;
+
+  /// Returns whether this window is foreground, active, has no active
+  /// mouse capture, and is not inside a menu or native move/size loop.
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on Windows.
+  fn is_ready_for_client_maximize_drag(&self) -> bool;
 }
 
 #[cfg(target_os = "windows")]
@@ -468,12 +533,43 @@ impl NativeWindowWindowsExt for NativeWindow {
     self.inner.move_without_resize(x, y)
   }
 
+  fn set_bounds_preserving_zorder(
+    &self,
+    rect: &Rect,
+  ) -> crate::Result<()> {
+    self.inner.set_bounds_preserving_zorder(rect)
+  }
+
+  fn owner_window(&self) -> Option<NativeWindow> {
+    self.inner.owner_window()
+  }
+
+  fn dpi(&self) -> u32 {
+    self.inner.dpi()
+  }
+
+  fn is_non_standalone_overlay(&self) -> bool {
+    self.inner.is_non_standalone_overlay()
+  }
+
+  fn is_overlay_hit_passthrough(&self, point: &Point) -> bool {
+    self.inner.is_overlay_hit_passthrough(point)
+  }
+
+  fn hit_test_at_point(&self, point: &Point) -> WindowHitTest {
+    self.inner.hit_test_at_point(point)
+  }
+
   fn is_caption_at_point(&self, point: &Point) -> bool {
     self.inner.is_caption_at_point(point)
   }
 
   fn is_in_native_movesize(&self) -> bool {
     self.inner.is_in_native_movesize()
+  }
+
+  fn is_ready_for_client_maximize_drag(&self) -> bool {
+    self.inner.is_ready_for_client_maximize_drag()
   }
 }
 

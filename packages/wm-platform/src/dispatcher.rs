@@ -659,6 +659,39 @@ impl Dispatcher {
     }
   }
 
+  /// Snapshots the `Win32` mouse-capture / drag-drop sequence counter for
+  /// `window_id`.
+  #[cfg(target_os = "windows")]
+  #[must_use]
+  pub fn capture_snapshot(&self, window_id: WindowId) -> (u64, bool) {
+    if self.source.is_none() {
+      return (0, false);
+    }
+
+    platform_impl::capture_snapshot(window_id.0)
+  }
+
+  /// Checks whether `window_id` completed a mouse-capture release cycle or
+  /// began an OLE drag-drop operation since `since_seq`.
+  #[cfg(target_os = "windows")]
+  #[must_use]
+  pub fn capture_cycle_since(
+    &self,
+    window_id: WindowId,
+    since_seq: u64,
+    started_captured: bool,
+  ) -> (bool, bool) {
+    if self.source.is_none() {
+      return (false, false);
+    }
+
+    platform_impl::capture_cycle_since(
+      window_id.0,
+      since_seq,
+      started_captured,
+    )
+  }
+
   /// Shows or updates the Aero snap preview overlay behind the given
   /// window.
   pub fn show_snap_overlay(

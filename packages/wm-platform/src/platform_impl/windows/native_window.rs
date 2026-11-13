@@ -17,6 +17,7 @@ use windows::{
       PROCESS_QUERY_LIMITED_INFORMATION,
     },
     UI::{
+      HiDpi::GetDpiForWindow,
       Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEINPUT,
       },
@@ -29,8 +30,11 @@ use windows::{
         SendNotifyMessageW, SetForegroundWindow,
         SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPlacement,
         SetWindowPos, ShowWindowAsync, WindowFromPoint, GA_PARENT, GA_ROOT,
-        GUITHREADINFO, GUI_INMOVESIZE, GWL_EXSTYLE, GWL_STYLE, GW_OWNER,
-        HTCAPTION, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
+        GUITHREADINFO, GUI_INMENUMODE, GUI_INMOVESIZE, GUI_POPUPMENUMODE,
+        GUI_SYSTEMMENUMODE, GWL_EXSTYLE, GWL_STYLE, GW_OWNER,
+        HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTERROR, HTLEFT, HTNOWHERE,
+        HTTRANSPARENT,
+        HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
         LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LWA_COLORKEY,
         SET_WINDOW_POS_FLAGS, SMTO_ABORTIFHUNG, SMTO_BLOCK,
         SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
@@ -38,8 +42,9 @@ use windows::{
         SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_MAXIMIZE,
         SW_MINIMIZE, SW_RESTORE, SW_SHOWNA, WINDOWPLACEMENT,
         WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_NCHITTEST,
-        WPF_ASYNCWINDOWPLACEMENT, WS_DLGFRAME, WS_EX_LAYERED,
-        WS_THICKFRAME,
+        WPF_ASYNCWINDOWPLACEMENT, WS_CAPTION, WS_DISABLED, WS_DLGFRAME,
+        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TRANSPARENT, WS_THICKFRAME,
       },
     },
   },
@@ -502,64 +507,174 @@ impl NativeWindow {
     Ok(())
   }
 
-  /// Implements [`NativeWindowWindowsExt::is_caption_at_point`].
-  pub(crate) fn is_caption_at_point(&self, point: &Point) -> bool {
-    const HTCAPTION_HIT: usize = HTCAPTION as usize;
-    #[allow(clippy::cast_sign_loss)]
-    const HTTRANSPARENT_HIT: usize = HTTRANSPARENT as isize as usize;
-    const MAX_ANCESTOR_STEPS: usize = 16;
+  /// Implements [`NativeWindowWindowsExt::set_bounds_preserving_zorder`].
+  pub(crate) fn set_bounds_preserving_zorder(
+    &self,
+    rect: &Rect,
+  ) -> crate::Result<()> {
+    unsafe {
+      SetWindowPos(
+        self.hwnd(),
+        HWND_TOP,
+        rect.x(),
+        rect.y(),
+        rect.width(),
+        rect.height(),
+        SWP_NOZORDER
+          | SWP_NOACTIVATE
+          | SWP_NOCOPYBITS
+          | SWP_ASYNCWINDOWPOS
+          | SWP_FRAMECHANGED,
+      )
+    }?;
+
+    Ok(())
+  }
+
+  /// Implements [`NativeWindowWindowsExt::owner_window`].
+  pub(crate) fn owner_window(&self) -> Option<crate::NativeWindow> {
+    let owner = unsafe { GetWindow(self.hwnd(), GW_OWNER) };
+    if owner.0 == 0 {
+      None
+    } else {
+      Some(NativeWindow::new(owner.0).into())
+    }
+  }
+
+  /// Implements [`NativeWindowWindowsExt::dpi`].
+  pub(crate) fn dpi(&self) -> u32 {
+    let dpi = unsafe { GetDpiForWindow(self.hwnd()) };
+    if dpi == 0 {
+      96
+    } else {
+      dpi
+    }
+  }
+
+  /// Implements [`NativeWindowWindowsExt::is_non_standalone_overlay`].
+  pub(crate) fn is_non_standalone_overlay(&self) -> bool {
+    !self.has_window_style(WS_CAPTION)
+      || self.has_window_style_ex(WS_EX_TRANSPARENT)
+      || self.has_window_style_ex(WS_EX_TOOLWINDOW)
+      || self.has_window_style_ex(WS_EX_NOACTIVATE)
+  }
+
+  /// Implements [`NativeWindowWindowsExt::is_overlay_hit_passthrough`].
+  pub(crate) fn is_overlay_hit_passthrough(&self, point: &Point) -> bool {
+    if self.has_window_style_ex(WS_EX_TRANSPARENT) {
+      return true;
+    }
 
     let pt = POINT { x: point.x, y: point.y };
     let target_hwnd = unsafe { WindowFromPoint(pt) };
+    let start_hwnd = if target_hwnd.0 != 0
+      && unsafe { GetAncestor(target_hwnd, GA_ROOT) } == self.hwnd()
+    {
+      target_hwnd
+    } else {
+      self.hwnd()
+    };
+
+    let Some(hit_code) =
+      Self::hit_test_chain(start_hwnd, self.hwnd(), point)
+    else {
+      return true;
+    };
+
+    #[allow(clippy::cast_possible_wrap)]
+    let is_caption = hit_code == HTCAPTION as i32;
+    is_caption || Self::is_passthrough_hit_code(hit_code)
+  }
+
+  /// Implements [`NativeWindowWindowsExt::hit_test_at_point`].
+  pub(crate) fn hit_test_at_point(
+    &self,
+    point: &Point,
+  ) -> crate::WindowHitTest {
+    let pt = POINT { x: point.x, y: point.y };
+    let target_hwnd = unsafe { WindowFromPoint(pt) };
     if target_hwnd.0 == 0 {
-      return false;
+      return crate::WindowHitTest::Other;
     }
 
     let root_hwnd = unsafe { GetAncestor(target_hwnd, GA_ROOT) };
     if root_hwnd != self.hwnd() {
-      return false;
+      if root_hwnd.0 != 0 && Self::is_owned_by(root_hwnd, self.hwnd()) {
+        let overlay = NativeWindow::new(root_hwnd.0);
+        if overlay.is_non_standalone_overlay() {
+          if overlay.has_window_style_ex(WS_EX_TRANSPARENT) {
+            return Self::send_nchittest(self.hwnd(), point).map_or(
+              crate::WindowHitTest::Other,
+              Self::classify_hit_code,
+            );
+          }
+
+          let overlay_hit =
+            Self::hit_test_chain(target_hwnd, root_hwnd, point);
+          if let Some(hit_code) = overlay_hit {
+            #[allow(clippy::cast_possible_wrap)]
+            let caption = HTCAPTION as i32;
+            if hit_code == caption {
+              return crate::WindowHitTest::Caption;
+            }
+            if !Self::is_passthrough_hit_code(hit_code) {
+              return crate::WindowHitTest::Other;
+            }
+          }
+          return Self::send_nchittest(self.hwnd(), point).map_or(
+            crate::WindowHitTest::Other,
+            Self::classify_hit_code,
+          );
+        }
+      }
+      return crate::WindowHitTest::Other;
     }
 
-    #[allow(clippy::cast_possible_truncation)]
-    let packed_point = (i32::from(point.y as i16) << 16)
-      | (i32::from(point.x as i16) & 0xFFFF);
-    let lparam = LPARAM(packed_point as isize);
+    Self::hit_test_chain(target_hwnd, self.hwnd(), point)
+      .map_or(crate::WindowHitTest::Other, Self::classify_hit_code)
+  }
 
-    let mut current = target_hwnd;
+  fn hit_test_chain(
+    start_hwnd: HWND,
+    root_hwnd: HWND,
+    point: &Point,
+  ) -> Option<i32> {
+    const MAX_ANCESTOR_STEPS: usize = 16;
+
+    let mut current = start_hwnd;
     for _ in 0..MAX_ANCESTOR_STEPS {
-      let mut hit: usize = 0;
-      let res = unsafe {
-        SendMessageTimeoutW(
-          current,
-          WM_NCHITTEST,
-          WPARAM(0),
-          lparam,
-          SMTO_ABORTIFHUNG | SMTO_BLOCK,
-          30,
-          Some(&raw mut hit),
-        )
-      };
-
-      if res.0 == 0 {
-        return false;
+      if current != root_hwnd && Self::is_child_passthrough(current) {
+        let parent = unsafe { GetAncestor(current, GA_PARENT) };
+        if parent.0 == 0 || parent == current {
+          break;
+        }
+        current = parent;
+        continue;
       }
 
-      if hit == HTCAPTION_HIT {
-        return true;
+      if let Some(hit_code) = Self::send_nchittest(current, point) {
+        if !Self::is_passthrough_hit_code(hit_code) {
+          return Some(hit_code);
+        }
       }
 
-      if hit != HTTRANSPARENT_HIT || current == root_hwnd {
-        return false;
+      if current == root_hwnd {
+        return None;
       }
 
       let parent = unsafe { GetAncestor(current, GA_PARENT) };
       if parent.0 == 0 || parent == current {
-        return false;
+        break;
       }
       current = parent;
     }
 
-    false
+    None
+  }
+
+  /// Implements [`NativeWindowWindowsExt::is_caption_at_point`].
+  pub(crate) fn is_caption_at_point(&self, point: &Point) -> bool {
+    self.hit_test_at_point(point) == crate::WindowHitTest::Caption
   }
 
   /// Implements [`NativeWindowWindowsExt::is_in_native_movesize`].
@@ -578,6 +693,125 @@ impl NativeWindow {
 
     unsafe { GetGUIThreadInfo(thread_id, &raw mut info) }.is_ok()
       && info.flags.contains(GUI_INMOVESIZE)
+  }
+
+  /// Implements
+  /// [`NativeWindowWindowsExt::is_ready_for_client_maximize_drag`].
+  pub(crate) fn is_ready_for_client_maximize_drag(&self) -> bool {
+    let hwnd = self.hwnd();
+    if unsafe { GetForegroundWindow() } != hwnd {
+      return false;
+    }
+
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    if thread_id == 0 {
+      return false;
+    }
+
+    let mut info = GUITHREADINFO {
+      #[allow(clippy::cast_possible_truncation)]
+      cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+      ..Default::default()
+    };
+
+    if unsafe { GetGUIThreadInfo(thread_id, &raw mut info) }.is_err() {
+      return false;
+    }
+
+    let blocked = GUI_INMOVESIZE
+      | GUI_INMENUMODE
+      | GUI_POPUPMENUMODE
+      | GUI_SYSTEMMENUMODE;
+
+    (info.flags & blocked).0 == 0
+      && info.hwndCapture.0 == 0
+      && info.hwndMoveSize.0 == 0
+      && info.hwndActive == hwnd
+  }
+
+  fn is_owned_by(child_root: HWND, owner_hwnd: HWND) -> bool {
+    let mut current = child_root;
+    for _ in 0..8 {
+      let owner = unsafe { GetWindow(current, GW_OWNER) };
+      if owner.0 == 0 || owner == current {
+        return false;
+      }
+      if owner == owner_hwnd {
+        return true;
+      }
+      current = owner;
+    }
+    false
+  }
+
+  fn is_child_passthrough(hwnd: HWND) -> bool {
+    let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+    if !visible {
+      return true;
+    }
+
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
+    let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+    #[allow(clippy::cast_possible_wrap)]
+    let disabled = (style & WS_DISABLED.0 as isize) != 0;
+    #[allow(clippy::cast_possible_wrap)]
+    let transparent = (ex_style & WS_EX_TRANSPARENT.0 as isize) != 0;
+
+    disabled || transparent
+  }
+
+  fn send_nchittest(hwnd: HWND, point: &Point) -> Option<i32> {
+    #[allow(clippy::cast_possible_truncation)]
+    let packed_point = (i32::from(point.y as i16) << 16)
+      | (i32::from(point.x as i16) & 0xFFFF);
+    let lparam = LPARAM(packed_point as isize);
+
+    let mut hit: usize = 0;
+    let res = unsafe {
+      SendMessageTimeoutW(
+        hwnd,
+        WM_NCHITTEST,
+        WPARAM(0),
+        lparam,
+        SMTO_ABORTIFHUNG | SMTO_BLOCK,
+        100,
+        Some(&raw mut hit),
+      )
+    };
+
+    if res.0 == 0 {
+      return None;
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    Some(hit as i32)
+  }
+
+  fn is_passthrough_hit_code(hit_code: i32) -> bool {
+    #[allow(clippy::cast_possible_wrap)]
+    let nowhere = HTNOWHERE as i32;
+    hit_code == HTTRANSPARENT || hit_code == nowhere || hit_code == HTERROR
+  }
+
+  fn classify_hit_code(hit_code: i32) -> crate::WindowHitTest {
+    #[allow(clippy::cast_possible_wrap)]
+    let caption = HTCAPTION as i32;
+    #[allow(clippy::cast_possible_wrap)]
+    let client = HTCLIENT as i32;
+    #[allow(clippy::cast_possible_wrap)]
+    let border_start = HTLEFT as i32;
+    #[allow(clippy::cast_possible_wrap)]
+    let border_end = HTBOTTOMRIGHT as i32;
+
+    if hit_code == caption {
+      crate::WindowHitTest::Caption
+    } else if (border_start..=border_end).contains(&hit_code) {
+      crate::WindowHitTest::ResizeBorder
+    } else if hit_code == client {
+      crate::WindowHitTest::Client
+    } else {
+      crate::WindowHitTest::Other
+    }
   }
 
   /// Implements [`NativeWindowWindowsExt::set_cloaked`].

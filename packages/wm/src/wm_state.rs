@@ -9,7 +9,9 @@ use wm_platform::{
   Direction, Dispatcher, Display, NativeWindow, Point, Rect,
 };
 #[cfg(target_os = "windows")]
-use wm_platform::{NativeWindowWindowsExt, OpacityValue};
+use wm_platform::{
+  NativeWindowWindowsExt, OpacityValue, WindowHitTest, WindowId,
+};
 
 use crate::{
   commands::{
@@ -29,10 +31,24 @@ use crate::{
 
 #[cfg(target_os = "windows")]
 #[derive(Clone, Debug)]
+pub struct LeftButtonDownHit {
+  pub window_id: Uuid,
+  pub cursor: Point,
+  pub hit_test: WindowHitTest,
+  pub is_near_resize_border: bool,
+  pub timestamp: Instant,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug)]
 pub struct PendingMaximizeDrag {
   pub window_id: Uuid,
+  pub window_handle: WindowId,
   pub start_cursor: Point,
   pub max_frame: Rect,
+  pub requires_capture_release: bool,
+  pub start_capture_seq: u64,
+  pub started_captured: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -41,6 +57,11 @@ pub struct ManualWindowDrag {
   pub window_id: Uuid,
   pub cursor_offset_x: i32,
   pub cursor_offset_y: i32,
+  pub restored_width: i32,
+  pub restored_height: i32,
+  pub started_at: Instant,
+  pub did_sw_restore_fallback: bool,
+  pub did_confirm_restored_size: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +114,11 @@ pub struct WmState {
   /// Whether the OS focused window is the same as the WM focused window.
   pub is_focus_synced: bool,
 
+  /// Cached left-mouse-down hit classification for disambiguating
+  /// move vs resize drags on min-size-constrained windows.
+  #[cfg(target_os = "windows")]
+  pub last_left_button_down: Option<LeftButtonDownHit>,
+
   /// Pending titlebar click on a maximized window awaiting drag start.
   #[cfg(target_os = "windows")]
   pub pending_maximize_drag: Option<PendingMaximizeDrag>,
@@ -101,6 +127,9 @@ pub struct WmState {
   /// titlebar when native Windows Snap is disabled.
   #[cfg(target_os = "windows")]
   pub active_manual_drag: Option<ManualWindowDrag>,
+
+  /// Cursor position captured when the active native drag began.
+  pub active_drag_start_cursor: Option<(Uuid, Point)>,
 
   /// Active live tiling resize state tracking latched drag edges.
   pub live_resize_state: Option<LiveResizeState>,
@@ -133,9 +162,12 @@ impl WmState {
       is_paused: false,
       is_focus_synced: false,
       #[cfg(target_os = "windows")]
+      last_left_button_down: None,
+      #[cfg(target_os = "windows")]
       pending_maximize_drag: None,
       #[cfg(target_os = "windows")]
       active_manual_drag: None,
+      active_drag_start_cursor: None,
       live_resize_state: None,
       has_initialized: false,
       event_tx,
@@ -166,6 +198,14 @@ impl WmState {
         self.active_manual_drag = None;
         cleared_move_drag = true;
       }
+    }
+
+    if self
+      .active_drag_start_cursor
+      .as_ref()
+      .is_some_and(|(drag_window_id, _)| *drag_window_id == window_id)
+    {
+      self.active_drag_start_cursor = None;
     }
 
     if self

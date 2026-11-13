@@ -1,0 +1,1783 @@
+diff --git a/packages/wm-platform/src/dispatcher.rs b/packages/wm-platform/src/dispatcher.rs
+index b13c4053..7119954a 100644
+--- a/packages/wm-platform/src/dispatcher.rs
++++ b/packages/wm-platform/src/dispatcher.rs
+@@ -659,6 +659,39 @@ impl Dispatcher {
+     }
+   }
+ 
++  /// Snapshots the `Win32` mouse-capture / drag-drop sequence counter for
++  /// `window_id`.
++  #[cfg(target_os = "windows")]
++  #[must_use]
++  pub fn capture_snapshot(&self, window_id: WindowId) -> (u64, bool) {
++    if self.source.is_none() {
++      return (0, false);
++    }
++
++    platform_impl::capture_snapshot(window_id.0)
++  }
++
++  /// Checks whether `window_id` completed a mouse-capture release cycle or
++  /// began an OLE drag-drop operation since `since_seq`.
++  #[cfg(target_os = "windows")]
++  #[must_use]
++  pub fn capture_cycle_since(
++    &self,
++    window_id: WindowId,
++    since_seq: u64,
++    started_captured: bool,
++  ) -> (bool, bool) {
++    if self.source.is_none() {
++      return (false, false);
++    }
++
++    platform_impl::capture_cycle_since(
++      window_id.0,
++      since_seq,
++      started_captured,
++    )
++  }
++
+   /// Shows or updates the Aero snap preview overlay behind the given
+   /// window.
+   pub fn show_snap_overlay(
+diff --git a/packages/wm-platform/src/native_window.rs b/packages/wm-platform/src/native_window.rs
+index aeb01478..2fc0310d 100644
+--- a/packages/wm-platform/src/native_window.rs
++++ b/packages/wm-platform/src/native_window.rs
+@@ -139,6 +139,16 @@ impl NativeWindowExtMacOs for NativeWindow {
+   }
+ }
+ 
++/// High-level `WM_NCHITTEST` classification for a screen coordinate.
++#[cfg(target_os = "windows")]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum WindowHitTest {
++  Caption,
++  ResizeBorder,
++  Client,
++  Other,
++}
++
+ /// Windows-specific extensions for [`NativeWindow`].
+ #[cfg(target_os = "windows")]
+ pub trait NativeWindowWindowsExt {
+@@ -339,6 +349,53 @@ pub trait NativeWindowWindowsExt {
+   /// This method is only available on Windows.
+   fn move_without_resize(&self, x: i32, y: i32) -> crate::Result<()>;
+ 
++  /// Sets the window position and size while preserving z-order and
++  /// forcing a `SWP_FRAMECHANGED` recalculation.
++  ///
++  /// # Platform-specific
++  ///
++  /// This method is only available on Windows.
++  fn set_bounds_preserving_zorder(&self, rect: &Rect) -> crate::Result<()>;
++
++  /// Gets the window's owner handle (`GW_OWNER`), if any.
++  ///
++  /// # Platform-specific
++  ///
++  /// This method is only available on Windows.
++  fn owner_window(&self) -> Option<NativeWindow>;
++
++  /// Gets the effective DPI of the window (defaulting to `96`).
++  ///
++  /// # Platform-specific
++  ///
++  /// This method is only available on Windows.
++  fn dpi(&self) -> u32;
++
++  /// Returns whether this window is a captionless, tool, no-activate, or
++  /// hit-transparent overlay rather than a standalone captioned window.
++  ///
++  /// # Platform-specific
++  ///
++  /// This method is only available on Windows.
++  fn is_non_standalone_overlay(&self) -> bool;
++
++  /// Returns whether `point` hits a transparent or caption-forwarding
++  /// overlay region (`HTTRANSPARENT`, `HTNOWHERE`, `HTERROR`, or
++  /// `HTCAPTION`) rather than an interactive client region.
++  ///
++  /// # Platform-specific
++  ///
++  /// This method is only available on Windows.
++  fn is_overlay_hit_passthrough(&self, point: &Point) -> bool;
++
++  /// Classifies `WM_NCHITTEST` at `point` for this window, walking past
++  /// disabled, invisible, or hit-transparent child windows.
++  ///
++  /// # Platform-specific
++  ///
++  /// This method is only available on Windows.
++  fn hit_test_at_point(&self, point: &Point) -> WindowHitTest;
++
+   /// Returns whether `point` lies on the draggable caption (`HTCAPTION`)
+   /// area of this window.
+   ///
+@@ -354,6 +411,14 @@ pub trait NativeWindowWindowsExt {
+   ///
+   /// This method is only available on Windows.
+   fn is_in_native_movesize(&self) -> bool;
++
++  /// Returns whether this window is foreground, active, has no active
++  /// mouse capture, and is not inside a menu or native move/size loop.
++  ///
++  /// # Platform-specific
++  ///
++  /// This method is only available on Windows.
++  fn is_ready_for_client_maximize_drag(&self) -> bool;
+ }
+ 
+ #[cfg(target_os = "windows")]
+@@ -468,6 +533,33 @@ impl NativeWindowWindowsExt for NativeWindow {
+     self.inner.move_without_resize(x, y)
+   }
+ 
++  fn set_bounds_preserving_zorder(
++    &self,
++    rect: &Rect,
++  ) -> crate::Result<()> {
++    self.inner.set_bounds_preserving_zorder(rect)
++  }
++
++  fn owner_window(&self) -> Option<NativeWindow> {
++    self.inner.owner_window()
++  }
++
++  fn dpi(&self) -> u32 {
++    self.inner.dpi()
++  }
++
++  fn is_non_standalone_overlay(&self) -> bool {
++    self.inner.is_non_standalone_overlay()
++  }
++
++  fn is_overlay_hit_passthrough(&self, point: &Point) -> bool {
++    self.inner.is_overlay_hit_passthrough(point)
++  }
++
++  fn hit_test_at_point(&self, point: &Point) -> WindowHitTest {
++    self.inner.hit_test_at_point(point)
++  }
++
+   fn is_caption_at_point(&self, point: &Point) -> bool {
+     self.inner.is_caption_at_point(point)
+   }
+@@ -475,6 +567,10 @@ impl NativeWindowWindowsExt for NativeWindow {
+   fn is_in_native_movesize(&self) -> bool {
+     self.inner.is_in_native_movesize()
+   }
++
++  fn is_ready_for_client_maximize_drag(&self) -> bool {
++    self.inner.is_ready_for_client_maximize_drag()
++  }
+ }
+ 
+ #[derive(Clone, Debug)]
+diff --git a/packages/wm-platform/src/platform_impl/windows/native_window.rs b/packages/wm-platform/src/platform_impl/windows/native_window.rs
+index 54dacd26..1ffed7aa 100644
+--- a/packages/wm-platform/src/platform_impl/windows/native_window.rs
++++ b/packages/wm-platform/src/platform_impl/windows/native_window.rs
+@@ -17,6 +17,7 @@ use windows::{
+       PROCESS_QUERY_LIMITED_INFORMATION,
+     },
+     UI::{
++      HiDpi::GetDpiForWindow,
+       Input::KeyboardAndMouse::{
+         SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEINPUT,
+       },
+@@ -29,8 +30,11 @@ use windows::{
+         SendNotifyMessageW, SetForegroundWindow,
+         SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPlacement,
+         SetWindowPos, ShowWindowAsync, WindowFromPoint, GA_PARENT, GA_ROOT,
+-        GUITHREADINFO, GUI_INMOVESIZE, GWL_EXSTYLE, GWL_STYLE, GW_OWNER,
+-        HTCAPTION, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
++        GUITHREADINFO, GUI_INMENUMODE, GUI_INMOVESIZE, GUI_POPUPMENUMODE,
++        GUI_SYSTEMMENUMODE, GWL_EXSTYLE, GWL_STYLE, GW_OWNER,
++        HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTERROR, HTLEFT, HTNOWHERE,
++        HTTRANSPARENT,
++        HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
+         LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LWA_COLORKEY,
+         SET_WINDOW_POS_FLAGS, SMTO_ABORTIFHUNG, SMTO_BLOCK,
+         SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+@@ -38,8 +42,9 @@ use windows::{
+         SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_MAXIMIZE,
+         SW_MINIMIZE, SW_RESTORE, SW_SHOWNA, WINDOWPLACEMENT,
+         WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_NCHITTEST,
+-        WPF_ASYNCWINDOWPLACEMENT, WS_DLGFRAME, WS_EX_LAYERED,
+-        WS_THICKFRAME,
++        WPF_ASYNCWINDOWPLACEMENT, WS_CAPTION, WS_DISABLED, WS_DLGFRAME,
++        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
++        WS_EX_TRANSPARENT, WS_THICKFRAME,
+       },
+     },
+   },
+@@ -502,64 +507,174 @@ impl NativeWindow {
+     Ok(())
+   }
+ 
+-  /// Implements [`NativeWindowWindowsExt::is_caption_at_point`].
+-  pub(crate) fn is_caption_at_point(&self, point: &Point) -> bool {
+-    const HTCAPTION_HIT: usize = HTCAPTION as usize;
+-    #[allow(clippy::cast_sign_loss)]
+-    const HTTRANSPARENT_HIT: usize = HTTRANSPARENT as isize as usize;
+-    const MAX_ANCESTOR_STEPS: usize = 16;
++  /// Implements [`NativeWindowWindowsExt::set_bounds_preserving_zorder`].
++  pub(crate) fn set_bounds_preserving_zorder(
++    &self,
++    rect: &Rect,
++  ) -> crate::Result<()> {
++    unsafe {
++      SetWindowPos(
++        self.hwnd(),
++        HWND_TOP,
++        rect.x(),
++        rect.y(),
++        rect.width(),
++        rect.height(),
++        SWP_NOZORDER
++          | SWP_NOACTIVATE
++          | SWP_NOCOPYBITS
++          | SWP_ASYNCWINDOWPOS
++          | SWP_FRAMECHANGED,
++      )
++    }?;
++
++    Ok(())
++  }
++
++  /// Implements [`NativeWindowWindowsExt::owner_window`].
++  pub(crate) fn owner_window(&self) -> Option<crate::NativeWindow> {
++    let owner = unsafe { GetWindow(self.hwnd(), GW_OWNER) };
++    if owner.0 == 0 {
++      None
++    } else {
++      Some(NativeWindow::new(owner.0).into())
++    }
++  }
++
++  /// Implements [`NativeWindowWindowsExt::dpi`].
++  pub(crate) fn dpi(&self) -> u32 {
++    let dpi = unsafe { GetDpiForWindow(self.hwnd()) };
++    if dpi == 0 {
++      96
++    } else {
++      dpi
++    }
++  }
++
++  /// Implements [`NativeWindowWindowsExt::is_non_standalone_overlay`].
++  pub(crate) fn is_non_standalone_overlay(&self) -> bool {
++    !self.has_window_style(WS_CAPTION)
++      || self.has_window_style_ex(WS_EX_TRANSPARENT)
++      || self.has_window_style_ex(WS_EX_TOOLWINDOW)
++      || self.has_window_style_ex(WS_EX_NOACTIVATE)
++  }
+ 
++  /// Implements [`NativeWindowWindowsExt::is_overlay_hit_passthrough`].
++  pub(crate) fn is_overlay_hit_passthrough(&self, point: &Point) -> bool {
++    if self.has_window_style_ex(WS_EX_TRANSPARENT) {
++      return true;
++    }
++
++    let pt = POINT { x: point.x, y: point.y };
++    let target_hwnd = unsafe { WindowFromPoint(pt) };
++    let start_hwnd = if target_hwnd.0 != 0
++      && unsafe { GetAncestor(target_hwnd, GA_ROOT) } == self.hwnd()
++    {
++      target_hwnd
++    } else {
++      self.hwnd()
++    };
++
++    let Some(hit_code) =
++      Self::hit_test_chain(start_hwnd, self.hwnd(), point)
++    else {
++      return true;
++    };
++
++    #[allow(clippy::cast_possible_wrap)]
++    let is_caption = hit_code == HTCAPTION as i32;
++    is_caption || Self::is_passthrough_hit_code(hit_code)
++  }
++
++  /// Implements [`NativeWindowWindowsExt::hit_test_at_point`].
++  pub(crate) fn hit_test_at_point(
++    &self,
++    point: &Point,
++  ) -> crate::WindowHitTest {
+     let pt = POINT { x: point.x, y: point.y };
+     let target_hwnd = unsafe { WindowFromPoint(pt) };
+     if target_hwnd.0 == 0 {
+-      return false;
++      return crate::WindowHitTest::Other;
+     }
+ 
+     let root_hwnd = unsafe { GetAncestor(target_hwnd, GA_ROOT) };
+     if root_hwnd != self.hwnd() {
+-      return false;
++      if root_hwnd.0 != 0 && Self::is_owned_by(root_hwnd, self.hwnd()) {
++        let overlay = NativeWindow::new(root_hwnd.0);
++        if overlay.is_non_standalone_overlay() {
++          if overlay.has_window_style_ex(WS_EX_TRANSPARENT) {
++            return Self::send_nchittest(self.hwnd(), point).map_or(
++              crate::WindowHitTest::Other,
++              Self::classify_hit_code,
++            );
++          }
++
++          let overlay_hit =
++            Self::hit_test_chain(target_hwnd, root_hwnd, point);
++          if let Some(hit_code) = overlay_hit {
++            #[allow(clippy::cast_possible_wrap)]
++            let caption = HTCAPTION as i32;
++            if hit_code == caption {
++              return crate::WindowHitTest::Caption;
++            }
++            if !Self::is_passthrough_hit_code(hit_code) {
++              return crate::WindowHitTest::Other;
++            }
++          }
++          return Self::send_nchittest(self.hwnd(), point).map_or(
++            crate::WindowHitTest::Other,
++            Self::classify_hit_code,
++          );
++        }
++      }
++      return crate::WindowHitTest::Other;
+     }
+ 
+-    #[allow(clippy::cast_possible_truncation)]
+-    let packed_point = (i32::from(point.y as i16) << 16)
+-      | (i32::from(point.x as i16) & 0xFFFF);
+-    let lparam = LPARAM(packed_point as isize);
++    Self::hit_test_chain(target_hwnd, self.hwnd(), point)
++      .map_or(crate::WindowHitTest::Other, Self::classify_hit_code)
++  }
+ 
+-    let mut current = target_hwnd;
+-    for _ in 0..MAX_ANCESTOR_STEPS {
+-      let mut hit: usize = 0;
+-      let res = unsafe {
+-        SendMessageTimeoutW(
+-          current,
+-          WM_NCHITTEST,
+-          WPARAM(0),
+-          lparam,
+-          SMTO_ABORTIFHUNG | SMTO_BLOCK,
+-          30,
+-          Some(&raw mut hit),
+-        )
+-      };
++  fn hit_test_chain(
++    start_hwnd: HWND,
++    root_hwnd: HWND,
++    point: &Point,
++  ) -> Option<i32> {
++    const MAX_ANCESTOR_STEPS: usize = 16;
+ 
+-      if res.0 == 0 {
+-        return false;
++    let mut current = start_hwnd;
++    for _ in 0..MAX_ANCESTOR_STEPS {
++      if current != root_hwnd && Self::is_child_passthrough(current) {
++        let parent = unsafe { GetAncestor(current, GA_PARENT) };
++        if parent.0 == 0 || parent == current {
++          break;
++        }
++        current = parent;
++        continue;
+       }
+ 
+-      if hit == HTCAPTION_HIT {
+-        return true;
++      if let Some(hit_code) = Self::send_nchittest(current, point) {
++        if !Self::is_passthrough_hit_code(hit_code) {
++          return Some(hit_code);
++        }
+       }
+ 
+-      if hit != HTTRANSPARENT_HIT || current == root_hwnd {
+-        return false;
++      if current == root_hwnd {
++        return None;
+       }
+ 
+       let parent = unsafe { GetAncestor(current, GA_PARENT) };
+       if parent.0 == 0 || parent == current {
+-        return false;
++        break;
+       }
+       current = parent;
+     }
+ 
+-    false
++    None
++  }
++
++  /// Implements [`NativeWindowWindowsExt::is_caption_at_point`].
++  pub(crate) fn is_caption_at_point(&self, point: &Point) -> bool {
++    self.hit_test_at_point(point) == crate::WindowHitTest::Caption
+   }
+ 
+   /// Implements [`NativeWindowWindowsExt::is_in_native_movesize`].
+@@ -580,6 +695,125 @@ impl NativeWindow {
+       && info.flags.contains(GUI_INMOVESIZE)
+   }
+ 
++  /// Implements
++  /// [`NativeWindowWindowsExt::is_ready_for_client_maximize_drag`].
++  pub(crate) fn is_ready_for_client_maximize_drag(&self) -> bool {
++    let hwnd = self.hwnd();
++    if unsafe { GetForegroundWindow() } != hwnd {
++      return false;
++    }
++
++    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, None) };
++    if thread_id == 0 {
++      return false;
++    }
++
++    let mut info = GUITHREADINFO {
++      #[allow(clippy::cast_possible_truncation)]
++      cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
++      ..Default::default()
++    };
++
++    if unsafe { GetGUIThreadInfo(thread_id, &raw mut info) }.is_err() {
++      return false;
++    }
++
++    let blocked = GUI_INMOVESIZE
++      | GUI_INMENUMODE
++      | GUI_POPUPMENUMODE
++      | GUI_SYSTEMMENUMODE;
++
++    (info.flags & blocked).0 == 0
++      && info.hwndCapture.0 == 0
++      && info.hwndMoveSize.0 == 0
++      && info.hwndActive == hwnd
++  }
++
++  fn is_owned_by(child_root: HWND, owner_hwnd: HWND) -> bool {
++    let mut current = child_root;
++    for _ in 0..8 {
++      let owner = unsafe { GetWindow(current, GW_OWNER) };
++      if owner.0 == 0 || owner == current {
++        return false;
++      }
++      if owner == owner_hwnd {
++        return true;
++      }
++      current = owner;
++    }
++    false
++  }
++
++  fn is_child_passthrough(hwnd: HWND) -> bool {
++    let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
++    if !visible {
++      return true;
++    }
++
++    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
++    let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
++    #[allow(clippy::cast_possible_wrap)]
++    let disabled = (style & WS_DISABLED.0 as isize) != 0;
++    #[allow(clippy::cast_possible_wrap)]
++    let transparent = (ex_style & WS_EX_TRANSPARENT.0 as isize) != 0;
++
++    disabled || transparent
++  }
++
++  fn send_nchittest(hwnd: HWND, point: &Point) -> Option<i32> {
++    #[allow(clippy::cast_possible_truncation)]
++    let packed_point = (i32::from(point.y as i16) << 16)
++      | (i32::from(point.x as i16) & 0xFFFF);
++    let lparam = LPARAM(packed_point as isize);
++
++    let mut hit: usize = 0;
++    let res = unsafe {
++      SendMessageTimeoutW(
++        hwnd,
++        WM_NCHITTEST,
++        WPARAM(0),
++        lparam,
++        SMTO_ABORTIFHUNG | SMTO_BLOCK,
++        100,
++        Some(&raw mut hit),
++      )
++    };
++
++    if res.0 == 0 {
++      return None;
++    }
++
++    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
++    Some(hit as i32)
++  }
++
++  fn is_passthrough_hit_code(hit_code: i32) -> bool {
++    #[allow(clippy::cast_possible_wrap)]
++    let nowhere = HTNOWHERE as i32;
++    hit_code == HTTRANSPARENT || hit_code == nowhere || hit_code == HTERROR
++  }
++
++  fn classify_hit_code(hit_code: i32) -> crate::WindowHitTest {
++    #[allow(clippy::cast_possible_wrap)]
++    let caption = HTCAPTION as i32;
++    #[allow(clippy::cast_possible_wrap)]
++    let client = HTCLIENT as i32;
++    #[allow(clippy::cast_possible_wrap)]
++    let border_start = HTLEFT as i32;
++    #[allow(clippy::cast_possible_wrap)]
++    let border_end = HTBOTTOMRIGHT as i32;
++
++    if hit_code == caption {
++      crate::WindowHitTest::Caption
++    } else if (border_start..=border_end).contains(&hit_code) {
++      crate::WindowHitTest::ResizeBorder
++    } else if hit_code == client {
++      crate::WindowHitTest::Client
++    } else {
++      crate::WindowHitTest::Other
++    }
++  }
++
+   /// Implements [`NativeWindowWindowsExt::set_cloaked`].
+   pub(crate) fn set_cloaked(&self, cloaked: bool) -> crate::Result<()> {
+     COM_INIT.with(|com_init| -> crate::Result<()> {
+diff --git a/packages/wm-platform/src/platform_impl/windows/window_listener.rs b/packages/wm-platform/src/platform_impl/windows/window_listener.rs
+index 29838431..bc4f743a 100644
+--- a/packages/wm-platform/src/platform_impl/windows/window_listener.rs
++++ b/packages/wm-platform/src/platform_impl/windows/window_listener.rs
+@@ -1,4 +1,4 @@
+-use std::sync::OnceLock;
++use std::sync::{Mutex, OnceLock};
+ 
+ use tokio::sync::mpsc;
+ use windows::Win32::{
+@@ -6,12 +6,15 @@ use windows::Win32::{
+   UI::{
+     Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK},
+     WindowsAndMessaging::{
+-      EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
+-      EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE,
+-      EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND,
++      GetAncestor, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY,
++      EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
++      EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
++      EVENT_SYSTEM_CAPTUREEND, EVENT_SYSTEM_CAPTURESTART,
++      EVENT_SYSTEM_DRAGDROPSTART, EVENT_SYSTEM_FOREGROUND,
+       EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
+-      EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, OBJID_WINDOW,
+-      WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
++      EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GA_ROOT,
++      OBJID_CLIENT, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
++      WINEVENT_SKIPOWNPROCESS,
+     },
+   },
+ };
+@@ -19,6 +22,101 @@ use windows::Win32::{
+ use super::NativeWindow;
+ use crate::{Dispatcher, WindowEvent, WindowId};
+ 
++const CAPTURE_RING_LEN: usize = 16;
++
++struct CaptureHistory {
++  seq: u64,
++  active_capture_root: isize,
++  capture_starts: [(u64, isize); CAPTURE_RING_LEN],
++  capture_start_idx: usize,
++  capture_ends: [(u64, isize); CAPTURE_RING_LEN],
++  capture_end_idx: usize,
++  dragdrop_starts: [(u64, isize); CAPTURE_RING_LEN],
++  dragdrop_idx: usize,
++}
++
++impl CaptureHistory {
++  const fn new() -> Self {
++    Self {
++      seq: 0,
++      active_capture_root: 0,
++      capture_starts: [(0, 0); CAPTURE_RING_LEN],
++      capture_start_idx: 0,
++      capture_ends: [(0, 0); CAPTURE_RING_LEN],
++      capture_end_idx: 0,
++      dragdrop_starts: [(0, 0); CAPTURE_RING_LEN],
++      dragdrop_idx: 0,
++    }
++  }
++  fn next_seq(&mut self) -> u64 {
++    self.seq = self.seq.wrapping_add(1);
++    self.seq
++  }
++
++  fn record_capture_start(&mut self, root_id: isize) {
++    let seq = self.next_seq();
++    self.active_capture_root = root_id;
++    self.capture_starts[self.capture_start_idx] = (seq, root_id);
++    self.capture_start_idx =
++      (self.capture_start_idx + 1) % CAPTURE_RING_LEN;
++  }
++
++  fn record_capture_end(&mut self, root_id: isize) {
++    let seq = self.next_seq();
++    if self.active_capture_root == root_id {
++      self.active_capture_root = 0;
++    }
++    self.capture_ends[self.capture_end_idx] = (seq, root_id);
++    self.capture_end_idx = (self.capture_end_idx + 1) % CAPTURE_RING_LEN;
++  }
++
++  fn record_dragdrop_start(&mut self, root_id: isize) {
++    let seq = self.next_seq();
++    self.dragdrop_starts[self.dragdrop_idx] = (seq, root_id);
++    self.dragdrop_idx = (self.dragdrop_idx + 1) % CAPTURE_RING_LEN;
++  }
++}
++
++static CAPTURE_HISTORY: Mutex<CaptureHistory> =
++  Mutex::new(CaptureHistory::new());
++
++/// Snapshots the monotonic capture/drag-drop sequence counter and whether
++/// `window_handle` currently owns mouse capture.
++pub(crate) fn capture_snapshot(window_handle: isize) -> (u64, bool) {
++  let history = CAPTURE_HISTORY
++    .lock()
++    .unwrap_or_else(std::sync::PoisonError::into_inner);
++  (history.seq, history.active_capture_root == window_handle)
++}
++
++/// Returns `(had_capture_end_cycle, had_dragdrop_start)` for
++/// `window_handle` since `since_seq`.
++pub(crate) fn capture_cycle_since(
++  window_handle: isize,
++  since_seq: u64,
++  started_captured: bool,
++) -> (bool, bool) {
++  let history = CAPTURE_HISTORY
++    .lock()
++    .unwrap_or_else(std::sync::PoisonError::into_inner);
++
++  let had_start = started_captured
++    || history
++      .capture_starts
++      .iter()
++      .any(|&(seq, root)| root == window_handle && seq > since_seq);
++  let had_end = history
++    .capture_ends
++    .iter()
++    .any(|&(seq, root)| root == window_handle && seq > since_seq);
++  let had_dragdrop = history
++    .dragdrop_starts
++    .iter()
++    .any(|&(seq, root)| root == window_handle && seq > since_seq);
++
++  (had_start && had_end, had_dragdrop)
++}
++
+ thread_local! {
+   /// Sender for window events. For use with hook procedure.
+   static EVENT_TX: OnceLock<mpsc::UnboundedSender<WindowEvent>> = const { OnceLock::new() };
+@@ -68,7 +166,8 @@ impl WindowListener {
+     let event_ranges = [
+       (EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE),
+       (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
+-      (EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND),
++      (EVENT_SYSTEM_CAPTURESTART, EVENT_SYSTEM_MOVESIZEEND),
++      (EVENT_SYSTEM_DRAGDROPSTART, EVENT_SYSTEM_DRAGDROPSTART),
+       (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
+       (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE),
+       (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
+@@ -114,6 +213,34 @@ impl WindowListener {
+     _event_thread: u32,
+     _event_time: u32,
+   ) {
++    if matches!(
++      event_type,
++      EVENT_SYSTEM_CAPTURESTART
++        | EVENT_SYSTEM_CAPTUREEND
++        | EVENT_SYSTEM_DRAGDROPSTART
++    ) {
++      let valid_obj =
++        id_object == OBJID_WINDOW.0 || id_object == OBJID_CLIENT.0;
++      if handle != HWND(0) && id_child == 0 && valid_obj {
++        let root = unsafe { GetAncestor(handle, GA_ROOT) };
++        let root_id = if root.0 != 0 { root.0 } else { handle.0 };
++        let mut history = CAPTURE_HISTORY
++          .lock()
++          .unwrap_or_else(std::sync::PoisonError::into_inner);
++        match event_type {
++          EVENT_SYSTEM_CAPTURESTART => {
++            history.record_capture_start(root_id);
++          }
++          EVENT_SYSTEM_CAPTUREEND => history.record_capture_end(root_id),
++          EVENT_SYSTEM_DRAGDROPSTART => {
++            history.record_dragdrop_start(root_id);
++          }
++          _ => {}
++        }
++      }
++      return;
++    }
++
+     // Check whether the event is associated with a window object rather
+     // than a UI control.
+     let is_window_event =
+diff --git a/packages/wm/src/events/handle_mouse_move.rs b/packages/wm/src/events/handle_mouse_move.rs
+index 915dded3..64b81162 100644
+--- a/packages/wm/src/events/handle_mouse_move.rs
++++ b/packages/wm/src/events/handle_mouse_move.rs
+@@ -1,3 +1,6 @@
++#[cfg(target_os = "windows")]
++use std::time::{Duration, Instant};
++
+ use anyhow::Context;
+ #[cfg(any(target_os = "macos", target_os = "windows"))]
+ use wm_common::try_warn;
+@@ -6,7 +9,7 @@ use wm_common::{
+   ActiveDrag, ActiveDragOperation, FloatingStateConfig, WindowState,
+ };
+ #[cfg(target_os = "windows")]
+-use wm_platform::{NativeWindowWindowsExt, Point, Rect};
++use wm_platform::{NativeWindowWindowsExt, Point, Rect, WindowHitTest};
+ use wm_platform::{MouseButton, MouseEvent};
+ 
+ #[cfg(target_os = "macos")]
+@@ -18,7 +21,7 @@ use crate::{
+   },
+   events::update_floating_window_position,
+   models::WindowContainer,
+-  wm_state::{ManualWindowDrag, PendingMaximizeDrag},
++  wm_state::{LeftButtonDownHit, ManualWindowDrag, PendingMaximizeDrag},
+ };
+ use crate::{
+   commands::container::set_focused_descendant,
+@@ -113,10 +116,7 @@ pub fn handle_mouse_move(
+       }
+       #[cfg(target_os = "windows")]
+       {
+-        state
+-          .dispatcher
+-          .window_from_point(position)?
+-          .and_then(|native| state.window_from_native(&native))
++        resolve_managed_window_at_point(position, state)?
+       }
+     };
+ 
+@@ -172,6 +172,7 @@ fn handle_windows_mouse_button(
+       position,
+       ..
+     } => {
++      state.last_left_button_down = None;
+       state.pending_maximize_drag = None;
+       if state.active_manual_drag.is_some() {
+         finish_manual_drag(Some(position), state, config)?;
+@@ -182,6 +183,66 @@ fn handle_windows_mouse_button(
+   }
+ }
+ 
++#[cfg(target_os = "windows")]
++fn resolve_managed_window_at_point(
++  position: &Point,
++  state: &WmState,
++) -> anyhow::Result<Option<WindowContainer>> {
++  const MAX_OWNER_HOPS: usize = 8;
++
++  let Some(native_window) = state.dispatcher.window_from_point(position)?
++  else {
++    return Ok(None);
++  };
++
++  if let Some(window) = state.window_from_native(&native_window) {
++    return Ok(Some(window));
++  }
++
++  if !native_window.is_non_standalone_overlay()
++    || !native_window.is_overlay_hit_passthrough(position)
++  {
++    return Ok(None);
++  }
++
++  let mut current = native_window;
++  for _ in 0..MAX_OWNER_HOPS {
++    let Some(owner) = current.owner_window() else {
++      break;
++    };
++    if owner.id() == current.id() {
++      break;
++    }
++    if let Some(window) = state.window_from_native(&owner) {
++      return Ok(Some(window));
++    }
++    current = owner;
++  }
++
++  Ok(None)
++}
++
++#[cfg(target_os = "windows")]
++fn is_point_near_resize_border(
++  position: &Point,
++  frame: &Rect,
++  dpi: u32,
++) -> bool {
++  let dpi_i32 = i32::try_from(dpi).unwrap_or(96);
++  let side_margin = ((12 * dpi_i32) / 96).clamp(10, 24);
++  let top_margin = ((8 * dpi_i32) / 96).clamp(6, 16);
++  let grip_size = ((32 * dpi_i32) / 96).clamp(24, 64);
++
++  let near_left = position.x <= frame.left + side_margin;
++  let near_right = position.x >= frame.right - side_margin;
++  let near_bottom = position.y >= frame.bottom - side_margin;
++  let near_top = position.y <= frame.top + top_margin;
++  let in_size_grip = position.x >= frame.right - grip_size
++    && position.y >= frame.bottom - grip_size;
++
++  near_left || near_right || near_bottom || near_top || in_size_grip
++}
++
+ #[cfg(target_os = "windows")]
+ fn handle_windows_left_down(
+   position: &Point,
+@@ -189,6 +250,7 @@ fn handle_windows_left_down(
+   config: &UserConfig,
+ ) -> anyhow::Result<()> {
+   state.pending_maximize_drag = None;
++  state.last_left_button_down = None;
+ 
+   if state.active_manual_drag.is_some() {
+     finish_manual_drag(Some(position), state, config)?;
+@@ -199,89 +261,183 @@ fn handle_windows_left_down(
+     return Ok(());
+   }
+ 
+-  let Some(native_window) = state.dispatcher.window_from_point(position)?
++  let Some(window) = resolve_managed_window_at_point(position, state)?
+   else {
+     return Ok(());
+   };
+ 
+-  let Some(window) = state.window_from_native(&native_window) else {
+-    return Ok(());
+-  };
++  let native = window.native();
++  let hit_test = native.hit_test_at_point(position);
++  let frame = native
++    .frame()
++    .unwrap_or_else(|_| window.native_properties().frame);
++  let dpi = native.dpi();
++  let is_maximized = native.is_maximized().unwrap_or(false);
++  let window_handle = native.id();
++  drop(native);
++
++  let is_near_resize_border =
++    is_point_near_resize_border(position, &frame, dpi);
++
++  state.last_left_button_down = Some(LeftButtonDownHit {
++    window_id: window.id(),
++    cursor: position.clone(),
++    hit_test,
++    is_near_resize_border,
++    timestamp: Instant::now(),
++  });
+ 
+-  if !window.native().is_maximized().unwrap_or(false) {
++  if !is_maximized {
+     return Ok(());
+   }
+ 
+-  if !window.native().is_caption_at_point(position) {
++  let dpi_i32 = i32::try_from(dpi).unwrap_or(96);
++  let top_bar_band_px = ((56 * dpi_i32) / 96).clamp(48, 120);
++
++  let (arm_pending, requires_capture_release) = match hit_test {
++    WindowHitTest::Caption => (true, false),
++    WindowHitTest::Client => {
++      let in_top_band = position.y >= frame.top
++        && position.y <= frame.top + top_bar_band_px;
++      (in_top_band, true)
++    }
++    WindowHitTest::ResizeBorder | WindowHitTest::Other => (false, false),
++  };
++
++  if !arm_pending {
+     return Ok(());
+   }
+ 
+-  let max_frame = match window.native().frame() {
+-    Ok(frame) => frame,
+-    Err(_) => window.native_properties().frame,
++  let (start_capture_seq, started_captured) = if requires_capture_release {
++    state.dispatcher.capture_snapshot(window_handle)
++  } else {
++    (0, false)
+   };
+ 
+   state.pending_maximize_drag = Some(PendingMaximizeDrag {
+     window_id: window.id(),
++    window_handle,
+     start_cursor: position.clone(),
+-    max_frame,
++    max_frame: frame,
++    requires_capture_release,
++    start_capture_seq,
++    started_captured,
+   });
+ 
+   Ok(())
+ }
+ 
+ #[cfg(target_os = "windows")]
+-fn handle_drag_move(
++fn handle_active_manual_drag(
++  drag: &ManualWindowDrag,
+   position: &Point,
+   pressed_buttons: &wm_platform::PressedButtons,
+   state: &mut WmState,
+   config: &UserConfig,
+ ) -> anyhow::Result<bool> {
+-  const DRAG_THRESHOLD_PX: i32 = 10;
++  if !pressed_buttons.contains(&MouseButton::Left)
++    || !state.dispatcher.is_mouse_down(&MouseButton::Left)
++  {
++    finish_manual_drag(Some(position), state, config)?;
++    return Ok(false);
++  }
+ 
+-  if let Some(drag) = state.active_manual_drag.clone() {
+-    if !pressed_buttons.contains(&MouseButton::Left)
+-      || !state.dispatcher.is_mouse_down(&MouseButton::Left)
+-    {
+-      finish_manual_drag(Some(position), state, config)?;
+-      return Ok(false);
+-    }
++  let Some(window) = state.window_by_id(drag.window_id) else {
++    state.active_manual_drag = None;
++    state.dispatcher.hide_snap_overlay();
++    return Ok(false);
++  };
+ 
+-    let Some(window) = state.window_by_id(drag.window_id) else {
+-      state.active_manual_drag = None;
+-      state.dispatcher.hide_snap_overlay();
+-      return Ok(false);
+-    };
++  let native = window.native();
++  if !native.is_valid() {
++    state.active_manual_drag = None;
++    state.dispatcher.hide_snap_overlay();
++    return Ok(false);
++  }
+ 
+-    let native = window.native();
+-    if !native.is_valid() {
+-      state.active_manual_drag = None;
+-      state.dispatcher.hide_snap_overlay();
+-      return Ok(false);
++  let target_x = position.x - drag.cursor_offset_x;
++  let target_y = position.y - drag.cursor_offset_y;
++  let is_maximized = native.is_maximized().unwrap_or(false);
++  let mut did_sw_restore_fallback = drag.did_sw_restore_fallback;
++  let mut did_confirm_restored_size = drag.did_confirm_restored_size;
++
++  if is_maximized {
++    if !did_sw_restore_fallback
++      && drag.started_at.elapsed() >= Duration::from_millis(40)
++    {
++      let _ = native.restore(None);
++      did_sw_restore_fallback = true;
+     }
+ 
+-    let _ = native.move_without_resize(
+-      position.x - drag.cursor_offset_x,
+-      position.y - drag.cursor_offset_y,
++    let target_rect = Rect::from_xy(
++      target_x,
++      target_y,
++      drag.restored_width,
++      drag.restored_height,
+     );
+-    let is_maximized = native.is_maximized().unwrap_or(false);
+-    let shadow_borders = if is_maximized {
+-      None
++    let _ = native.set_bounds_preserving_zorder(&target_rect);
++  } else if !did_confirm_restored_size {
++    let current_rect = native
++      .frame_with_shadows()
++      .unwrap_or_else(|_| window.native_properties().frame);
++    if (current_rect.width() - drag.restored_width).abs() <= 40
++      && (current_rect.height() - drag.restored_height).abs() <= 40
++    {
++      did_confirm_restored_size = true;
++      let _ = native.move_without_resize(target_x, target_y);
+     } else {
+-      native.shadow_borders().ok()
+-    };
+-    drop(native);
+-
+-    if let Some(shadow_borders) = shadow_borders {
+-      window.update_native_properties(|properties| {
+-        properties.is_maximized = false;
+-        properties.shadow_borders = shadow_borders;
+-      });
++      let target_rect = Rect::from_xy(
++        target_x,
++        target_y,
++        drag.restored_width,
++        drag.restored_height,
++      );
++      let _ = native.set_bounds_preserving_zorder(&target_rect);
+     }
++  } else {
++    let _ = native.move_without_resize(target_x, target_y);
++  }
+ 
+-    update_drag_snap_preview(&window, Some(position), state)?;
++  let shadow_borders = if is_maximized {
++    None
++  } else {
++    native.shadow_borders().ok()
++  };
++  drop(native);
+ 
+-    return Ok(true);
++  if let Some(active_drag) = state.active_manual_drag.as_mut() {
++    active_drag.did_sw_restore_fallback = did_sw_restore_fallback;
++    active_drag.did_confirm_restored_size = did_confirm_restored_size;
++  }
++
++  if let Some(shadow_borders) = shadow_borders {
++    window.update_native_properties(|properties| {
++      properties.is_maximized = false;
++      properties.shadow_borders = shadow_borders;
++    });
++  }
++
++  update_drag_snap_preview(&window, Some(position), state)?;
++  Ok(true)
++}
++
++#[cfg(target_os = "windows")]
++fn handle_drag_move(
++  position: &Point,
++  pressed_buttons: &wm_platform::PressedButtons,
++  state: &mut WmState,
++  config: &UserConfig,
++) -> anyhow::Result<bool> {
++  const DRAG_THRESHOLD_PX: i32 = 10;
++
++  if let Some(drag) = state.active_manual_drag.clone() {
++    return handle_active_manual_drag(
++      &drag,
++      position,
++      pressed_buttons,
++      state,
++      config,
++    );
+   }
+ 
+   let Some(pending) = state.pending_maximize_drag.clone() else {
+@@ -301,12 +457,45 @@ fn handle_drag_move(
+     return Ok(false);
+   }
+ 
+-  state.pending_maximize_drag = None;
+-
+   let Some(window) = state.window_by_id(pending.window_id) else {
++    state.pending_maximize_drag = None;
+     return Ok(false);
+   };
+ 
++  if pending.requires_capture_release {
++    let (had_capture_cycle, had_dragdrop) =
++      state.dispatcher.capture_cycle_since(
++        pending.window_handle,
++        pending.start_capture_seq,
++        pending.started_captured,
++      );
++
++    if had_dragdrop {
++      state.pending_maximize_drag = None;
++      return Ok(false);
++    }
++
++    if window.active_drag().is_some()
++      || window.native().is_in_native_movesize()
++      || !window.native().is_maximized().unwrap_or(false)
++    {
++      state.pending_maximize_drag = None;
++      return Ok(false);
++    }
++
++    if !had_capture_cycle
++      || !window.native().is_ready_for_client_maximize_drag()
++    {
++      return Ok(false);
++    }
++
++    state.pending_maximize_drag = None;
++    start_maximize_drag(window, &pending, position, state, config)?;
++    return Ok(true);
++  }
++
++  state.pending_maximize_drag = None;
++
+   // If Windows Snap already entered its native modal drag loop, yield to
+   // native tracking instead of duplicating the drag.
+   if window.active_drag().is_some()
+@@ -393,7 +582,7 @@ fn start_maximize_drag(
+ 
+   let native = window.native();
+   native.restore(Some(&outer_rect))?;
+-  let _ = native.move_without_resize(outer_rect.left, outer_rect.top);
++  let _ = native.set_bounds_preserving_zorder(&outer_rect);
+   drop(native);
+ 
+   window.set_floating_placement(restored_frame.clone());
+@@ -427,6 +616,11 @@ fn start_maximize_drag(
+     window_id: window.id(),
+     cursor_offset_x: position.x - outer_rect.left,
+     cursor_offset_y: position.y - outer_rect.top,
++    restored_width: outer_rect.width(),
++    restored_height: outer_rect.height(),
++    started_at: Instant::now(),
++    did_sw_restore_fallback: false,
++    did_confirm_restored_size: false,
+   });
+ 
+   Ok(())
+@@ -445,6 +639,7 @@ fn finish_manual_drag(
+   };
+ 
+   let Some(window) = state.window_by_id(drag.window_id) else {
++    state.clear_window_drag_state(drag.window_id);
+     return Ok(());
+   };
+ 
+@@ -474,6 +669,7 @@ fn finish_manual_drag(
+     WindowContainer::NonTilingWindow(non_tiling),
+   ) = (active_drag, &window)
+   {
++    let finished_id = non_tiling.id();
+     finalize_move_drag(
+       non_tiling,
+       frame,
+@@ -482,8 +678,11 @@ fn finish_manual_drag(
+       state,
+       config,
+     )?;
++    state.clear_window_drag_state(finished_id);
+   } else {
++    let finished_id = window.id();
+     window.set_active_drag(None);
++    state.clear_window_drag_state(finished_id);
+ 
+     if let WindowContainer::NonTilingWindow(non_tiling) = window {
+       let nearest_monitor = state
+diff --git a/packages/wm/src/events/handle_window_moved_or_resized.rs b/packages/wm/src/events/handle_window_moved_or_resized.rs
+index 45a96875..c490e4b5 100644
+--- a/packages/wm/src/events/handle_window_moved_or_resized.rs
++++ b/packages/wm/src/events/handle_window_moved_or_resized.rs
+@@ -1,13 +1,16 @@
++#[cfg(target_os = "windows")]
++use std::time::Duration;
++
+ use anyhow::Context;
+ use wm_common::{
+   try_warn, ActiveDrag, ActiveDragOperation, DisplayState,
+   FloatingStateConfig, FullscreenStateConfig, HideMethod, WindowState,
+ };
+ #[cfg(target_os = "windows")]
+-use wm_platform::NativeWindowWindowsExt;
++use wm_platform::{NativeWindowWindowsExt, WindowHitTest};
+ #[cfg(target_os = "macos")]
+-use wm_platform::{LengthValue, MouseButton, RectDelta};
+-use wm_platform::{NativeWindow, Rect};
++use wm_platform::{LengthValue, RectDelta};
++use wm_platform::{MouseButton, NativeWindow, Point, Rect};
+ 
+ use crate::{
+   commands::{
+@@ -91,7 +94,13 @@ pub fn handle_window_moved_or_resized(
+         return handle_window_moved_or_resized_end(&window, state, config);
+       }
+ 
+-      return update_drag_state(&window, &frame_position, state, config);
++      return update_drag_state(
++        &window,
++        &frame_position,
++        None,
++        state,
++        config,
++      );
+     }
+ 
+     let old_is_maximized = window.native_properties().is_maximized;
+@@ -203,8 +212,64 @@ pub fn handle_window_moved_or_resized(
+       ) || (matches!(window.state(), WindowState::Fullscreen(_))
+         && !matches!(window.prev_state(), Some(WindowState::Tiling)));
+ 
++      let is_maximized_origin = old_is_maximized
++        || matches!(
++          window.state(),
++          WindowState::Fullscreen(FullscreenStateConfig {
++            maximized: true,
++            ..
++          })
++        );
++
++      #[cfg(target_os = "windows")]
++      let cached_hit = state.last_left_button_down.take().filter(|hit| {
++        hit.window_id == window.id()
++          && hit.timestamp.elapsed() < Duration::from_secs(2)
++      });
++
++      #[cfg(target_os = "windows")]
++      let initial_operation = if is_maximized_origin {
++        Some(ActiveDragOperation::Move)
++      } else {
++        cached_hit.as_ref().and_then(|hit| match hit.hit_test {
++          WindowHitTest::Caption => Some(ActiveDragOperation::Move),
++          WindowHitTest::ResizeBorder => {
++            Some(ActiveDragOperation::Resize)
++          }
++          WindowHitTest::Client if !hit.is_near_resize_border => {
++            Some(ActiveDragOperation::Move)
++          }
++          WindowHitTest::Client | WindowHitTest::Other => None,
++        })
++      };
++
++      #[cfg(not(target_os = "windows"))]
++      let initial_operation = if is_maximized_origin {
++        Some(ActiveDragOperation::Move)
++      } else {
++        None
++      };
++
++      #[cfg(target_os = "windows")]
++      let cached_cursor = cached_hit.map(|hit| hit.cursor);
++      #[cfg(not(target_os = "windows"))]
++      let cached_cursor: Option<Point> = None;
++
++      let start_cursor = cached_cursor.or_else(|| {
++        if state.dispatcher.has_event_loop()
++          && state.dispatcher.is_mouse_down(&MouseButton::Left)
++        {
++          state.dispatcher.cursor_position().ok()
++        } else {
++          None
++        }
++      });
++
++      state.active_drag_start_cursor =
++        start_cursor.map(|cursor| (window.id(), cursor));
++
+       window.set_active_drag(Some(ActiveDrag {
+-        operation: None,
++        operation: initial_operation,
+         is_from_floating,
+         #[cfg(target_os = "windows")]
+         initial_position: old_frame_position.clone(),
+@@ -220,7 +285,7 @@ pub fn handle_window_moved_or_resized(
+       }));
+ 
+       #[cfg(target_os = "windows")]
+-      update_drag_state(&window, &frame_position, state, config)?;
++      update_drag_state(&window, &frame_position, None, state, config)?;
+ 
+       return Ok(());
+     }
+@@ -452,10 +517,23 @@ pub fn update_floating_window_position(
+ /// This function determines whether a window is being moved or resized and
+ /// updates its operation state accordingly. If the window is being moved,
+ /// it's set to floating mode.
++fn frame_displacement_distance(frame: &Rect, initial: &Rect) -> f32 {
++  if frame.width() == initial.width() && frame.height() == initial.height()
++  {
++    frame.center_point().distance_between(&initial.center_point())
++  } else {
++    Point { x: frame.left, y: frame.top }.distance_between(&Point {
++      x: initial.left,
++      y: initial.top,
++    })
++  }
++}
++
+ #[allow(clippy::too_many_lines)]
+ fn update_drag_state(
+   window: &WindowContainer,
+   frame_position: &Rect,
++  cursor_override: Option<&Point>,
+   state: &mut WmState,
+   config: &UserConfig,
+ ) -> anyhow::Result<()> {
+@@ -472,9 +550,23 @@ fn update_drag_state(
+   let is_move = if let Some(operation) = active_drag.operation {
+     matches!(operation, ActiveDragOperation::Move)
+   } else {
+-    let is_move = *frame_position != active_drag.initial_position
+-      && frame_position.height() == active_drag.initial_position.height()
+-      && frame_position.width() == active_drag.initial_position.width();
++    let initial = &active_drag.initial_position;
++    let same_size = frame_position.height() == initial.height()
++      && frame_position.width() == initial.width();
++    let translated_x = frame_position.left != initial.left
++      && frame_position.right != initial.right
++      && (frame_position.left - initial.left).signum()
++        == (frame_position.right - initial.right).signum()
++      && frame_position.height() == initial.height();
++    let translated_y = frame_position.top != initial.top
++      && frame_position.bottom != initial.bottom
++      && (frame_position.top - initial.top).signum()
++        == (frame_position.bottom - initial.bottom).signum()
++      && frame_position.width() == initial.width();
++
++    let is_move = (*frame_position != *initial && same_size)
++      || translated_x
++      || translated_y;
+ 
+     let operation = if is_move {
+       ActiveDragOperation::Move
+@@ -497,9 +589,34 @@ fn update_drag_state(
+   let active_window = if is_move
+     && !matches!(window.state(), WindowState::Floating(_))
+   {
+-    let move_distance = frame_position
+-      .center_point()
+-      .distance_between(&active_drag.initial_position.center_point());
++    let move_distance = match &state.active_drag_start_cursor {
++      Some((drag_window_id, start_cursor))
++        if *drag_window_id == window.id() =>
++      {
++        if let Some(cursor) = cursor_override {
++          cursor.distance_between(start_cursor)
++        } else if state.dispatcher.has_event_loop() {
++          state.dispatcher.cursor_position().map_or_else(
++            |_| {
++              frame_displacement_distance(
++                frame_position,
++                &active_drag.initial_position,
++              )
++            },
++            |cursor| cursor.distance_between(start_cursor),
++          )
++        } else {
++          frame_displacement_distance(
++            frame_position,
++            &active_drag.initial_position,
++          )
++        }
++      }
++      _ => frame_displacement_distance(
++        frame_position,
++        &active_drag.initial_position,
++      ),
++    };
+ 
+     // Dragging operations on a maximized window can only occur on Windows.
+     // The OS immediately restores it while it's being dragged, so we need
+@@ -559,7 +676,7 @@ fn update_drag_state(
+   };
+ 
+   if is_move && matches!(active_window.state(), WindowState::Floating(_)) {
+-    update_drag_snap_preview(&active_window, None, state)?;
++    update_drag_snap_preview(&active_window, cursor_override, state)?;
+   } else if !is_move {
+     update_live_resize(
+       &active_window,
+@@ -738,4 +855,172 @@ mod tests {
+ 
+     assert!(!is_in_corner(&frame, &monitor));
+   }
++
++  #[test]
++  fn min_size_constrained_tiling_drag_transitions_to_floating() {
++    use tokio::sync::mpsc;
++    use wm_common::{ActiveDrag, ActiveDragOperation, WindowState};
++    use wm_platform::{Dispatcher, Point};
++
++    use super::update_drag_state;
++    use crate::{
++      commands::container::{attach_container, set_focused_descendant},
++      models::{Monitor, TilingWindow, Workspace},
++      traits::{TilingSizeGetters, WindowGetters},
++      user_config::UserConfig,
++      wm_state::WmState,
++    };
++
++    let (event_tx, _event_rx) = mpsc::unbounded_channel();
++    let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
++    let mut state = WmState::new(Dispatcher::mock(), event_tx, exit_tx);
++    let config = UserConfig::mock();
++
++    let workspace = Workspace::mock()
++      .gaps_config(config.value.gaps.clone())
++      .call();
++    let monitor = Monitor::mock()
++      .bounds(Rect::from_xy(0, 0, 1920, 1080))
++      .working_area(Rect::from_xy(0, 0, 1920, 1032))
++      .workspaces(vec![workspace.clone()])
++      .call();
++    attach_container(
++      &monitor.into(),
++      &state.root_container.clone().into(),
++      None,
++    )
++    .unwrap();
++    set_focused_descendant(&workspace.clone().into(), None);
++
++    let win = TilingWindow::mock()
++      .tiling_size(0.25)
++      .gaps_config(config.value.gaps.clone())
++      .call();
++    let sibling = TilingWindow::mock()
++      .tiling_size(0.75)
++      .gaps_config(config.value.gaps.clone())
++      .call();
++    attach_container(&win.clone().into(), &workspace.clone().into(), None)
++      .unwrap();
++    attach_container(&sibling.into(), &workspace.clone().into(), None)
++      .unwrap();
++
++    // Tiled slot is 480px wide, below a hypothetical 800px minimum width.
++    let tile_rect = Rect::from_xy(0, 0, 480, 1032);
++    win.set_active_drag(Some(ActiveDrag {
++      operation: Some(ActiveDragOperation::Move),
++      is_from_floating: false,
++      initial_position: tile_rect,
++      origin_void_id: None,
++    }));
++    state.active_drag_start_cursor =
++      Some((win.id(), Point { x: 240, y: 20 }));
++
++    // OS enforces minimum width (480 -> 800) before 10px cursor travel.
++    let expanded_rect = Rect::from_xy(0, 0, 800, 1032);
++    let small_move_cursor = Point { x: 245, y: 22 };
++    update_drag_state(
++      &win.clone().into(),
++      &expanded_rect,
++      Some(&small_move_cursor),
++      &mut state,
++      &config,
++    )
++    .unwrap();
++
++    // Remain Tiling below 10px cursor movement without false resize.
++    assert!(matches!(win.state(), WindowState::Tiling));
++    assert!(state.live_resize_state.is_none());
++
++    // Once cursor travels >= 10px, window transitions to Floating cleanly.
++    let drag_out_cursor = Point { x: 270, y: 35 };
++    let moved_rect = Rect::from_xy(30, 15, 800, 1032);
++    update_drag_state(
++      &win.clone().into(),
++      &moved_rect,
++      Some(&drag_out_cursor),
++      &mut state,
++      &config,
++    )
++    .unwrap();
++
++    let updated = state.window_by_id(win.id()).unwrap();
++    assert!(matches!(updated.state(), WindowState::Floating(_)));
++    assert!(state.live_resize_state.is_none());
++  }
++
++  #[test]
++  fn maximized_origin_move_drag_ignores_restored_size_shrink() {
++    use tokio::sync::mpsc;
++    use wm_common::{
++      ActiveDrag, ActiveDragOperation, FullscreenStateConfig, WindowState,
++    };
++    use wm_platform::{Dispatcher, Point};
++
++    use super::update_drag_state;
++    use crate::{
++      commands::container::{attach_container, set_focused_descendant},
++      models::{Monitor, NonTilingWindow, Workspace},
++      traits::WindowGetters,
++      user_config::UserConfig,
++      wm_state::WmState,
++    };
++
++    let (event_tx, _event_rx) = mpsc::unbounded_channel();
++    let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
++    let mut state = WmState::new(Dispatcher::mock(), event_tx, exit_tx);
++    let config = UserConfig::mock();
++
++    let workspace = Workspace::mock()
++      .gaps_config(config.value.gaps.clone())
++      .call();
++    let monitor = Monitor::mock()
++      .bounds(Rect::from_xy(0, 0, 1920, 1080))
++      .working_area(Rect::from_xy(0, 0, 1920, 1032))
++      .workspaces(vec![workspace.clone()])
++      .call();
++    attach_container(
++      &monitor.into(),
++      &state.root_container.clone().into(),
++      None,
++    )
++    .unwrap();
++    set_focused_descendant(&workspace.clone().into(), None);
++
++    let win = NonTilingWindow::mock()
++      .state(WindowState::Fullscreen(FullscreenStateConfig {
++        maximized: true,
++        ..Default::default()
++      }))
++      .call();
++    attach_container(&win.clone().into(), &workspace.into(), None)
++      .unwrap();
++
++    win.set_active_drag(Some(ActiveDrag {
++      operation: Some(ActiveDragOperation::Move),
++      is_from_floating: true,
++      initial_position: Rect::from_xy(0, 0, 1920, 1032),
++      origin_void_id: None,
++    }));
++    state.active_drag_start_cursor =
++      Some((win.id(), Point { x: 960, y: 15 }));
++
++    let restored_rect = Rect::from_xy(360, 4, 1200, 800);
++    let drag_cursor = Point { x: 960, y: 19 };
++    update_drag_state(
++      &win.clone().into(),
++      &restored_rect,
++      Some(&drag_cursor),
++      &mut state,
++      &config,
++    )
++    .unwrap();
++
++    let updated = state.window_by_id(win.id()).unwrap();
++    assert!(matches!(updated.state(), WindowState::Floating(_)));
++    assert_eq!(
++      updated.active_drag().and_then(|d| d.operation),
++      Some(ActiveDragOperation::Move)
++    );
++  }
+ }
+diff --git a/packages/wm/src/events/handle_window_moved_or_resized_end.rs b/packages/wm/src/events/handle_window_moved_or_resized_end.rs
+index b08e0e45..ec9c13ad 100644
+--- a/packages/wm/src/events/handle_window_moved_or_resized_end.rs
++++ b/packages/wm/src/events/handle_window_moved_or_resized_end.rs
+@@ -91,6 +91,8 @@ pub fn handle_window_moved_or_resized_end(
+           )?;
+         }
+ 
++        state.clear_window_drag_state(updated.id());
++
+         if is_maximized {
+           // Dequeue the window from redraw if it's maximized, since the
+           // window is already in the correct state.
+@@ -122,6 +124,8 @@ pub fn handle_window_moved_or_resized_end(
+           config,
+         )?;
+       }
++
++      state.clear_window_drag_state(window.id());
+     }
+     WindowContainer::TilingWindow(window) => {
+       finish_tiling_window_drag(window, &active_drag, state)?;
+@@ -156,7 +160,7 @@ fn finish_tiling_window_drag(
+       state,
+     )?;
+     state.clear_window_drag_state(window.id());
+-  } else {
++  } else if is_resize {
+     state.clear_window_drag_state(window.id());
+ 
+     // Update the window's size from its actual frame dimensions.
+@@ -166,6 +170,8 @@ fn finish_tiling_window_drag(
+       Some(LengthValue::from_px(frame.height())),
+       state,
+     )?;
++  } else {
++    state.clear_window_drag_state(window.id());
+   }
+ 
+   window.set_active_drag(None);
+@@ -178,3 +184,72 @@ fn finish_tiling_window_drag(
+ 
+   Ok(())
+ }
++
++#[cfg(test)]
++mod tests {
++  use tokio::sync::mpsc;
++  use wm_common::{ActiveDrag, ActiveDragOperation};
++  use wm_platform::{Dispatcher, Rect};
++
++  use super::finish_tiling_window_drag;
++  use crate::{
++    commands::container::{attach_container, set_focused_descendant},
++    models::{Monitor, TilingWindow, Workspace},
++    traits::{TilingSizeGetters, WindowGetters},
++    user_config::UserConfig,
++    wm_state::WmState,
++  };
++
++  #[test]
++  fn aborted_min_size_move_drag_preserves_tiling_size() {
++    let (event_tx, _event_rx) = mpsc::unbounded_channel();
++    let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
++    let mut state = WmState::new(Dispatcher::mock(), event_tx, exit_tx);
++    let config = UserConfig::mock();
++
++    let workspace = Workspace::mock()
++      .gaps_config(config.value.gaps.clone())
++      .call();
++    let monitor = Monitor::mock()
++      .bounds(Rect::from_xy(0, 0, 1920, 1080))
++      .working_area(Rect::from_xy(0, 0, 1920, 1032))
++      .workspaces(vec![workspace.clone()])
++      .call();
++    attach_container(
++      &monitor.into(),
++      &state.root_container.clone().into(),
++      None,
++    )
++    .unwrap();
++    set_focused_descendant(&workspace.clone().into(), None);
++
++    let win = TilingWindow::mock()
++      .tiling_size(0.25)
++      .gaps_config(config.value.gaps.clone())
++      .call();
++    let sibling = TilingWindow::mock()
++      .tiling_size(0.75)
++      .gaps_config(config.value.gaps.clone())
++      .call();
++    attach_container(&win.clone().into(), &workspace.clone().into(), None)
++      .unwrap();
++    attach_container(&sibling.into(), &workspace.into(), None).unwrap();
++
++    // Simulate OS min-size expansion during a sub-threshold Move click.
++    win.update_native_properties(|props| {
++      props.frame = Rect::from_xy(0, 0, 800, 1032);
++    });
++    let active_drag = ActiveDrag {
++      operation: Some(ActiveDragOperation::Move),
++      is_from_floating: false,
++      initial_position: Rect::from_xy(0, 0, 480, 1032),
++      origin_void_id: None,
++    };
++    win.set_active_drag(Some(active_drag.clone()));
++
++    finish_tiling_window_drag(&win, &active_drag, &mut state).unwrap();
++
++    assert!((win.tiling_size() - 0.25).abs() < 0.001);
++    assert!(win.active_drag().is_none());
++  }
++}
+diff --git a/packages/wm/src/wm_state.rs b/packages/wm/src/wm_state.rs
+index 96ae614a..fe422d03 100644
+--- a/packages/wm/src/wm_state.rs
++++ b/packages/wm/src/wm_state.rs
+@@ -9,7 +9,9 @@ use wm_platform::{
+   Direction, Dispatcher, Display, NativeWindow, Point, Rect,
+ };
+ #[cfg(target_os = "windows")]
+-use wm_platform::{NativeWindowWindowsExt, OpacityValue};
++use wm_platform::{
++  NativeWindowWindowsExt, OpacityValue, WindowHitTest, WindowId,
++};
+ 
+ use crate::{
+   commands::{
+@@ -27,12 +29,26 @@ use crate::{
+   user_config::UserConfig,
+ };
+ 
++#[cfg(target_os = "windows")]
++#[derive(Clone, Debug)]
++pub struct LeftButtonDownHit {
++  pub window_id: Uuid,
++  pub cursor: Point,
++  pub hit_test: WindowHitTest,
++  pub is_near_resize_border: bool,
++  pub timestamp: Instant,
++}
++
+ #[cfg(target_os = "windows")]
+ #[derive(Clone, Debug)]
+ pub struct PendingMaximizeDrag {
+   pub window_id: Uuid,
++  pub window_handle: WindowId,
+   pub start_cursor: Point,
+   pub max_frame: Rect,
++  pub requires_capture_release: bool,
++  pub start_capture_seq: u64,
++  pub started_captured: bool,
+ }
+ 
+ #[cfg(target_os = "windows")]
+@@ -41,6 +57,11 @@ pub struct ManualWindowDrag {
+   pub window_id: Uuid,
+   pub cursor_offset_x: i32,
+   pub cursor_offset_y: i32,
++  pub restored_width: i32,
++  pub restored_height: i32,
++  pub started_at: Instant,
++  pub did_sw_restore_fallback: bool,
++  pub did_confirm_restored_size: bool,
+ }
+ 
+ #[derive(Clone, Debug)]
+@@ -93,6 +114,11 @@ pub struct WmState {
+   /// Whether the OS focused window is the same as the WM focused window.
+   pub is_focus_synced: bool,
+ 
++  /// Cached left-mouse-down hit classification for disambiguating
++  /// move vs resize drags on min-size-constrained windows.
++  #[cfg(target_os = "windows")]
++  pub last_left_button_down: Option<LeftButtonDownHit>,
++
+   /// Pending titlebar click on a maximized window awaiting drag start.
+   #[cfg(target_os = "windows")]
+   pub pending_maximize_drag: Option<PendingMaximizeDrag>,
+@@ -102,6 +128,9 @@ pub struct WmState {
+   #[cfg(target_os = "windows")]
+   pub active_manual_drag: Option<ManualWindowDrag>,
+ 
++  /// Cursor position captured when the active native drag began.
++  pub active_drag_start_cursor: Option<(Uuid, Point)>,
++
+   /// Active live tiling resize state tracking latched drag edges.
+   pub live_resize_state: Option<LiveResizeState>,
+ 
+@@ -133,9 +162,12 @@ impl WmState {
+       is_paused: false,
+       is_focus_synced: false,
+       #[cfg(target_os = "windows")]
++      last_left_button_down: None,
++      #[cfg(target_os = "windows")]
+       pending_maximize_drag: None,
+       #[cfg(target_os = "windows")]
+       active_manual_drag: None,
++      active_drag_start_cursor: None,
+       live_resize_state: None,
+       has_initialized: false,
+       event_tx,
+@@ -168,6 +200,14 @@ impl WmState {
+       }
+     }
+ 
++    if self
++      .active_drag_start_cursor
++      .as_ref()
++      .is_some_and(|(drag_window_id, _)| *drag_window_id == window_id)
++    {
++      self.active_drag_start_cursor = None;
++    }
++
+     if self
+       .live_resize_state
+       .as_ref()

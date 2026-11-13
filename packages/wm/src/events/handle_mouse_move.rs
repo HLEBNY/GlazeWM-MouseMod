@@ -1,3 +1,6 @@
+#[cfg(target_os = "windows")]
+use std::time::{Duration, Instant};
+
 use anyhow::Context;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use wm_common::try_warn;
@@ -6,7 +9,7 @@ use wm_common::{
   ActiveDrag, ActiveDragOperation, FloatingStateConfig, WindowState,
 };
 #[cfg(target_os = "windows")]
-use wm_platform::{NativeWindowWindowsExt, Point, Rect};
+use wm_platform::{NativeWindowWindowsExt, Point, Rect, WindowHitTest};
 use wm_platform::{MouseButton, MouseEvent};
 
 #[cfg(target_os = "macos")]
@@ -18,7 +21,7 @@ use crate::{
   },
   events::update_floating_window_position,
   models::WindowContainer,
-  wm_state::{ManualWindowDrag, PendingMaximizeDrag},
+  wm_state::{LeftButtonDownHit, ManualWindowDrag, PendingMaximizeDrag},
 };
 use crate::{
   commands::container::set_focused_descendant,
@@ -113,10 +116,7 @@ pub fn handle_mouse_move(
       }
       #[cfg(target_os = "windows")]
       {
-        state
-          .dispatcher
-          .window_from_point(position)?
-          .and_then(|native| state.window_from_native(&native))
+        resolve_managed_window_at_point(position, state)?
       }
     };
 
@@ -172,6 +172,7 @@ fn handle_windows_mouse_button(
       position,
       ..
     } => {
+      state.last_left_button_down = None;
       state.pending_maximize_drag = None;
       if state.active_manual_drag.is_some() {
         finish_manual_drag(Some(position), state, config)?;
@@ -183,12 +184,73 @@ fn handle_windows_mouse_button(
 }
 
 #[cfg(target_os = "windows")]
+fn resolve_managed_window_at_point(
+  position: &Point,
+  state: &WmState,
+) -> anyhow::Result<Option<WindowContainer>> {
+  const MAX_OWNER_HOPS: usize = 8;
+
+  let Some(native_window) = state.dispatcher.window_from_point(position)?
+  else {
+    return Ok(None);
+  };
+
+  if let Some(window) = state.window_from_native(&native_window) {
+    return Ok(Some(window));
+  }
+
+  if !native_window.is_non_standalone_overlay()
+    || !native_window.is_overlay_hit_passthrough(position)
+  {
+    return Ok(None);
+  }
+
+  let mut current = native_window;
+  for _ in 0..MAX_OWNER_HOPS {
+    let Some(owner) = current.owner_window() else {
+      break;
+    };
+    if owner.id() == current.id() {
+      break;
+    }
+    if let Some(window) = state.window_from_native(&owner) {
+      return Ok(Some(window));
+    }
+    current = owner;
+  }
+
+  Ok(None)
+}
+
+#[cfg(target_os = "windows")]
+fn is_point_near_resize_border(
+  position: &Point,
+  frame: &Rect,
+  dpi: u32,
+) -> bool {
+  let dpi_i32 = i32::try_from(dpi).unwrap_or(96);
+  let side_margin = ((12 * dpi_i32) / 96).clamp(10, 24);
+  let top_margin = ((8 * dpi_i32) / 96).clamp(6, 16);
+  let grip_size = ((32 * dpi_i32) / 96).clamp(24, 64);
+
+  let near_left = position.x <= frame.left + side_margin;
+  let near_right = position.x >= frame.right - side_margin;
+  let near_bottom = position.y >= frame.bottom - side_margin;
+  let near_top = position.y <= frame.top + top_margin;
+  let in_size_grip = position.x >= frame.right - grip_size
+    && position.y >= frame.bottom - grip_size;
+
+  near_left || near_right || near_bottom || near_top || in_size_grip
+}
+
+#[cfg(target_os = "windows")]
 fn handle_windows_left_down(
   position: &Point,
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
   state.pending_maximize_drag = None;
+  state.last_left_button_down = None;
 
   if state.active_manual_drag.is_some() {
     finish_manual_drag(Some(position), state, config)?;
@@ -199,35 +261,164 @@ fn handle_windows_left_down(
     return Ok(());
   }
 
-  let Some(native_window) = state.dispatcher.window_from_point(position)?
+  let Some(window) = resolve_managed_window_at_point(position, state)?
   else {
     return Ok(());
   };
 
-  let Some(window) = state.window_from_native(&native_window) else {
+  let native = window.native();
+  let hit_test = native.hit_test_at_point(position);
+  let frame = native
+    .frame()
+    .unwrap_or_else(|_| window.native_properties().frame);
+  let dpi = native.dpi();
+  let is_maximized = native.is_maximized().unwrap_or(false);
+  let window_handle = native.id();
+  drop(native);
+
+  let is_near_resize_border =
+    is_point_near_resize_border(position, &frame, dpi);
+
+  state.last_left_button_down = Some(LeftButtonDownHit {
+    window_id: window.id(),
+    cursor: position.clone(),
+    hit_test,
+    is_near_resize_border,
+    timestamp: Instant::now(),
+  });
+
+  if !is_maximized {
     return Ok(());
+  }
+
+  let dpi_i32 = i32::try_from(dpi).unwrap_or(96);
+  let top_bar_band_px = ((56 * dpi_i32) / 96).clamp(48, 120);
+
+  let (arm_pending, requires_capture_release) = match hit_test {
+    WindowHitTest::Caption => (true, false),
+    WindowHitTest::Client => {
+      let in_top_band = position.y >= frame.top
+        && position.y <= frame.top + top_bar_band_px;
+      (in_top_band, true)
+    }
+    WindowHitTest::ResizeBorder | WindowHitTest::Other => (false, false),
   };
 
-  if !window.native().is_maximized().unwrap_or(false) {
+  if !arm_pending {
     return Ok(());
   }
 
-  if !window.native().is_caption_at_point(position) {
-    return Ok(());
-  }
-
-  let max_frame = match window.native().frame() {
-    Ok(frame) => frame,
-    Err(_) => window.native_properties().frame,
+  let (start_capture_seq, started_captured) = if requires_capture_release {
+    state.dispatcher.capture_snapshot(window_handle)
+  } else {
+    (0, false)
   };
 
   state.pending_maximize_drag = Some(PendingMaximizeDrag {
     window_id: window.id(),
+    window_handle,
     start_cursor: position.clone(),
-    max_frame,
+    max_frame: frame,
+    requires_capture_release,
+    start_capture_seq,
+    started_captured,
   });
 
   Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn handle_active_manual_drag(
+  drag: &ManualWindowDrag,
+  position: &Point,
+  pressed_buttons: &wm_platform::PressedButtons,
+  state: &mut WmState,
+  config: &UserConfig,
+) -> anyhow::Result<bool> {
+  if !pressed_buttons.contains(&MouseButton::Left)
+    || !state.dispatcher.is_mouse_down(&MouseButton::Left)
+  {
+    finish_manual_drag(Some(position), state, config)?;
+    return Ok(false);
+  }
+
+  let Some(window) = state.window_by_id(drag.window_id) else {
+    state.active_manual_drag = None;
+    state.dispatcher.hide_snap_overlay();
+    return Ok(false);
+  };
+
+  let native = window.native();
+  if !native.is_valid() {
+    state.active_manual_drag = None;
+    state.dispatcher.hide_snap_overlay();
+    return Ok(false);
+  }
+
+  let target_x = position.x - drag.cursor_offset_x;
+  let target_y = position.y - drag.cursor_offset_y;
+  let is_maximized = native.is_maximized().unwrap_or(false);
+  let mut did_sw_restore_fallback = drag.did_sw_restore_fallback;
+  let mut did_confirm_restored_size = drag.did_confirm_restored_size;
+
+  if is_maximized {
+    if !did_sw_restore_fallback
+      && drag.started_at.elapsed() >= Duration::from_millis(40)
+    {
+      let _ = native.restore(None);
+      did_sw_restore_fallback = true;
+    }
+
+    let target_rect = Rect::from_xy(
+      target_x,
+      target_y,
+      drag.restored_width,
+      drag.restored_height,
+    );
+    let _ = native.set_bounds_preserving_zorder(&target_rect);
+  } else if !did_confirm_restored_size {
+    let current_rect = native
+      .frame_with_shadows()
+      .unwrap_or_else(|_| window.native_properties().frame);
+    if (current_rect.width() - drag.restored_width).abs() <= 40
+      && (current_rect.height() - drag.restored_height).abs() <= 40
+    {
+      did_confirm_restored_size = true;
+      let _ = native.move_without_resize(target_x, target_y);
+    } else {
+      let target_rect = Rect::from_xy(
+        target_x,
+        target_y,
+        drag.restored_width,
+        drag.restored_height,
+      );
+      let _ = native.set_bounds_preserving_zorder(&target_rect);
+    }
+  } else {
+    let _ = native.move_without_resize(target_x, target_y);
+  }
+
+  let shadow_borders = if is_maximized {
+    None
+  } else {
+    native.shadow_borders().ok()
+  };
+  drop(native);
+
+  if let Some(active_drag) = state.active_manual_drag.as_mut() {
+    active_drag.did_sw_restore_fallback = did_sw_restore_fallback;
+    active_drag.did_confirm_restored_size = did_confirm_restored_size;
+  }
+
+  if let Some(shadow_borders) = shadow_borders {
+    window.update_native_properties(|properties| {
+      properties.is_maximized = false;
+      properties.shadow_borders = shadow_borders;
+    });
+  }
+
+  update_drag_snap_preview(&window, Some(position), state)?;
+  Ok(true)
 }
 
 #[cfg(target_os = "windows")]
@@ -240,48 +431,13 @@ fn handle_drag_move(
   const DRAG_THRESHOLD_PX: i32 = 10;
 
   if let Some(drag) = state.active_manual_drag.clone() {
-    if !pressed_buttons.contains(&MouseButton::Left)
-      || !state.dispatcher.is_mouse_down(&MouseButton::Left)
-    {
-      finish_manual_drag(Some(position), state, config)?;
-      return Ok(false);
-    }
-
-    let Some(window) = state.window_by_id(drag.window_id) else {
-      state.active_manual_drag = None;
-      state.dispatcher.hide_snap_overlay();
-      return Ok(false);
-    };
-
-    let native = window.native();
-    if !native.is_valid() {
-      state.active_manual_drag = None;
-      state.dispatcher.hide_snap_overlay();
-      return Ok(false);
-    }
-
-    let _ = native.move_without_resize(
-      position.x - drag.cursor_offset_x,
-      position.y - drag.cursor_offset_y,
+    return handle_active_manual_drag(
+      &drag,
+      position,
+      pressed_buttons,
+      state,
+      config,
     );
-    let is_maximized = native.is_maximized().unwrap_or(false);
-    let shadow_borders = if is_maximized {
-      None
-    } else {
-      native.shadow_borders().ok()
-    };
-    drop(native);
-
-    if let Some(shadow_borders) = shadow_borders {
-      window.update_native_properties(|properties| {
-        properties.is_maximized = false;
-        properties.shadow_borders = shadow_borders;
-      });
-    }
-
-    update_drag_snap_preview(&window, Some(position), state)?;
-
-    return Ok(true);
   }
 
   let Some(pending) = state.pending_maximize_drag.clone() else {
@@ -301,11 +457,44 @@ fn handle_drag_move(
     return Ok(false);
   }
 
-  state.pending_maximize_drag = None;
-
   let Some(window) = state.window_by_id(pending.window_id) else {
+    state.pending_maximize_drag = None;
     return Ok(false);
   };
+
+  if pending.requires_capture_release {
+    let (had_capture_cycle, had_dragdrop) =
+      state.dispatcher.capture_cycle_since(
+        pending.window_handle,
+        pending.start_capture_seq,
+        pending.started_captured,
+      );
+
+    if had_dragdrop {
+      state.pending_maximize_drag = None;
+      return Ok(false);
+    }
+
+    if window.active_drag().is_some()
+      || window.native().is_in_native_movesize()
+      || !window.native().is_maximized().unwrap_or(false)
+    {
+      state.pending_maximize_drag = None;
+      return Ok(false);
+    }
+
+    if !had_capture_cycle
+      || !window.native().is_ready_for_client_maximize_drag()
+    {
+      return Ok(false);
+    }
+
+    state.pending_maximize_drag = None;
+    start_maximize_drag(window, &pending, position, state, config)?;
+    return Ok(true);
+  }
+
+  state.pending_maximize_drag = None;
 
   // If Windows Snap already entered its native modal drag loop, yield to
   // native tracking instead of duplicating the drag.
@@ -393,7 +582,7 @@ fn start_maximize_drag(
 
   let native = window.native();
   native.restore(Some(&outer_rect))?;
-  let _ = native.move_without_resize(outer_rect.left, outer_rect.top);
+  let _ = native.set_bounds_preserving_zorder(&outer_rect);
   drop(native);
 
   window.set_floating_placement(restored_frame.clone());
@@ -427,6 +616,11 @@ fn start_maximize_drag(
     window_id: window.id(),
     cursor_offset_x: position.x - outer_rect.left,
     cursor_offset_y: position.y - outer_rect.top,
+    restored_width: outer_rect.width(),
+    restored_height: outer_rect.height(),
+    started_at: Instant::now(),
+    did_sw_restore_fallback: false,
+    did_confirm_restored_size: false,
   });
 
   Ok(())
@@ -445,6 +639,7 @@ fn finish_manual_drag(
   };
 
   let Some(window) = state.window_by_id(drag.window_id) else {
+    state.clear_window_drag_state(drag.window_id);
     return Ok(());
   };
 
@@ -474,6 +669,7 @@ fn finish_manual_drag(
     WindowContainer::NonTilingWindow(non_tiling),
   ) = (active_drag, &window)
   {
+    let finished_id = non_tiling.id();
     finalize_move_drag(
       non_tiling,
       frame,
@@ -482,8 +678,11 @@ fn finish_manual_drag(
       state,
       config,
     )?;
+    state.clear_window_drag_state(finished_id);
   } else {
+    let finished_id = window.id();
     window.set_active_drag(None);
+    state.clear_window_drag_state(finished_id);
 
     if let WindowContainer::NonTilingWindow(non_tiling) = window {
       let nearest_monitor = state
