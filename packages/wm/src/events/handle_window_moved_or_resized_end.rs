@@ -7,10 +7,12 @@ use wm_platform::LengthValue;
 
 use crate::{
   commands::window::{
-    collapse_origin_void, finalize_move_drag, set_window_size,
-    update_window_state,
+    collapse_origin_void, finalize_move_drag, finish_single_axis_drag,
+    set_window_size, update_window_state,
   },
-  events::{update_floating_window_position, update_live_resize},
+  events::{
+    update_floating_window_position, update_live_resize_with_finalize,
+  },
   models::{TilingWindow, WindowContainer},
   traits::{CommonGetters, WindowGetters},
   user_config::UserConfig,
@@ -128,7 +130,11 @@ pub fn handle_window_moved_or_resized_end(
       state.clear_window_drag_state(window.id());
     }
     WindowContainer::TilingWindow(window) => {
-      finish_tiling_window_drag(window, &active_drag, state)?;
+      if state.is_single_axis_drag_window(window.id()) {
+        finish_single_axis_drag(None, state, config)?;
+      } else {
+        finish_tiling_window_drag(window, &active_drag, state)?;
+      }
     }
   }
 
@@ -151,12 +157,16 @@ fn finish_tiling_window_drag(
   let is_live_resize =
     is_resize && state.is_live_resize_window(window.id());
 
-  if is_live_resize {
+  let mut resized_workspace_redraw = false;
+
+  if is_live_resize || (is_resize && frame != active_drag.initial_position)
+  {
     let container: WindowContainer = window.clone().into();
-    update_live_resize(
+    resized_workspace_redraw = update_live_resize_with_finalize(
       &container,
       &frame,
       &active_drag.initial_position,
+      true,
       state,
     )?;
     state.clear_window_drag_state(window.id());
@@ -175,6 +185,14 @@ fn finish_tiling_window_drag(
   }
 
   window.set_active_drag(None);
+
+  if resized_workspace_redraw {
+    if let Some(workspace) = window.workspace() {
+      state
+        .pending_sync
+        .queue_containers_to_redraw(workspace.tiling_children());
+    }
+  }
 
   // Redraw the window so it snaps back when:
   // - It is the only tiling window in the workspace.

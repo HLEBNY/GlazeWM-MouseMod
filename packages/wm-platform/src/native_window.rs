@@ -419,6 +419,22 @@ pub trait NativeWindowWindowsExt {
   ///
   /// This method is only available on Windows.
   fn is_ready_for_client_maximize_drag(&self) -> bool;
+
+  /// Posts a synthetic `WM_LBUTTONUP` message to exit the native Win32
+  /// move/size modal loop while preserving physical mouse state.
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on Windows.
+  fn cancel_native_movesize(&self);
+
+  /// Raises this window to `HWND_TOP` at `rect` synchronously without
+  /// forcing focus activation.
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on Windows.
+  fn raise_to_top_at_bounds(&self, rect: &Rect) -> crate::Result<()>;
 }
 
 #[cfg(target_os = "windows")]
@@ -570,6 +586,14 @@ impl NativeWindowWindowsExt for NativeWindow {
 
   fn is_ready_for_client_maximize_drag(&self) -> bool {
     self.inner.is_ready_for_client_maximize_drag()
+  }
+
+  fn cancel_native_movesize(&self) {
+    self.inner.cancel_native_movesize();
+  }
+
+  fn raise_to_top_at_bounds(&self, rect: &Rect) -> crate::Result<()> {
+    self.inner.raise_to_top_at_bounds(rect)
   }
 }
 

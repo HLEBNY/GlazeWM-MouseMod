@@ -27,7 +27,7 @@ use crate::{
     TilingSizeGetters, WindowGetters,
   },
   user_config::UserConfig,
-  wm_state::WmState,
+  wm_state::{SingleAxisKind, WmState},
 };
 
 /// Screen-edge and corner zones active during mouse move drags.
@@ -163,6 +163,126 @@ pub fn detect_screen_zone(
   None
 }
 
+/// Detects breakaway snap/maximize zones during a single-axis tiled move
+/// drag, gating perpendicular edges so sliding along the locked track to a
+/// grid edge never triggers an unintended corner/edge breakaway.
+#[must_use]
+pub fn detect_single_axis_breakaway_zone(
+  cursor: &Point,
+  working_area: &Rect,
+  monitor_bounds: Option<&Rect>,
+  axis: SingleAxisKind,
+  start_cursor: &Point,
+) -> Option<ScreenZone> {
+  let containment = monitor_bounds.unwrap_or(working_area);
+  if !containment.contains_point(cursor) {
+    return None;
+  }
+
+  let edge_px = (working_area.width().min(working_area.height()) / 50)
+    .clamp(14, 24);
+  let corner_w = (working_area.width() / 6).clamp(100, 200);
+  let corner_h = (working_area.height() / 5).clamp(100, 200);
+  let rail_px = 5;
+  let pull_away_px = 36;
+  let third_w = working_area.width() / 3;
+  let mid_left = working_area.left + third_w;
+  let mid_right = working_area.right - third_w;
+
+  match axis {
+    SingleAxisKind::Horizontal => {
+      let near_top_rail = cursor.y <= working_area.top + rail_px
+        && (start_cursor.y > working_area.top + rail_px
+          || cursor.y <= working_area.top + 1);
+      let near_bottom = cursor.y >= working_area.bottom - 1 - edge_px;
+      let near_left = cursor.x <= working_area.left + edge_px;
+      let near_right = cursor.x >= working_area.right - 1 - edge_px;
+      let pulled_upper_corner = (cursor.y - start_cursor.y) >= pull_away_px
+        && cursor.y < working_area.top + corner_h;
+
+      if (near_top_rail
+        && (near_left || cursor.x < working_area.left + corner_w))
+        || (near_left && pulled_upper_corner)
+      {
+        return Some(ScreenZone::TopLeft);
+      }
+      if (near_top_rail
+        && (near_right || cursor.x >= working_area.right - corner_w))
+        || (near_right && pulled_upper_corner)
+      {
+        return Some(ScreenZone::TopRight);
+      }
+      if near_bottom
+        && (near_left || cursor.x < working_area.left + corner_w)
+      {
+        return Some(ScreenZone::BottomLeft);
+      }
+      if near_bottom
+        && (near_right || cursor.x >= working_area.right - corner_w)
+      {
+        return Some(ScreenZone::BottomRight);
+      }
+      if near_top_rail && cursor.x >= mid_left && cursor.x <= mid_right {
+        return Some(ScreenZone::TopCenter);
+      }
+      if near_top_rail {
+        return Some(ScreenZone::Top);
+      }
+      if near_bottom {
+        return Some(ScreenZone::Bottom);
+      }
+      None
+    }
+    SingleAxisKind::Vertical => {
+      let near_left_rail = cursor.x <= working_area.left + rail_px
+        && (start_cursor.x > working_area.left + rail_px
+          || cursor.x <= working_area.left + 1);
+      let near_right_rail = cursor.x >= working_area.right - 1 - rail_px
+        && (start_cursor.x < working_area.right - 1 - rail_px
+          || cursor.x >= working_area.right - 2);
+      let near_top = cursor.y <= working_area.top + edge_px;
+      let near_bottom = cursor.y >= working_area.bottom - 1 - edge_px;
+      let pulled_horiz = (cursor.x - start_cursor.x).abs() >= pull_away_px;
+
+      if (near_top
+        && (near_left_rail
+          || (pulled_horiz && cursor.x < working_area.left + corner_w)))
+        || (near_left_rail && cursor.y < working_area.top + corner_h)
+      {
+        return Some(ScreenZone::TopLeft);
+      }
+      if (near_top
+        && (near_right_rail
+          || (pulled_horiz && cursor.x >= working_area.right - corner_w)))
+        || (near_right_rail && cursor.y < working_area.top + corner_h)
+      {
+        return Some(ScreenZone::TopRight);
+      }
+      if (near_bottom
+        && (near_left_rail
+          || (pulled_horiz && cursor.x < working_area.left + corner_w)))
+        || (near_left_rail && cursor.y >= working_area.bottom - corner_h)
+      {
+        return Some(ScreenZone::BottomLeft);
+      }
+      if (near_bottom
+        && (near_right_rail
+          || (pulled_horiz && cursor.x >= working_area.right - corner_w)))
+        || (near_right_rail && cursor.y >= working_area.bottom - corner_h)
+      {
+        return Some(ScreenZone::BottomRight);
+      }
+      if near_left_rail {
+        return Some(ScreenZone::Left);
+      }
+      if near_right_rail {
+        return Some(ScreenZone::Right);
+      }
+      None
+    }
+  }
+}
+
 /// Resolves the drop target for `dragged_window` at `cursor` under the
 /// active drag's origin rules.
 ///
@@ -257,6 +377,24 @@ pub fn compute_drop_preview_rect(
   active_drag: &ActiveDrag,
   state: &WmState,
 ) -> anyhow::Result<Option<Rect>> {
+  compute_drop_preview_rect_at(
+    target,
+    dragged_window,
+    active_drag,
+    None,
+    state,
+  )
+}
+
+/// Computes the exact preview rect in screen coordinates for `target` at
+/// an optional cursor position (used to disambiguate multiple side voids).
+pub fn compute_drop_preview_rect_at(
+  target: &DropTarget,
+  dragged_window: &WindowContainer,
+  active_drag: &ActiveDrag,
+  cursor: Option<&Point>,
+  state: &WmState,
+) -> anyhow::Result<Option<Rect>> {
   let border_delta = if state.dispatcher.is_openglass_active() {
     dragged_window.total_border_delta()?
   } else {
@@ -329,10 +467,14 @@ pub fn compute_drop_preview_rect(
       };
       let monitor = workspace.monitor().context("No monitor.")?;
       let working_area = monitor.native_properties().working_area;
+      let tiling_id =
+        dragged_window.as_tiling_window().map(CommonGetters::id);
+      let exclude_id = active_drag.origin_void_id.or(tiling_id);
       let preview = compute_snap_zone_preview_rect(
         &workspace,
         *zone,
-        active_drag.origin_void_id,
+        exclude_id,
+        cursor,
       )?
       .apply_delta(&border_delta, None);
       Ok(Some(clamp_rect_edges(&preview, &working_area)))
@@ -367,8 +509,13 @@ pub fn update_drag_snap_preview(
     return Ok(());
   };
 
-  let Some(rect) =
-    compute_drop_preview_rect(&target, window, &active_drag, state)?
+  let Some(rect) = compute_drop_preview_rect_at(
+    &target,
+    window,
+    &active_drag,
+    Some(&cursor),
+    state,
+  )?
   else {
     state.dispatcher.hide_snap_overlay();
     return Ok(());
@@ -445,6 +592,7 @@ pub fn finalize_move_drag(
       workspace_id,
       zone,
       active_drag,
+      Some(&cursor),
       state,
       config,
     ),
@@ -685,6 +833,7 @@ fn commit_snap_zone(
   workspace_id: Uuid,
   zone: ScreenZone,
   active_drag: &ActiveDrag,
+  cursor: Option<&Point>,
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<WindowContainer> {
@@ -704,6 +853,7 @@ fn commit_snap_zone(
     &workspace,
     zone,
     origin_void_in_target,
+    cursor,
     &ws_rect,
     h_gap,
     v_gap,
@@ -1018,22 +1168,32 @@ fn insert_into_populated_workspace(
 fn compute_snap_zone_preview_rect(
   workspace: &Workspace,
   zone: ScreenZone,
-  origin_void_id: Option<Uuid>,
+  exclude_slot_id: Option<Uuid>,
+  cursor: Option<&Point>,
 ) -> anyhow::Result<Rect> {
   let ws_rect = workspace.multi_window_workspace_rect()?;
   let (h_gap, v_gap) = workspace.workspace_inner_gaps()?;
 
-  let origin_in_ws = origin_void_id
-    .filter(|id| super::void_slot_by_id(workspace, *id).is_some());
+  let origin_in_ws = exclude_slot_id.filter(|id| {
+    workspace
+      .descendants()
+      .any(|c| c.id() == *id && c.as_tiling_container().is_ok())
+  });
 
-  if let Some(void_match) = find_matching_void(
-    workspace,
-    zone,
-    origin_in_ws,
-    &ws_rect,
-    h_gap,
-    v_gap,
-  )? {
+  let has_other_real_windows = workspace
+    .tiling_windows()
+    .any(|win| Some(win.id()) != origin_in_ws);
+
+  if has_other_real_windows {
+    if let Some(void_match) = find_matching_void(
+      workspace,
+      zone,
+      origin_in_ws,
+      cursor,
+      &ws_rect,
+      h_gap,
+      v_gap,
+    )? {
     return match void_match {
       VoidMatch::Exact(slot) => slot.to_rect(),
       VoidMatch::SplitHalf {
@@ -1046,12 +1206,18 @@ fn compute_snap_zone_preview_rect(
         Ok(split_half_rect(&slot_rect, &split_dir, insert_first, gap))
       }
     };
+    }
   }
 
-  let effective_children: Vec<TilingContainer> = workspace
-    .tiling_children()
-    .filter(|c| Some(c.id()) != origin_in_ws)
-    .collect();
+  let effective_children: Vec<TilingContainer> =
+    if has_other_real_windows {
+    workspace
+      .tiling_children()
+      .filter(|c| Some(c.id()) != origin_in_ws)
+      .collect()
+  } else {
+    Vec::new()
+  };
 
   if effective_children.is_empty()
     || (effective_children.len() == 1
@@ -1140,43 +1306,81 @@ fn compute_populated_snap_zone_preview(
   }
 }
 
+#[allow(clippy::too_many_lines)]
 fn find_matching_void(
   workspace: &Workspace,
   zone: ScreenZone,
   origin_void_id: Option<Uuid>,
+  cursor: Option<&Point>,
   ws_rect: &Rect,
   h_gap: i32,
   v_gap: i32,
 ) -> anyhow::Result<Option<VoidMatch>> {
+  const MIN_VOID_SPAN_PX: i32 = 32;
+
   let slots: Vec<VoidSlot> = workspace
     .descendants()
     .filter_map(|c| c.as_void().cloned())
     .filter(|slot| Some(slot.id()) != origin_void_id)
     .collect();
 
-  for slot in slots {
-    let r = slot.to_rect()?;
-    let near_l = r.left <= ws_rect.left + h_gap + 6;
-    let near_r = r.right >= ws_rect.right - h_gap - 6;
-    let near_t = r.top <= ws_rect.top + v_gap + 6;
-    let near_b = r.bottom >= ws_rect.bottom - v_gap - 6;
-    let is_full_h = r.height() >= (ws_rect.height() * 2) / 3;
-    let is_full_w = r.width() >= (ws_rect.width() * 2) / 3;
-    let is_sub_w = r.width() <= (ws_rect.width() * 3) / 4;
-    let is_sub_h = r.height() <= (ws_rect.height() * 3) / 4;
+  let mut best: Option<(u8, VoidMatch)> = None;
 
-    let matched = match zone {
-      ScreenZone::Left if near_l && is_full_h && is_sub_w => {
-        Some(VoidMatch::Exact(slot))
+  for slot in slots {
+    let rect = slot.to_rect()?;
+    if rect.width() < MIN_VOID_SPAN_PX
+      || rect.height() < MIN_VOID_SPAN_PX
+    {
+      continue;
+    }
+
+    let near_l = rect.left <= ws_rect.left + h_gap + 8;
+    let near_r = rect.right >= ws_rect.right - h_gap - 8;
+    let near_t = rect.top <= ws_rect.top + v_gap + 8;
+    let near_b = rect.bottom >= ws_rect.bottom - v_gap - 8;
+    let is_full_h = rect.height() >= (ws_rect.height() * 2) / 3;
+    let is_full_w = rect.width() >= (ws_rect.width() * 2) / 3;
+    let is_partial_w = rect.width() < ws_rect.width() - 40;
+    let is_partial_h = rect.height() < ws_rect.height() - 40;
+    let contains_y = cursor.is_some_and(|pt| {
+      pt.y >= rect.top - v_gap - 8 && pt.y <= rect.bottom + v_gap + 8
+    });
+    let contains_x = cursor.is_some_and(|pt| {
+      pt.x >= rect.left - h_gap - 8 && pt.x <= rect.right + h_gap + 8
+    });
+
+    let candidate: Option<(u8, VoidMatch)> = match zone {
+      ScreenZone::Left if near_l && is_partial_w => {
+        let rank = if contains_y {
+          0
+        } else {
+          u8::from(!is_full_h) + 1
+        };
+        Some((rank, VoidMatch::Exact(slot)))
       }
-      ScreenZone::Right if near_r && is_full_h && is_sub_w => {
-        Some(VoidMatch::Exact(slot))
+      ScreenZone::Right if near_r && is_partial_w => {
+        let rank = if contains_y {
+          0
+        } else {
+          u8::from(!is_full_h) + 1
+        };
+        Some((rank, VoidMatch::Exact(slot)))
       }
-      ScreenZone::Top if near_t && is_full_w && is_sub_h => {
-        Some(VoidMatch::Exact(slot))
+      ScreenZone::Top if near_t && is_partial_h => {
+        let rank = if contains_x {
+          0
+        } else {
+          u8::from(!is_full_w) + 1
+        };
+        Some((rank, VoidMatch::Exact(slot)))
       }
-      ScreenZone::Bottom if near_b && is_full_w && is_sub_h => {
-        Some(VoidMatch::Exact(slot))
+      ScreenZone::Bottom if near_b && is_partial_h => {
+        let rank = if contains_x {
+          0
+        } else {
+          u8::from(!is_full_w) + 1
+        };
+        Some((rank, VoidMatch::Exact(slot)))
       }
       ScreenZone::TopLeft
       | ScreenZone::TopRight
@@ -1186,20 +1390,26 @@ fn find_matching_void(
         let horiz_ok = if is_left { near_l } else { near_r };
         let vert_ok = if is_top { near_t } else { near_b };
 
-        if horiz_ok && vert_ok && is_sub_w && is_sub_h {
-          Some(VoidMatch::Exact(slot))
-        } else if horiz_ok && is_full_h && is_sub_w {
-          Some(VoidMatch::SplitHalf {
-            slot,
-            split_dir: TilingDirection::Vertical,
-            insert_first: is_top,
-          })
-        } else if vert_ok && is_full_w && is_sub_h {
-          Some(VoidMatch::SplitHalf {
-            slot,
-            split_dir: TilingDirection::Horizontal,
-            insert_first: is_left,
-          })
+        if horiz_ok && vert_ok && is_partial_w && is_partial_h {
+          Some((0, VoidMatch::Exact(slot)))
+        } else if horiz_ok && is_full_h && is_partial_w {
+          Some((
+            1,
+            VoidMatch::SplitHalf {
+              slot,
+              split_dir: TilingDirection::Vertical,
+              insert_first: is_top,
+            },
+          ))
+        } else if vert_ok && is_full_w && is_partial_h {
+          Some((
+            1,
+            VoidMatch::SplitHalf {
+              slot,
+              split_dir: TilingDirection::Horizontal,
+              insert_first: is_left,
+            },
+          ))
         } else {
           None
         }
@@ -1207,12 +1417,14 @@ fn find_matching_void(
       _ => None,
     };
 
-    if matched.is_some() {
-      return Ok(matched);
+    if let Some((rank, matched)) = candidate {
+      if best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
+        best = Some((rank, matched));
+      }
     }
   }
 
-  Ok(None)
+  Ok(best.map(|(_, matched)| matched))
 }
 
 fn find_corner_leaf(
@@ -1545,7 +1757,7 @@ mod tests {
     commands::window::{
       first_void_slot, unmanage_window, vacate_tiling_slot,
     },
-    models::Monitor,
+    models::{Container, Monitor},
   };
 
   fn setup_state() -> (WmState, UserConfig, Workspace) {
@@ -2087,5 +2299,172 @@ mod tests {
         .unwrap()
         .unwrap();
     assert_eq!(max_preview, work);
+  }
+
+  #[test]
+  fn side_void_over_three_quarters_matches_edge_drop_instead_of_half() {
+    let (mut state, config, workspace) = setup_state();
+    let ws_c: Container = workspace.clone().into();
+    workspace.set_tiling_direction(TilingDirection::Horizontal);
+
+    let void_left = VoidSlot::new(config.value.gaps.clone());
+    void_left.set_tiling_size(0.8);
+    let tile_right = TilingWindow::mock()
+      .tiling_size(0.2)
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    attach_container(&void_left.clone().into(), &ws_c, None).unwrap();
+    attach_container(&tile_right.into(), &ws_c, None).unwrap();
+
+    let floating =
+      add_floating(&workspace, Rect::from_xy(300, 300, 500, 400));
+    let drag = drag_move(true, None);
+    let left_edge = Point { x: 8, y: 500 };
+
+    let target = resolve_drop_target(
+      &floating.clone().into(),
+      &left_edge,
+      &drag,
+      &state,
+    )
+    .unwrap()
+    .unwrap();
+    let preview = compute_drop_preview_rect_at(
+      &target,
+      &floating.clone().into(),
+      &drag,
+      Some(&left_edge),
+      &state,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(preview, void_left.to_rect().unwrap());
+
+    let committed = finalize_move_drag(
+      &floating,
+      floating.floating_placement(),
+      &drag,
+      Some(&left_edge),
+      &mut state,
+      &config,
+    )
+    .unwrap();
+    assert_eq!(committed.to_rect().unwrap(), void_left.to_rect().unwrap());
+  }
+
+  #[test]
+  fn nested_side_void_matches_edge_drop() {
+    let (mut state, config, workspace) = setup_state();
+    let ws_c: Container = workspace.clone().into();
+    workspace.set_tiling_direction(TilingDirection::Horizontal);
+
+    let left_split = SplitContainer::new(
+      TilingDirection::Vertical,
+      config.value.gaps.clone(),
+    );
+    left_split.set_tiling_size(0.5);
+    let tile_right = TilingWindow::mock()
+      .tiling_size(0.5)
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    attach_container(&left_split.clone().into(), &ws_c, None).unwrap();
+    attach_container(&tile_right.into(), &ws_c, None).unwrap();
+
+    let top_left = TilingWindow::mock()
+      .tiling_size(0.5)
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let void_bl = VoidSlot::new(config.value.gaps.clone());
+    void_bl.set_tiling_size(0.5);
+    let split_c: Container = left_split.into();
+    attach_container(&top_left.into(), &split_c, None).unwrap();
+    attach_container(&void_bl.clone().into(), &split_c, None).unwrap();
+
+    let floating =
+      add_floating(&workspace, Rect::from_xy(300, 300, 500, 400));
+    let drag = drag_move(true, None);
+    let left_edge = Point { x: 8, y: 800 };
+
+    let committed = finalize_move_drag(
+      &floating,
+      floating.floating_placement(),
+      &drag,
+      Some(&left_edge),
+      &mut state,
+      &config,
+    )
+    .unwrap();
+
+    assert_eq!(committed.to_rect().unwrap(), void_bl.to_rect().unwrap());
+  }
+
+  #[test]
+  fn single_axis_breakaway_ignores_titlebar_slide_until_outer_rail() {
+    let work = Rect::from_xy(0, 0, 1920, 1032);
+    let bounds = Rect::from_xy(0, 0, 1920, 1080);
+    let start_h = Point { x: 1100, y: 18 };
+
+    assert_eq!(
+      detect_single_axis_breakaway_zone(
+        &Point { x: 12, y: 18 },
+        &work,
+        Some(&bounds),
+        SingleAxisKind::Horizontal,
+        &start_h,
+      ),
+      None
+    );
+    assert_eq!(
+      detect_single_axis_breakaway_zone(
+        &Point { x: 1912, y: 18 },
+        &work,
+        Some(&bounds),
+        SingleAxisKind::Horizontal,
+        &start_h,
+      ),
+      None
+    );
+    assert_eq!(
+      detect_single_axis_breakaway_zone(
+        &Point { x: 960, y: 2 },
+        &work,
+        Some(&bounds),
+        SingleAxisKind::Horizontal,
+        &start_h,
+      ),
+      Some(ScreenZone::TopCenter)
+    );
+    assert_eq!(
+      detect_single_axis_breakaway_zone(
+        &Point { x: 1880, y: 1025 },
+        &work,
+        Some(&bounds),
+        SingleAxisKind::Horizontal,
+        &start_h,
+      ),
+      Some(ScreenZone::BottomRight)
+    );
+
+    let start_v = Point { x: 400, y: 20 };
+    assert_eq!(
+      detect_single_axis_breakaway_zone(
+        &Point { x: 400, y: 2 },
+        &work,
+        Some(&bounds),
+        SingleAxisKind::Vertical,
+        &start_v,
+      ),
+      None
+    );
+    assert_eq!(
+      detect_single_axis_breakaway_zone(
+        &Point { x: 3, y: 500 },
+        &work,
+        Some(&bounds),
+        SingleAxisKind::Vertical,
+        &start_v,
+      ),
+      Some(ScreenZone::Left)
+    );
   }
 }

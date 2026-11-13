@@ -26,8 +26,8 @@ use windows::{
         GetForegroundWindow, GetGUIThreadInfo, GetLayeredWindowAttributes,
         GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowPlacement,
         GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-        IsWindow, IsWindowVisible, IsZoomed, SendMessageTimeoutW,
-        SendNotifyMessageW, SetForegroundWindow,
+        IsWindow, IsWindowVisible, IsZoomed, PostMessageW,
+        SendMessageTimeoutW, SendNotifyMessageW, SetForegroundWindow,
         SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPlacement,
         SetWindowPos, ShowWindowAsync, WindowFromPoint, GA_PARENT, GA_ROOT,
         GUITHREADINFO, GUI_INMENUMODE, GUI_INMOVESIZE, GUI_POPUPMENUMODE,
@@ -41,9 +41,9 @@ use windows::{
         SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING,
         SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_MAXIMIZE,
         SW_MINIMIZE, SW_RESTORE, SW_SHOWNA, WINDOWPLACEMENT,
-        WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_NCHITTEST,
-        WPF_ASYNCWINDOWPLACEMENT, WS_CAPTION, WS_DISABLED, WS_DLGFRAME,
-        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_LBUTTONUP,
+        WM_NCHITTEST, WPF_ASYNCWINDOWPLACEMENT, WS_CAPTION, WS_DISABLED,
+        WS_DLGFRAME, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
         WS_EX_TRANSPARENT, WS_THICKFRAME,
       },
     },
@@ -525,6 +525,33 @@ impl NativeWindow {
           | SWP_NOCOPYBITS
           | SWP_ASYNCWINDOWPOS
           | SWP_FRAMECHANGED,
+      )
+    }?;
+
+    Ok(())
+  }
+
+  /// Implements [`NativeWindowWindowsExt::cancel_native_movesize`].
+  pub(crate) fn cancel_native_movesize(&self) {
+    let _ = unsafe {
+      PostMessageW(self.hwnd(), WM_LBUTTONUP, WPARAM(0), LPARAM(0))
+    };
+  }
+
+  /// Implements [`NativeWindowWindowsExt::raise_to_top_at_bounds`].
+  pub(crate) fn raise_to_top_at_bounds(
+    &self,
+    rect: &Rect,
+  ) -> crate::Result<()> {
+    unsafe {
+      SetWindowPos(
+        self.hwnd(),
+        HWND_TOP,
+        rect.x(),
+        rect.y(),
+        rect.width(),
+        rect.height(),
+        SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_ASYNCWINDOWPOS,
       )
     }?;
 

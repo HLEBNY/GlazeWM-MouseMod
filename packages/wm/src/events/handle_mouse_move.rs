@@ -17,7 +17,9 @@ use crate::events::handle_window_moved_or_resized_end;
 #[cfg(target_os = "windows")]
 use crate::{
   commands::window::{
-    finalize_move_drag, update_drag_snap_preview, update_window_state,
+    finalize_move_drag, finish_single_axis_drag,
+    handle_active_single_axis_drag, update_drag_snap_preview,
+    update_window_state,
   },
   events::update_floating_window_position,
   models::WindowContainer,
@@ -174,6 +176,9 @@ fn handle_windows_mouse_button(
     } => {
       state.last_left_button_down = None;
       state.pending_maximize_drag = None;
+      if state.active_single_axis_drag.is_some() {
+        finish_single_axis_drag(Some(position), state, config)?;
+      }
       if state.active_manual_drag.is_some() {
         finish_manual_drag(Some(position), state, config)?;
       }
@@ -252,6 +257,9 @@ fn handle_windows_left_down(
   state.pending_maximize_drag = None;
   state.last_left_button_down = None;
 
+  if state.active_single_axis_drag.is_some() {
+    finish_single_axis_drag(Some(position), state, config)?;
+  }
   if state.active_manual_drag.is_some() {
     finish_manual_drag(Some(position), state, config)?;
   }
@@ -429,6 +437,15 @@ fn handle_drag_move(
   config: &UserConfig,
 ) -> anyhow::Result<bool> {
   const DRAG_THRESHOLD_PX: i32 = 10;
+
+  if state.active_single_axis_drag.is_some() {
+    return handle_active_single_axis_drag(
+      position,
+      pressed_buttons,
+      state,
+      config,
+    );
+  }
 
   if let Some(drag) = state.active_manual_drag.clone() {
     return handle_active_manual_drag(

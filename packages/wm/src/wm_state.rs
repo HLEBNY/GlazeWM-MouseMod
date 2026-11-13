@@ -64,6 +64,29 @@ pub struct ManualWindowDrag {
   pub did_confirm_restored_size: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SingleAxisKind {
+  Horizontal,
+  Vertical,
+}
+
+#[derive(Clone, Debug)]
+pub struct SingleAxisDrag {
+  pub window_id: Uuid,
+  pub workspace_id: Uuid,
+  pub monitor_id: Uuid,
+  pub axis: SingleAxisKind,
+  pub start_cursor: Point,
+  pub initial_tile_rect: Rect,
+  pub initial_outer_rect: Rect,
+  pub cursor_offset_axis: i32,
+  pub cursor_offset_x: i32,
+  pub cursor_offset_y: i32,
+  pub has_crossed_threshold: bool,
+  pub last_swap_guard: Option<(Uuid, i32, i32)>,
+  pub is_cross_monitor: bool,
+}
+
 #[derive(Clone, Debug)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct LiveResizeState {
@@ -134,6 +157,9 @@ pub struct WmState {
   /// Active live tiling resize state tracking latched drag edges.
   pub live_resize_state: Option<LiveResizeState>,
 
+  /// Active single-axis tiled move drag keeping a full-span tile in-grid.
+  pub active_single_axis_drag: Option<SingleAxisDrag>,
+
   /// Whether the initial state has been populated.
   has_initialized: bool,
 
@@ -169,6 +195,7 @@ impl WmState {
       active_manual_drag: None,
       active_drag_start_cursor: None,
       live_resize_state: None,
+      active_single_axis_drag: None,
       has_initialized: false,
       event_tx,
       exit_tx,
@@ -217,6 +244,15 @@ impl WmState {
     }
 
     if self
+      .active_single_axis_drag
+      .as_ref()
+      .is_some_and(|drag| drag.window_id == window_id)
+    {
+      self.active_single_axis_drag = None;
+      cleared_move_drag = true;
+    }
+
+    if self
       .window_by_id(window_id)
       .is_some_and(|window| window.active_drag().is_some())
     {
@@ -247,6 +283,15 @@ impl WmState {
       return false;
     };
     resize.window_id == window_id
+  }
+
+  /// Returns whether `window_id` has an active single-axis tiling drag.
+  #[must_use]
+  pub fn is_single_axis_drag_window(&self, window_id: Uuid) -> bool {
+    let Some(drag) = &self.active_single_axis_drag else {
+      return false;
+    };
+    drag.window_id == window_id
   }
 
   /// Populates the initial WM state by creating containers for all

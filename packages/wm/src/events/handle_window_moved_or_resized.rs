@@ -4,24 +4,36 @@ use std::time::Duration;
 use anyhow::Context;
 use wm_common::{
   try_warn, ActiveDrag, ActiveDragOperation, DisplayState,
-  FloatingStateConfig, FullscreenStateConfig, HideMethod, WindowState,
+  FloatingStateConfig, FullscreenStateConfig, HideMethod, TilingDirection,
+  WindowState,
 };
-#[cfg(target_os = "windows")]
-use wm_platform::{NativeWindowWindowsExt, WindowHitTest};
 #[cfg(target_os = "macos")]
 use wm_platform::{LengthValue, RectDelta};
+#[cfg(target_os = "windows")]
+use wm_platform::{NativeWindowWindowsExt, WindowHitTest};
 use wm_platform::{MouseButton, NativeWindow, Point, Rect};
 
 use crate::{
   commands::{
-    container::{flatten_split_container, move_container_within_tree},
-    window::{update_drag_snap_preview, update_window_state},
+    container::{
+      flatten_split_container, move_container_within_tree,
+      wrap_in_split_container,
+    },
+    window::{
+      absorb_void_into_sibling, finish_single_axis_drag,
+      insert_void_preserving_siblings, normalize_workspace_voids,
+      try_start_single_axis_drag, update_drag_snap_preview,
+      update_window_state,
+    },
   },
   events::handle_window_moved_or_resized_end,
-  models::{Monitor, NonTilingWindow, WindowContainer},
+  models::{
+    DirectionContainer, Monitor, NonTilingWindow, SplitContainer,
+    TilingContainer, TilingWindow, VoidSlot, WindowContainer,
+  },
   traits::{
-    CommonGetters, PositionGetters, TilingSizeGetters, WindowGetters,
-    MIN_TILING_SIZE,
+    CommonGetters, PositionGetters, TilingDirectionGetters,
+    TilingSizeGetters, WindowGetters, MIN_TILING_SIZE,
   },
   user_config::UserConfig,
   wm_state::{LiveResizeState, WmState},
@@ -88,6 +100,32 @@ pub fn handle_window_moved_or_resized(
             properties.shadow_borders = shadow_borders;
           });
         }
+      }
+
+      if state.is_single_axis_drag_window(window.id()) {
+        if is_drag_end {
+          if state.dispatcher.has_event_loop()
+            && state.dispatcher.is_mouse_down(&MouseButton::Left)
+          {
+            #[cfg(target_os = "windows")]
+            if let Some(drag) = &state.active_single_axis_drag {
+              let outer_rect = drag.initial_outer_rect.clone();
+              let native = window.native();
+              if native.is_maximized().unwrap_or(false) {
+                let _ = native.restore(Some(&outer_rect));
+              }
+              drop(native);
+              window.update_native_properties(|props| {
+                props.is_maximized = false;
+              });
+            }
+            return Ok(());
+          }
+
+          return finish_single_axis_drag(None, state, config);
+        }
+
+        return Ok(());
       }
 
       if is_drag_end {
@@ -266,7 +304,7 @@ pub fn handle_window_moved_or_resized(
       });
 
       state.active_drag_start_cursor =
-        start_cursor.map(|cursor| (window.id(), cursor));
+        start_cursor.clone().map(|cursor| (window.id(), cursor));
 
       window.set_active_drag(Some(ActiveDrag {
         operation: initial_operation,
@@ -283,6 +321,18 @@ pub fn handle_window_moved_or_resized(
         initial_position: frame_position.clone(),
         origin_void_id: None,
       }));
+
+      if initial_operation == Some(ActiveDragOperation::Move) {
+        if let WindowContainer::TilingWindow(tiling_win) = &window {
+          if try_start_single_axis_drag(
+            tiling_win,
+            start_cursor.as_ref(),
+            state,
+          )? {
+            return Ok(());
+          }
+        }
+      }
 
       #[cfg(target_os = "windows")]
       update_drag_state(&window, &frame_position, None, state, config)?;
@@ -579,6 +629,23 @@ fn update_drag_state(
       ..active_drag.clone()
     }));
 
+    if is_move && state.dispatcher.has_event_loop() {
+      if let WindowContainer::TilingWindow(tiling_win) = window {
+        let start_cursor = state
+          .active_drag_start_cursor
+          .as_ref()
+          .filter(|(id, _)| *id == window.id())
+          .map(|(_, cursor)| cursor.clone());
+        if try_start_single_axis_drag(
+          tiling_win,
+          start_cursor.as_ref(),
+          state,
+        )? {
+          return Ok(());
+        }
+      }
+    }
+
     is_move
   };
 
@@ -689,6 +756,11 @@ fn update_drag_state(
   Ok(())
 }
 
+const MIN_VOID_REMAINING_PX: i32 = 4;
+const VOID_PUSH_THROUGH_PX: i32 = -4;
+const VOID_SNAP_RELEASE_PX: i32 = 20;
+const OUTER_VOID_CREATE_MIN_PX: i32 = 16;
+
 /// Applies real-time proportional resize updates to adjacent tiling
 /// containers and queues neighboring windows for immediate redraw while
 /// leaving the actively dragged window untouched.
@@ -698,8 +770,30 @@ pub fn update_live_resize(
   initial_position: &Rect,
   state: &mut WmState,
 ) -> anyhow::Result<()> {
+  update_live_resize_with_finalize(
+    window,
+    frame_position,
+    initial_position,
+    false,
+    state,
+  )?;
+  Ok(())
+}
+
+/// Applies live resize updates across neighboring containers, adjacent
+/// `VoidSlot` absorption, and outer-edge `VoidSlot` creation. When
+/// `is_final` is `true`, voids within snap tolerance absorb flush to the
+/// screen edge or neighbor.
+#[allow(clippy::too_many_lines)]
+pub fn update_live_resize_with_finalize(
+  window: &WindowContainer,
+  frame_position: &Rect,
+  initial_position: &Rect,
+  is_final: bool,
+  state: &mut WmState,
+) -> anyhow::Result<bool> {
   let Some(tiling_window) = window.as_tiling_window() else {
-    return Ok(());
+    return Ok(false);
   };
 
   let live_state = match &mut state.live_resize_state {
@@ -738,70 +832,362 @@ pub fn update_live_resize(
 
   let visual_frame =
     frame_position.apply_delta(&window.border_delta().inverse(), None);
+  let mut mutated = false;
 
   for (is_horizontal, is_prev_edge, is_active) in edges {
     if !is_active {
       continue;
     }
 
-    let Some((container, neighbor, parent)) = tiling_window
+    if let Some((container, neighbor, parent)) = tiling_window
       .resizable_container_and_neighbor(is_horizontal, is_prev_edge)?
-    else {
-      continue;
-    };
+    {
+      if let Some(void_neighbor) = neighbor.as_void().cloned() {
+        let (changed, pushed_through) = resize_into_void_neighbor(
+          tiling_window,
+          &container,
+          &void_neighbor,
+          &parent,
+          &visual_frame,
+          is_horizontal,
+          is_prev_edge,
+          is_final,
+          state,
+        )?;
+        mutated |= changed;
 
-    let curr_rect = container.to_rect()?;
-    let delta_px = match (is_horizontal, is_prev_edge) {
-      (true, true) => curr_rect.left - visual_frame.left,
-      (true, false) => visual_frame.right - curr_rect.right,
-      (false, true) => curr_rect.top - visual_frame.top,
-      (false, false) => visual_frame.bottom - curr_rect.bottom,
-    };
-
-    if delta_px == 0 {
-      continue;
-    }
-
-    let (horizontal_gap, vertical_gap) = container.inner_gaps()?;
-    let parent_rect = parent.to_rect()?;
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    let sibling_count = container.tiling_siblings().count() as i32;
-    let available_px = if is_horizontal {
-      parent_rect.width() - horizontal_gap * sibling_count
+        if pushed_through {
+          if let Some((next_c, next_n, next_p)) = tiling_window
+            .resizable_container_and_neighbor(is_horizontal, is_prev_edge)?
+          {
+            if !next_n.is_void() {
+              mutated |= resize_real_neighbor(
+                tiling_window,
+                &next_c,
+                &next_n,
+                &next_p,
+                &visual_frame,
+                is_horizontal,
+                is_prev_edge,
+                state,
+              )?;
+            }
+          }
+        }
+      } else {
+        mutated |= resize_real_neighbor(
+          tiling_window,
+          &container,
+          &neighbor,
+          &parent,
+          &visual_frame,
+          is_horizontal,
+          is_prev_edge,
+          state,
+        )?;
+      }
     } else {
-      parent_rect.height() - vertical_gap * sibling_count
-    };
-
-    if available_px <= 0 {
-      continue;
-    }
-
-    #[allow(clippy::cast_precision_loss)]
-    let delta_size = delta_px as f32 / available_px as f32;
-    let total_pair = container.tiling_size() + neighbor.tiling_size();
-    if total_pair <= MIN_TILING_SIZE * 2.0 {
-      continue;
-    }
-
-    let new_size = (container.tiling_size() + delta_size)
-      .clamp(MIN_TILING_SIZE, total_pair - MIN_TILING_SIZE);
-    let new_neighbor_size = total_pair - new_size;
-
-    if (new_size - container.tiling_size()).abs() > 0.0005 {
-      container.set_tiling_size(new_size);
-      neighbor.set_tiling_size(new_neighbor_size);
-
-      let dragged_id = tiling_window.id();
-      let siblings = parent
-        .descendants()
-        .filter(|c| c.is_tiling_window() && c.id() != dragged_id);
-      state.pending_sync.queue_containers_to_redraw(siblings);
+      mutated |= try_create_outer_edge_void(
+        tiling_window,
+        &visual_frame,
+        is_horizontal,
+        is_prev_edge,
+        is_final,
+      )?;
     }
   }
 
-  state.pending_sync.dequeue_container_from_redraw(window.clone());
+  if !is_final {
+    state.pending_sync.dequeue_container_from_redraw(window.clone());
+  }
 
-  Ok(())
+  Ok(mutated)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn resize_into_void_neighbor(
+  tiling_window: &TilingWindow,
+  container: &TilingContainer,
+  void_neighbor: &VoidSlot,
+  parent: &DirectionContainer,
+  visual_frame: &Rect,
+  is_horizontal: bool,
+  is_prev_edge: bool,
+  is_final: bool,
+  state: &mut WmState,
+) -> anyhow::Result<(bool, bool)> {
+  let curr_rect = container.to_rect()?;
+  let void_rect = void_neighbor.to_rect()?;
+  let parent_rect = parent.to_rect()?;
+  let (h_gap, v_gap) = container.inner_gaps()?;
+  let gap = if is_horizontal { h_gap } else { v_gap };
+  let parent_len = if is_horizontal {
+    parent_rect.width()
+  } else {
+    parent_rect.height()
+  };
+
+  #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+  let sibling_count = container.tiling_siblings().count() as i32;
+  let available_px = (parent_len - gap * sibling_count).max(1);
+
+  let dragged_coord =
+    resize_edge_coord(visual_frame, is_horizontal, is_prev_edge);
+  let far_edge =
+    resize_edge_coord(&void_rect, is_horizontal, is_prev_edge);
+  let remaining_px = if is_prev_edge {
+    dragged_coord - far_edge
+  } else {
+    far_edge - dragged_coord
+  };
+
+  let pushed_through = remaining_px <= VOID_PUSH_THROUGH_PX;
+  let should_absorb =
+    pushed_through || (is_final && remaining_px <= VOID_SNAP_RELEASE_PX);
+
+  if should_absorb {
+    absorb_void_into_sibling(
+      void_neighbor,
+      container,
+      parent,
+      gap,
+      parent_len,
+    )?;
+    if let Some(workspace) = tiling_window.workspace() {
+      normalize_workspace_voids(&workspace)?;
+      let dragged_id = tiling_window.id();
+      let others = workspace
+        .tiling_windows()
+        .filter(|w| w.id() != dragged_id);
+      state.pending_sync.queue_containers_to_redraw(others);
+    }
+    return Ok((true, pushed_through));
+  }
+
+  let delta_px = resize_edge_delta_px(
+    &curr_rect,
+    visual_frame,
+    is_horizontal,
+    is_prev_edge,
+  );
+  if delta_px == 0 {
+    return Ok((false, false));
+  }
+
+  #[allow(clippy::cast_precision_loss)]
+  let available_f = available_px as f32;
+  #[allow(clippy::cast_precision_loss)]
+  let delta_size = delta_px as f32 / available_f;
+  let total_pair = container.tiling_size() + void_neighbor.tiling_size();
+  let min_container = (36.0 / available_f).max(MIN_TILING_SIZE);
+  #[allow(clippy::cast_precision_loss)]
+  let min_void = (MIN_VOID_REMAINING_PX as f32 / available_f).max(0.001);
+
+  let max_container = (total_pair - min_void).max(min_container);
+  let new_size =
+    (container.tiling_size() + delta_size)
+      .clamp(min_container, max_container);
+  let new_void_size = (total_pair - new_size).max(min_void);
+
+  if (new_size - container.tiling_size()).abs() > 0.0005 {
+    container.set_tiling_size(new_size);
+    void_neighbor.set_tiling_size(new_void_size);
+
+    let dragged_id = tiling_window.id();
+    let siblings = parent
+      .descendants()
+      .filter(|c| c.is_tiling_window() && c.id() != dragged_id);
+    state.pending_sync.queue_containers_to_redraw(siblings);
+    return Ok((true, false));
+  }
+
+  Ok((false, false))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resize_real_neighbor(
+  tiling_window: &TilingWindow,
+  container: &TilingContainer,
+  neighbor: &TilingContainer,
+  parent: &DirectionContainer,
+  visual_frame: &Rect,
+  is_horizontal: bool,
+  is_prev_edge: bool,
+  state: &mut WmState,
+) -> anyhow::Result<bool> {
+  let curr_rect = container.to_rect()?;
+  let delta_px = resize_edge_delta_px(
+    &curr_rect,
+    visual_frame,
+    is_horizontal,
+    is_prev_edge,
+  );
+  if delta_px == 0 {
+    return Ok(false);
+  }
+
+  let (horizontal_gap, vertical_gap) = container.inner_gaps()?;
+  let parent_rect = parent.to_rect()?;
+  #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+  let sibling_count = container.tiling_siblings().count() as i32;
+  let available_px = if is_horizontal {
+    parent_rect.width() - horizontal_gap * sibling_count
+  } else {
+    parent_rect.height() - vertical_gap * sibling_count
+  };
+
+  if available_px <= 0 {
+    return Ok(false);
+  }
+
+  #[allow(clippy::cast_precision_loss)]
+  let delta_size = delta_px as f32 / available_px as f32;
+  let total_pair = container.tiling_size() + neighbor.tiling_size();
+  if total_pair <= MIN_TILING_SIZE * 2.0 {
+    return Ok(false);
+  }
+
+  let new_size = (container.tiling_size() + delta_size)
+    .clamp(MIN_TILING_SIZE, total_pair - MIN_TILING_SIZE);
+  let new_neighbor_size = total_pair - new_size;
+
+  if (new_size - container.tiling_size()).abs() > 0.0005 {
+    container.set_tiling_size(new_size);
+    neighbor.set_tiling_size(new_neighbor_size);
+
+    let dragged_id = tiling_window.id();
+    let siblings = parent
+      .descendants()
+      .filter(|c| c.is_tiling_window() && c.id() != dragged_id);
+    state.pending_sync.queue_containers_to_redraw(siblings);
+    return Ok(true);
+  }
+
+  Ok(false)
+}
+
+#[allow(clippy::too_many_lines)]
+fn try_create_outer_edge_void(
+  tiling_window: &TilingWindow,
+  visual_frame: &Rect,
+  is_horizontal: bool,
+  is_prev_edge: bool,
+  is_final: bool,
+) -> anyhow::Result<bool> {
+  let Some(workspace) = tiling_window.workspace() else {
+    return Ok(false);
+  };
+
+  let ws_rect = workspace.multi_window_workspace_rect()?;
+  let (h_gap, v_gap) = workspace.workspace_inner_gaps()?;
+  let gap = if is_horizontal { h_gap } else { v_gap };
+
+  let curr_rect = tiling_window.to_rect()?;
+  let curr_edge =
+    resize_edge_coord(&curr_rect, is_horizontal, is_prev_edge);
+  let ws_edge = resize_edge_coord(&ws_rect, is_horizontal, is_prev_edge);
+
+  if (curr_edge - ws_edge).abs() > 16 {
+    return Ok(false);
+  }
+
+  let dragged_coord =
+    resize_edge_coord(visual_frame, is_horizontal, is_prev_edge);
+  let inward_px = if is_prev_edge {
+    dragged_coord - ws_edge
+  } else {
+    ws_edge - dragged_coord
+  };
+
+  let min_create = (gap + 12).max(OUTER_VOID_CREATE_MIN_PX);
+  if inward_px < min_create {
+    return Ok(is_final);
+  }
+
+  let target_direction = if is_horizontal {
+    TilingDirection::Horizontal
+  } else {
+    TilingDirection::Vertical
+  };
+
+  let parent = tiling_window
+    .direction_container()
+    .context("Tiling window has no direction parent.")?;
+  let gaps_config = workspace.gaps_config();
+
+  if parent.tiling_direction() != target_direction {
+    if parent.as_workspace().is_some()
+      && parent.tiling_children().count() == 1
+    {
+      workspace.set_tiling_direction(target_direction);
+    } else {
+      let split =
+        SplitContainer::new(target_direction, gaps_config.clone());
+      wrap_in_split_container(
+        &split,
+        &parent.clone().into(),
+        &[tiling_window.clone().into()],
+      )?;
+    }
+  }
+
+  let new_parent = tiling_window
+    .direction_container()
+    .context("Tiling window has no direction parent after wrap.")?;
+  let parent_axis_px = if new_parent.as_workspace().is_some() {
+    if is_horizontal {
+      ws_rect.width()
+    } else {
+      ws_rect.height()
+    }
+  } else {
+    let parent_rect = new_parent.to_rect()?;
+    if is_horizontal {
+      parent_rect.width()
+    } else {
+      parent_rect.height()
+    }
+  };
+
+  let void_px = (inward_px - gap).max(4);
+  let inserted = insert_void_preserving_siblings(
+    &new_parent,
+    &tiling_window.clone().into(),
+    is_prev_edge,
+    void_px,
+    gap,
+    parent_axis_px,
+    gaps_config,
+  )?;
+
+  Ok(inserted.is_some())
+}
+
+const fn resize_edge_coord(
+  rect: &Rect,
+  is_horizontal: bool,
+  is_prev_edge: bool,
+) -> i32 {
+  match (is_horizontal, is_prev_edge) {
+    (true, true) => rect.left,
+    (true, false) => rect.right,
+    (false, true) => rect.top,
+    (false, false) => rect.bottom,
+  }
+}
+
+const fn resize_edge_delta_px(
+  curr_rect: &Rect,
+  visual_frame: &Rect,
+  is_horizontal: bool,
+  is_prev_edge: bool,
+) -> i32 {
+  match (is_horizontal, is_prev_edge) {
+    (true, true) => curr_rect.left - visual_frame.left,
+    (true, false) => visual_frame.right - curr_rect.right,
+    (false, true) => curr_rect.top - visual_frame.top,
+    (false, false) => visual_frame.bottom - curr_rect.bottom,
+  }
 }
 
 /// Gets whether the window is in the corner of the monitor.
@@ -1022,5 +1408,188 @@ mod tests {
       updated.active_drag().and_then(|d| d.operation),
       Some(ActiveDragOperation::Move)
     );
+  }
+
+  #[test]
+  fn live_resize_absorbs_adjacent_void_on_release_and_push_through() {
+    use tokio::sync::mpsc;
+    use wm_platform::Dispatcher;
+
+    use super::{update_live_resize, update_live_resize_with_finalize};
+    use crate::{
+      commands::container::{attach_container, set_focused_descendant},
+      models::{Container, Monitor, TilingWindow, VoidSlot, Workspace},
+      traits::{CommonGetters, PositionGetters, TilingSizeGetters},
+      user_config::UserConfig,
+      wm_state::WmState,
+    };
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+    let mut state = WmState::new(Dispatcher::mock(), event_tx, exit_tx);
+    let config = UserConfig::mock();
+
+    let workspace = Workspace::mock()
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let monitor = Monitor::mock()
+      .bounds(Rect::from_xy(0, 0, 1920, 1080))
+      .working_area(Rect::from_xy(0, 0, 1920, 1032))
+      .workspaces(vec![workspace.clone()])
+      .call();
+    attach_container(
+      &monitor.into(),
+      &state.root_container.clone().into(),
+      None,
+    )
+    .unwrap();
+    set_focused_descendant(&workspace.clone().into(), None);
+
+    let win_a = TilingWindow::mock()
+      .tiling_size(0.3)
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let void_mid = VoidSlot::new(config.value.gaps.clone());
+    void_mid.set_tiling_size(0.4);
+    let win_b = TilingWindow::mock()
+      .tiling_size(0.3)
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let ws_c: Container = workspace.clone().into();
+    attach_container(&win_a.clone().into(), &ws_c, None).unwrap();
+    attach_container(&void_mid.into(), &ws_c, None).unwrap();
+    attach_container(&win_b.clone().into(), &ws_c, None).unwrap();
+
+    let initial = win_a.to_rect().unwrap();
+    let b_initial = win_b.to_rect().unwrap();
+
+    // Drag right edge across most of the void without touching B yet.
+    let mid_frame = Rect::from_ltrb(
+      initial.left,
+      initial.top,
+      b_initial.left - 30,
+      initial.bottom,
+    );
+    update_live_resize(
+      &win_a.clone().into(),
+      &mid_frame,
+      &initial,
+      &mut state,
+    )
+    .unwrap();
+    assert_eq!(workspace.tiling_children().count(), 3);
+    assert_eq!(win_b.to_rect().unwrap(), b_initial);
+
+    // Push past the void into B: absorbs void and starts shrinking B.
+    let pushed_frame = Rect::from_ltrb(
+      initial.left,
+      initial.top,
+      b_initial.left + 120,
+      initial.bottom,
+    );
+    update_live_resize_with_finalize(
+      &win_a.clone().into(),
+      &pushed_frame,
+      &initial,
+      false,
+      &mut state,
+    )
+    .unwrap();
+
+    assert_eq!(workspace.tiling_children().count(), 2);
+    assert!(win_b.to_rect().unwrap().width() < b_initial.width());
+  }
+
+  #[test]
+  fn live_resize_outer_edge_creates_void_and_snaps_back() {
+    use tokio::sync::mpsc;
+    use wm_platform::Dispatcher;
+
+    use super::update_live_resize_with_finalize;
+    use crate::{
+      commands::container::{attach_container, set_focused_descendant},
+      models::{Container, Monitor, TilingWindow, Workspace},
+      traits::{CommonGetters, PositionGetters},
+      user_config::UserConfig,
+      wm_state::WmState,
+    };
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+    let mut state = WmState::new(Dispatcher::mock(), event_tx, exit_tx);
+    let config = UserConfig::mock();
+
+    let workspace = Workspace::mock()
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let monitor = Monitor::mock()
+      .bounds(Rect::from_xy(0, 0, 1920, 1080))
+      .working_area(Rect::from_xy(0, 0, 1920, 1032))
+      .workspaces(vec![workspace.clone()])
+      .call();
+    attach_container(
+      &monitor.into(),
+      &state.root_container.clone().into(),
+      None,
+    )
+    .unwrap();
+    set_focused_descendant(&workspace.clone().into(), None);
+
+    let win_a = TilingWindow::mock()
+      .tiling_size(0.5)
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let win_b = TilingWindow::mock()
+      .tiling_size(0.5)
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let ws_c: Container = workspace.clone().into();
+    attach_container(&win_a.clone().into(), &ws_c, None).unwrap();
+    attach_container(&win_b.clone().into(), &ws_c, None).unwrap();
+
+    let initial = win_a.to_rect().unwrap();
+    let b_initial = win_b.to_rect().unwrap();
+
+    // Drag A's outer left edge inward -> creates VoidSlot on left edge
+    // while leaving B untouched.
+    let inward_frame = Rect::from_ltrb(
+      initial.left + 200,
+      initial.top,
+      initial.right,
+      initial.bottom,
+    );
+    update_live_resize_with_finalize(
+      &win_a.clone().into(),
+      &inward_frame,
+      &initial,
+      false,
+      &mut state,
+    )
+    .unwrap();
+
+    let children: Vec<_> = workspace.tiling_children().collect();
+    assert_eq!(children.len(), 3);
+    assert!(children[0].is_void());
+    assert_eq!(children[1].id(), win_a.id());
+    assert_eq!(win_b.to_rect().unwrap(), b_initial);
+
+    // Drag back close to the left screen edge and release -> void absorbs.
+    let back_frame = Rect::from_ltrb(
+      initial.left + 10,
+      initial.top,
+      initial.right,
+      initial.bottom,
+    );
+    update_live_resize_with_finalize(
+      &win_a.clone().into(),
+      &back_frame,
+      &initial,
+      true,
+      &mut state,
+    )
+    .unwrap();
+
+    assert_eq!(workspace.tiling_children().count(), 2);
+    assert!(win_a.to_rect().unwrap().left <= initial.left + 2);
   }
 }

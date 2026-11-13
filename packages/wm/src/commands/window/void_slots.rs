@@ -1,12 +1,14 @@
 use anyhow::Context;
 use uuid::Uuid;
-use wm_common::{FullscreenStateConfig, TilingDirection, WindowState};
+use wm_common::{
+  FullscreenStateConfig, GapsConfig, TilingDirection, WindowState,
+};
 
 use super::update_window_state;
 use crate::{
   commands::container::{
-    flatten_child_split_containers, flatten_split_container,
-    set_focused_descendant,
+    attach_container, flatten_child_split_containers,
+    flatten_split_container, set_focused_descendant,
   },
   models::{
     Container, DirectionContainer, SplitContainer, TilingContainer,
@@ -539,4 +541,178 @@ pub fn collapse_origin_void(
   }
 
   Ok(true)
+}
+
+/// Swaps two sibling `TilingContainer`s inside the same `parent` without
+/// exchanging their `tiling_size` values.
+pub fn reorder_tiling_sibling(
+  first: &TilingContainer,
+  second: &TilingContainer,
+) -> anyhow::Result<()> {
+  if first.id() == second.id() {
+    return Ok(());
+  }
+
+  let parent_a = first.parent().context("First container has no parent.")?;
+  let parent_b =
+    second.parent().context("Second container has no parent.")?;
+  if parent_a.id() != parent_b.id() {
+    anyhow::bail!("Containers must share the same parent to reorder.");
+  }
+
+  let index_a = first.index();
+  let index_b = second.index();
+
+  let focus_a = parent_a
+    .borrow_child_focus_order()
+    .iter()
+    .position(|id| *id == first.id());
+  let focus_b = parent_a
+    .borrow_child_focus_order()
+    .iter()
+    .position(|id| *id == second.id());
+
+  {
+    let mut children = parent_a.borrow_children_mut();
+    if let Some(slot) = children.get_mut(index_a) {
+      *slot = second.clone().into();
+    }
+    if let Some(slot) = children.get_mut(index_b) {
+      *slot = first.clone().into();
+    }
+  }
+
+  if !first.is_void() && !second.is_void() {
+    if let (Some(idx_a), Some(idx_b)) = (focus_a, focus_b) {
+      let mut order = parent_a.borrow_child_focus_order_mut();
+      if let Some(slot) = order.get_mut(idx_a) {
+        *slot = second.id();
+      }
+      if let Some(slot) = order.get_mut(idx_b) {
+        *slot = first.id();
+      }
+    }
+  }
+
+  Ok(())
+}
+
+/// Absorbs `void_slot` into `beneficiary` within `parent`, reclaiming the
+/// removed inner gap into `beneficiary` while keeping all other siblings
+/// at their exact pixel sizes.
+pub fn absorb_void_into_sibling(
+  void_slot: &VoidSlot,
+  beneficiary: &TilingContainer,
+  parent: &DirectionContainer,
+  gap: i32,
+  parent_axis_px: i32,
+) -> anyhow::Result<()> {
+  let children: Vec<TilingContainer> = parent.tiling_children().collect();
+  if children.len() < 2 {
+    return Ok(());
+  }
+
+  #[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+  )]
+  let old_avail =
+    (parent_axis_px - gap * (children.len() as i32 - 1)).max(1) as f32;
+  #[allow(clippy::cast_precision_loss)]
+  let gap_f = gap as f32;
+  let new_avail = (old_avail + gap_f).max(1.0);
+
+  let merged_size =
+    ((beneficiary.tiling_size() + void_slot.tiling_size()) * old_avail
+      + gap_f)
+      / new_avail;
+
+  for child in &children {
+    if child.id() != void_slot.id() && child.id() != beneficiary.id() {
+      child.set_tiling_size((child.tiling_size() * old_avail) / new_avail);
+    }
+  }
+  beneficiary.set_tiling_size(merged_size);
+
+  parent
+    .borrow_children_mut()
+    .retain(|c| c.id() != void_slot.id());
+  parent
+    .borrow_child_focus_order_mut()
+    .retain(|id| *id != void_slot.id());
+  *void_slot.borrow_parent_mut() = None;
+
+  Ok(())
+}
+
+/// Inserts a new `VoidSlot` of `void_px` beside `target` in `parent`,
+/// shrinking `target` by `void_px + gap` while preserving the pixel sizes
+/// of all other siblings.
+pub fn insert_void_preserving_siblings(
+  parent: &DirectionContainer,
+  target: &TilingContainer,
+  insert_before: bool,
+  void_px: i32,
+  gap: i32,
+  parent_axis_px: i32,
+  gaps_config: GapsConfig,
+) -> anyhow::Result<Option<VoidSlot>> {
+  let children: Vec<TilingContainer> = parent.tiling_children().collect();
+  if children.is_empty() {
+    return Ok(None);
+  }
+
+  #[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+  )]
+  let sibling_count = children.len() as i32;
+  let old_avail = (parent_axis_px - gap * (sibling_count - 1)).max(1);
+  let new_avail = (parent_axis_px - gap * sibling_count).max(1);
+
+  #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+  let target_old_px =
+    (target.tiling_size() * old_avail as f32).round() as i32;
+  let max_void_px = target_old_px - gap - 40;
+  if max_void_px < 4 {
+    return Ok(None);
+  }
+
+  let clamped_void_px = void_px.clamp(4, max_void_px);
+  let target_new_px = target_old_px - gap - clamped_void_px;
+
+  #[allow(clippy::cast_precision_loss)]
+  let old_avail_f = old_avail as f32;
+  #[allow(clippy::cast_precision_loss)]
+  let new_avail_f = new_avail as f32;
+
+  for child in &children {
+    if child.id() != target.id() {
+      let scaled = (child.tiling_size() * old_avail_f) / new_avail_f;
+      child.set_tiling_size(scaled);
+    }
+  }
+
+  #[allow(clippy::cast_precision_loss)]
+  target.set_tiling_size(target_new_px as f32 / new_avail_f);
+
+  let void_slot = VoidSlot::new(gaps_config);
+  #[allow(clippy::cast_precision_loss)]
+  void_slot.set_tiling_size(clamped_void_px as f32 / new_avail_f);
+
+  let insert_idx = if insert_before {
+    target.index()
+  } else {
+    target.index() + 1
+  };
+  let void_container: Container = void_slot.clone().into();
+  attach_container(
+    &void_container,
+    &parent.clone().into(),
+    Some(insert_idx),
+  )?;
+
+  Ok(Some(void_slot))
 }
