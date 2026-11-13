@@ -1,0 +1,16 @@
+diff --git a/packages/wm/src/commands/window/single_axis_drag.rs b/packages/wm/src/commands/window/single_axis_drag.rs
+index e1e6cdf..b03ad64 100644
+--- a/packages/wm/src/commands/window/single_axis_drag.rs
++++ b/packages/wm/src/commands/window/single_axis_drag.rs
+@@ -782,9 +782,9 @@ const fn axis_end(rect: &Rect, is_horiz: bool) -> i32 {
+ 
+ const fn axis_len(rect: &Rect, is_horiz: bool) -> i32 {
+   if is_horiz {
+-    rect.width()
++    rect.right - rect.left
+   } else {
+-    rect.height()
++    rect.bottom - rect.top
+   }
+ }
+ 

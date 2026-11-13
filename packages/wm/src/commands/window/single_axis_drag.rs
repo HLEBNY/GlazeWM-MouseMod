@@ -782,9 +782,9 @@ const fn axis_end(rect: &Rect, is_horiz: bool) -> i32 {
 
 const fn axis_len(rect: &Rect, is_horiz: bool) -> i32 {
   if is_horiz {
-    rect.width()
+    rect.right - rect.left
   } else {
-    rect.height()
+    rect.bottom - rect.top
   }
 }
 
