@@ -7,8 +7,8 @@ use wm_common::{
 use super::update_window_state;
 use crate::{
   commands::container::{
-    attach_container, flatten_child_split_containers,
-    flatten_split_container, set_focused_descendant,
+    flatten_child_split_containers, flatten_split_container,
+    set_focused_descendant,
   },
   models::{
     Container, DirectionContainer, SplitContainer, TilingContainer,
@@ -681,12 +681,20 @@ pub fn insert_void_preserving_siblings(
   }
 
   let clamped_void_px = void_px.clamp(4, max_void_px);
-  let target_new_px = target_old_px - gap - clamped_void_px;
 
   #[allow(clippy::cast_precision_loss)]
   let old_avail_f = old_avail as f32;
   #[allow(clippy::cast_precision_loss)]
   let new_avail_f = new_avail as f32;
+  #[allow(clippy::cast_precision_loss)]
+  let gap_f = gap as f32;
+  #[allow(clippy::cast_precision_loss)]
+  let void_f = clamped_void_px as f32;
+
+  let target_new_f = target.tiling_size() * old_avail_f - gap_f - void_f;
+  if target_new_f <= 0.0 {
+    return Ok(None);
+  }
 
   for child in &children {
     if child.id() != target.id() {
@@ -695,12 +703,10 @@ pub fn insert_void_preserving_siblings(
     }
   }
 
-  #[allow(clippy::cast_precision_loss)]
-  target.set_tiling_size(target_new_px as f32 / new_avail_f);
+  target.set_tiling_size(target_new_f / new_avail_f);
 
   let void_slot = VoidSlot::new(gaps_config);
-  #[allow(clippy::cast_precision_loss)]
-  void_slot.set_tiling_size(clamped_void_px as f32 / new_avail_f);
+  void_slot.set_tiling_size(void_f / new_avail_f);
 
   let insert_idx = if insert_before {
     target.index()
@@ -708,11 +714,11 @@ pub fn insert_void_preserving_siblings(
     target.index() + 1
   };
   let void_container: Container = void_slot.clone().into();
-  attach_container(
-    &void_container,
-    &parent.clone().into(),
-    Some(insert_idx),
-  )?;
+  let clamped_idx = insert_idx.min(parent.child_count());
+  parent
+    .borrow_children_mut()
+    .insert(clamped_idx, void_container.clone());
+  *void_container.borrow_parent_mut() = Some(parent.clone().into());
 
   Ok(Some(void_slot))
 }

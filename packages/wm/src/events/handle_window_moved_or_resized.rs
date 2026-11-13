@@ -893,6 +893,7 @@ pub fn update_live_resize_with_finalize(
         is_horizontal,
         is_prev_edge,
         is_final,
+        state,
       )?;
     }
   }
@@ -983,11 +984,15 @@ fn resize_into_void_neighbor(
   #[allow(clippy::cast_precision_loss)]
   let min_void = (MIN_VOID_REMAINING_PX as f32 / available_f).max(0.001);
 
-  let max_container = (total_pair - min_void).max(min_container);
+  if total_pair <= min_container + min_void {
+    return Ok((false, false));
+  }
+
+  let max_container = total_pair - min_void;
   let new_size =
     (container.tiling_size() + delta_size)
       .clamp(min_container, max_container);
-  let new_void_size = (total_pair - new_size).max(min_void);
+  let new_void_size = total_pair - new_size;
 
   if (new_size - container.tiling_size()).abs() > 0.0005 {
     container.set_tiling_size(new_size);
@@ -1073,6 +1078,7 @@ fn try_create_outer_edge_void(
   is_horizontal: bool,
   is_prev_edge: bool,
   is_final: bool,
+  state: &mut WmState,
 ) -> anyhow::Result<bool> {
   let Some(workspace) = tiling_window.workspace() else {
     return Ok(false);
@@ -1159,6 +1165,14 @@ fn try_create_outer_edge_void(
     parent_axis_px,
     gaps_config,
   )?;
+
+  if inserted.is_some() {
+    let dragged_id = tiling_window.id();
+    let others = workspace
+      .tiling_windows()
+      .filter(|win| win.id() != dragged_id);
+    state.pending_sync.queue_containers_to_redraw(others);
+  }
 
   Ok(inserted.is_some())
 }
@@ -1446,19 +1460,19 @@ mod tests {
     set_focused_descendant(&workspace.clone().into(), None);
 
     let win_a = TilingWindow::mock()
-      .tiling_size(0.3)
       .gaps_config(config.value.gaps.clone())
       .call();
     let void_mid = VoidSlot::new(config.value.gaps.clone());
-    void_mid.set_tiling_size(0.4);
     let win_b = TilingWindow::mock()
-      .tiling_size(0.3)
       .gaps_config(config.value.gaps.clone())
       .call();
     let ws_c: Container = workspace.clone().into();
     attach_container(&win_a.clone().into(), &ws_c, None).unwrap();
-    attach_container(&void_mid.into(), &ws_c, None).unwrap();
+    attach_container(&void_mid.clone().into(), &ws_c, None).unwrap();
     attach_container(&win_b.clone().into(), &ws_c, None).unwrap();
+    win_a.set_tiling_size(0.3);
+    void_mid.set_tiling_size(0.4);
+    win_b.set_tiling_size(0.3);
 
     let initial = win_a.to_rect().unwrap();
     let b_initial = win_b.to_rect().unwrap();
@@ -1509,7 +1523,7 @@ mod tests {
     use crate::{
       commands::container::{attach_container, set_focused_descendant},
       models::{Container, Monitor, TilingWindow, Workspace},
-      traits::{CommonGetters, PositionGetters},
+      traits::{CommonGetters, PositionGetters, TilingSizeGetters},
       user_config::UserConfig,
       wm_state::WmState,
     };
@@ -1568,10 +1582,12 @@ mod tests {
     .unwrap();
 
     let children: Vec<_> = workspace.tiling_children().collect();
+    let sum_mid: f32 = children.iter().map(|c| c.tiling_size()).sum();
     assert_eq!(children.len(), 3);
     assert!(children[0].is_void());
     assert_eq!(children[1].id(), win_a.id());
     assert_eq!(win_b.to_rect().unwrap(), b_initial);
+    assert!((sum_mid - 1.0).abs() < 0.001);
 
     // Drag back close to the left screen edge and release -> void absorbs.
     let back_frame = Rect::from_ltrb(
@@ -1589,7 +1605,11 @@ mod tests {
     )
     .unwrap();
 
+    let sum_end: f32 =
+      workspace.tiling_children().map(|c| c.tiling_size()).sum();
     assert_eq!(workspace.tiling_children().count(), 2);
+    assert!((sum_end - 1.0).abs() < 0.001);
     assert!(win_a.to_rect().unwrap().left <= initial.left + 2);
+    assert_eq!(win_b.to_rect().unwrap(), b_initial);
   }
 }

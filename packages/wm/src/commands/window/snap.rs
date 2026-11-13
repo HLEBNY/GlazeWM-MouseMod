@@ -9,8 +9,8 @@ use wm_platform::{NativeWindowWindowsExt, WS_MAXIMIZEBOX};
 use wm_platform::{Point, Rect};
 
 use super::{
-  collapse_origin_void, normalize_workspace_voids, replace_tiling_slot,
-  swap_tiling_containers, update_window_state,
+  clear_workspace_voids, collapse_origin_void, normalize_workspace_voids,
+  replace_tiling_slot, swap_tiling_containers, update_window_state,
 };
 use crate::{
   commands::container::{
@@ -195,31 +195,17 @@ pub fn detect_single_axis_breakaway_zone(
         && (start_cursor.y > working_area.top + rail_px
           || cursor.y <= working_area.top + 1);
       let near_bottom = cursor.y >= working_area.bottom - 1 - edge_px;
-      let near_left = cursor.x <= working_area.left + edge_px;
-      let near_right = cursor.x >= working_area.right - 1 - edge_px;
-      let pulled_upper_corner = (cursor.y - start_cursor.y) >= pull_away_px
-        && cursor.y < working_area.top + corner_h;
 
-      if (near_top_rail
-        && (near_left || cursor.x < working_area.left + corner_w))
-        || (near_left && pulled_upper_corner)
-      {
+      if near_top_rail && cursor.x < working_area.left + corner_w {
         return Some(ScreenZone::TopLeft);
       }
-      if (near_top_rail
-        && (near_right || cursor.x >= working_area.right - corner_w))
-        || (near_right && pulled_upper_corner)
-      {
+      if near_top_rail && cursor.x >= working_area.right - corner_w {
         return Some(ScreenZone::TopRight);
       }
-      if near_bottom
-        && (near_left || cursor.x < working_area.left + corner_w)
-      {
+      if near_bottom && cursor.x < working_area.left + corner_w {
         return Some(ScreenZone::BottomLeft);
       }
-      if near_bottom
-        && (near_right || cursor.x >= working_area.right - corner_w)
-      {
+      if near_bottom && cursor.x >= working_area.right - corner_w {
         return Some(ScreenZone::BottomRight);
       }
       if near_top_rail && cursor.x >= mid_left && cursor.x <= mid_right {
@@ -242,32 +228,33 @@ pub fn detect_single_axis_breakaway_zone(
           || cursor.x >= working_area.right - 2);
       let near_top = cursor.y <= working_area.top + edge_px;
       let near_bottom = cursor.y >= working_area.bottom - 1 - edge_px;
-      let pulled_horiz = (cursor.x - start_cursor.x).abs() >= pull_away_px;
+      let pulled_left = (start_cursor.x - cursor.x) >= pull_away_px;
+      let pulled_right = (cursor.x - start_cursor.x) >= pull_away_px;
 
       if (near_top
         && (near_left_rail
-          || (pulled_horiz && cursor.x < working_area.left + corner_w)))
+          || (pulled_left && cursor.x < working_area.left + corner_w)))
         || (near_left_rail && cursor.y < working_area.top + corner_h)
       {
         return Some(ScreenZone::TopLeft);
       }
       if (near_top
         && (near_right_rail
-          || (pulled_horiz && cursor.x >= working_area.right - corner_w)))
+          || (pulled_right && cursor.x >= working_area.right - corner_w)))
         || (near_right_rail && cursor.y < working_area.top + corner_h)
       {
         return Some(ScreenZone::TopRight);
       }
       if (near_bottom
         && (near_left_rail
-          || (pulled_horiz && cursor.x < working_area.left + corner_w)))
+          || (pulled_left && cursor.x < working_area.left + corner_w)))
         || (near_left_rail && cursor.y >= working_area.bottom - corner_h)
       {
         return Some(ScreenZone::BottomLeft);
       }
       if (near_bottom
         && (near_right_rail
-          || (pulled_horiz && cursor.x >= working_area.right - corner_w)))
+          || (pulled_right && cursor.x >= working_area.right - corner_w)))
         || (near_right_rail && cursor.y >= working_area.bottom - corner_h)
       {
         return Some(ScreenZone::BottomRight);
@@ -846,6 +833,25 @@ fn commit_snap_zone(
     .origin_void_id
     .filter(|id| super::void_slot_by_id(&workspace, *id).is_some());
 
+  let has_other_real_windows = workspace
+    .tiling_windows()
+    .any(|win| Some(win.id()) != origin_void_in_target);
+
+  if !has_other_real_windows {
+    let tiling_window = moved_window.to_tiling(config.value.gaps.clone());
+    detach_container(moved_window.clone().into())?;
+    if let (Some(origin_void_id), Some(old_ws)) =
+      (active_drag.origin_void_id, &old_workspace)
+    {
+      if old_ws.id() != workspace.id() {
+        collapse_origin_void(origin_void_id, old_ws, None, state, config)?;
+      }
+    }
+    clear_workspace_voids(&workspace)?;
+    insert_into_empty_workspace(&tiling_window, &workspace, zone, config)?;
+    return finish_snap_zone_commit(tiling_window, &workspace, state);
+  }
+
   let (h_gap, v_gap) = workspace.workspace_inner_gaps()?;
   let ws_rect = workspace.multi_window_workspace_rect()?;
 
@@ -863,46 +869,19 @@ fn commit_snap_zone(
   detach_container(moved_window.clone().into())?;
 
   if let Some(void_match) = void_match {
-    match void_match {
-      VoidMatch::Exact(slot) => {
-        replace_tiling_slot(&slot.into(), &tiling_window.clone().into())?;
-      }
-      VoidMatch::SplitHalf {
-        slot,
-        split_dir,
-        insert_first,
-      } => {
-        let slot_parent =
-          slot.parent().context("Void slot has no parent.")?;
-        let split =
-          SplitContainer::new(split_dir, config.value.gaps.clone());
-        let slot_tiling: TilingContainer = slot.into();
-        wrap_in_split_container(&split, &slot_parent, &[slot_tiling])?;
-        let insert_idx = usize::from(!insert_first);
-        attach_container(
-          &tiling_window.clone().into(),
-          &split.into(),
-          Some(insert_idx),
-        )?;
-      }
-    }
-
+    apply_void_match(&tiling_window, void_match, config)?;
     if let (Some(origin_void_id), Some(old_ws)) =
       (active_drag.origin_void_id, &old_workspace)
     {
-      collapse_origin_void(origin_void_id, old_ws, None, state, config)?;
+      cleanup_origin_void_after_void_match(
+        origin_void_id,
+        old_ws,
+        &workspace,
+        state,
+        config,
+      )?;
     }
-
-    normalize_workspace_voids(&workspace)?;
-    tiling_window.set_active_drag(None);
-    set_focused_descendant(&tiling_window.clone().into(), None);
-
-    state
-      .pending_sync
-      .queue_containers_to_redraw(workspace.tiling_children())
-      .queue_workspace_to_reorder(workspace);
-
-    return Ok(tiling_window.into());
+    return finish_snap_zone_commit(tiling_window, &workspace, state);
   }
 
   // Collapse any active drag's origin void cleanly so we don't leave a
@@ -950,14 +929,89 @@ fn commit_snap_zone(
     )?;
   }
 
-  normalize_workspace_voids(&workspace)?;
+  finish_snap_zone_commit(tiling_window, &workspace, state)
+}
+
+fn apply_void_match(
+  tiling_window: &TilingWindow,
+  void_match: VoidMatch,
+  config: &UserConfig,
+) -> anyhow::Result<()> {
+  match void_match {
+    VoidMatch::Exact(slot) => {
+      replace_tiling_slot(&slot.into(), &tiling_window.clone().into())?;
+    }
+    VoidMatch::SplitHalf {
+      slot,
+      split_dir,
+      insert_first,
+    } => {
+      let slot_parent =
+        slot.parent().context("Void slot has no parent.")?;
+      let split =
+        SplitContainer::new(split_dir, config.value.gaps.clone());
+      let slot_tiling: TilingContainer = slot.into();
+      wrap_in_split_container(&split, &slot_parent, &[slot_tiling])?;
+      let insert_idx = usize::from(!insert_first);
+      attach_container(
+        &tiling_window.clone().into(),
+        &split.into(),
+        Some(insert_idx),
+      )?;
+    }
+  }
+
+  Ok(())
+}
+
+fn cleanup_origin_void_after_void_match(
+  origin_void_id: Uuid,
+  old_ws: &Workspace,
+  target_ws: &Workspace,
+  state: &mut WmState,
+  config: &UserConfig,
+) -> anyhow::Result<()> {
+  let slot = super::void_slot_by_id(old_ws, origin_void_id);
+  let Some(origin_void) = slot else {
+    return Ok(());
+  };
+
+  let prev_is_void = origin_void
+    .prev_siblings()
+    .find_map(|s| s.as_tiling_container().ok())
+    .is_some_and(|c| c.is_void());
+  let next_is_void = origin_void
+    .next_siblings()
+    .find_map(|s| s.as_tiling_container().ok())
+    .is_some_and(|c| c.is_void());
+
+  if prev_is_void || next_is_void {
+    normalize_workspace_voids(old_ws)?;
+    if old_ws.id() != target_ws.id() {
+      state
+        .pending_sync
+        .queue_containers_to_redraw(old_ws.tiling_children());
+    }
+  } else {
+    collapse_origin_void(origin_void_id, old_ws, None, state, config)?;
+  }
+
+  Ok(())
+}
+
+fn finish_snap_zone_commit(
+  tiling_window: TilingWindow,
+  workspace: &Workspace,
+  state: &mut WmState,
+) -> anyhow::Result<WindowContainer> {
+  normalize_workspace_voids(workspace)?;
   tiling_window.set_active_drag(None);
   set_focused_descendant(&tiling_window.clone().into(), None);
 
   state
     .pending_sync
     .queue_containers_to_redraw(workspace.tiling_children())
-    .queue_workspace_to_reorder(workspace);
+    .queue_workspace_to_reorder(workspace.clone());
 
   Ok(tiling_window.into())
 }
@@ -1755,9 +1809,10 @@ mod tests {
   use super::*;
   use crate::{
     commands::window::{
-      first_void_slot, unmanage_window, vacate_tiling_slot,
+      first_void_slot, insert_void_preserving_siblings, unmanage_window,
+      vacate_tiling_slot,
     },
-    models::{Container, Monitor},
+    models::{Container, DirectionContainer, Monitor},
   };
 
   fn setup_state() -> (WmState, UserConfig, Workspace) {
@@ -2308,13 +2363,13 @@ mod tests {
     workspace.set_tiling_direction(TilingDirection::Horizontal);
 
     let void_left = VoidSlot::new(config.value.gaps.clone());
-    void_left.set_tiling_size(0.8);
     let tile_right = TilingWindow::mock()
-      .tiling_size(0.2)
       .gaps_config(config.value.gaps.clone())
       .call();
     attach_container(&void_left.clone().into(), &ws_c, None).unwrap();
-    attach_container(&tile_right.into(), &ws_c, None).unwrap();
+    attach_container(&tile_right.clone().into(), &ws_c, None).unwrap();
+    void_left.set_tiling_size(0.8);
+    tile_right.set_tiling_size(0.2);
 
     let floating =
       add_floating(&workspace, Rect::from_xy(300, 300, 500, 400));
@@ -2466,5 +2521,81 @@ mod tests {
       ),
       Some(ScreenZone::Left)
     );
+  }
+
+  fn drop_at(
+    win: &NonTilingWindow,
+    pt: &Point,
+    state: &mut WmState,
+    config: &UserConfig,
+  ) -> (Rect, Rect) {
+    let drag = drag_move(true, None);
+    let c: WindowContainer = win.clone().into();
+    let t = resolve_drop_target(&c, pt, &drag, state).unwrap().unwrap();
+    let p = Some(pt);
+    let pr = compute_drop_preview_rect_at(&t, &c, &drag, p, state);
+    let preview = pr.unwrap().unwrap();
+    let placed = win.floating_placement();
+    let res = finalize_move_drag(win, placed, &drag, p, state, config);
+    (preview, res.unwrap().to_rect().unwrap())
+  }
+
+  #[test]
+  fn vertical_taskbar_and_bottom_insert_with_void_leave_no_gaps() {
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+    let mut state = WmState::new(Dispatcher::mock(), event_tx, exit_tx);
+    let config = UserConfig::mock();
+
+    let workspace = Workspace::mock()
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let monitor = Monitor::mock()
+      .bounds(Rect::from_xy(0, 0, 1360, 768))
+      .working_area(Rect::from_ltrb(0, 0, 1304, 768))
+      .workspaces(vec![workspace.clone()])
+      .call();
+    attach_container(
+      &monitor.into(),
+      &state.root_container.clone().into(),
+      None,
+    )
+    .unwrap();
+    set_focused_descendant(&workspace.clone().into(), None);
+
+    // Build [Win1(0.5), Void(0.5)], then detach Win1's left edge inward.
+    let w1 = TilingWindow::mock()
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let ws_c: Container = workspace.clone().into();
+    let right_void = VoidSlot::new(config.value.gaps.clone());
+    attach_container(&w1.clone().into(), &ws_c, None).unwrap();
+    attach_container(&right_void.into(), &ws_c, None).unwrap();
+
+    let ws_rect = workspace.multi_window_workspace_rect().unwrap();
+    let (h_gap, _v_gap) = workspace.workspace_inner_gaps().unwrap();
+    let parent_dir: DirectionContainer = workspace.clone().into();
+    insert_void_preserving_siblings(
+      &parent_dir,
+      &w1.clone().into(),
+      true,
+      60,
+      h_gap,
+      ws_rect.width(),
+      config.value.gaps.clone(),
+    )
+    .unwrap();
+
+    let w2 = add_floating(&workspace, Rect::from_xy(200, 200, 400, 300));
+    let (prev2, rect2) =
+      drop_at(&w2, &Point { x: 650, y: 760 }, &mut state, &config);
+    assert_eq!(rect2, prev2);
+    assert!((rect2.bottom - ws_rect.bottom).abs() <= 1);
+
+    let w3 = add_floating(&workspace, Rect::from_xy(300, 200, 400, 300));
+    let (prev3, rect3) =
+      drop_at(&w3, &Point { x: 1300, y: 400 }, &mut state, &config);
+    assert!((rect3.right - prev3.right).abs() <= 2);
+    assert!((rect3.right - ws_rect.right).abs() <= 2);
   }
 }

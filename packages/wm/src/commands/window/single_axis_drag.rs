@@ -14,9 +14,9 @@ use super::{
   update_window_state,
 };
 use crate::{
-  commands::container::{attach_container, set_focused_descendant},
+  commands::container::set_focused_descendant,
   models::{
-    DirectionContainer, TilingContainer, TilingWindow, VoidSlot,
+    Container, DirectionContainer, TilingContainer, TilingWindow, VoidSlot,
     WindowContainer, Workspace,
   },
   traits::{
@@ -543,11 +543,16 @@ fn step_into_adjacent_void(
     abs_delta.min(total_slide)
   };
 
-  let trailing_void = if move_forward {
-    window.prev_siblings().find_map(|s| s.as_void().cloned())
+  let adjacent_sibling = if move_forward {
+    window
+      .prev_siblings()
+      .find_map(|s| s.as_tiling_container().ok())
   } else {
-    window.next_siblings().find_map(|s| s.as_void().cloned())
+    window
+      .next_siblings()
+      .find_map(|s| s.as_tiling_container().ok())
   };
+  let trailing_void = adjacent_sibling.and_then(|s| s.as_void().cloned());
 
   let siblings: Vec<TilingContainer> = parent.tiling_children().collect();
   #[allow(
@@ -557,16 +562,12 @@ fn step_into_adjacent_void(
   )]
   let old_avail =
     (parent_axis_px - gap * (siblings.len() as i32 - 1)).max(1) as f32;
-  #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-  let v_ahead_old_px =
-    (void_ahead.tiling_size() * old_avail).round() as i32;
+  #[allow(clippy::cast_precision_loss)]
+  let step_f = step as f32;
+  let ahead_old_f = void_ahead.tiling_size() * old_avail;
 
   if let Some(v_behind) = trailing_void {
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-    let v_behind_old_px =
-      (v_behind.tiling_size() * old_avail).round() as i32;
-
-    if step >= total_slide || v_ahead_old_px - step < 4 {
+    if step >= total_slide || ahead_old_f - step_f < 4.0 {
       absorb_void_into_sibling(
         void_ahead,
         &v_behind.into(),
@@ -577,18 +578,22 @@ fn step_into_adjacent_void(
       return Ok(true);
     }
 
-    #[allow(clippy::cast_precision_loss)]
-    {
-      let next_behind = (v_behind_old_px + step) as f32 / old_avail;
-      v_behind.set_tiling_size(next_behind);
-      void_ahead
-        .set_tiling_size((v_ahead_old_px - step) as f32 / old_avail);
+    let total_pair = v_behind.tiling_size() + void_ahead.tiling_size();
+    let min_void = (4.0 / old_avail).max(0.001);
+    if total_pair <= min_void * 2.0 {
+      return Ok(false);
     }
+
+    let raw_behind = v_behind.tiling_size() + step_f / old_avail;
+    let next_behind = raw_behind.clamp(min_void, total_pair - min_void);
+    let next_ahead = total_pair - next_behind;
+    v_behind.set_tiling_size(next_behind);
+    void_ahead.set_tiling_size(next_ahead);
     return Ok(false);
   }
 
   let min_create_step = (gap + 12).max(14);
-  if step >= total_slide || v_ahead_old_px - step < 4 {
+  if step >= total_slide || ahead_old_f - step_f < 4.0 {
     reorder_tiling_sibling(
       &window.clone().into(),
       &void_ahead.clone().into(),
@@ -600,9 +605,11 @@ fn step_into_adjacent_void(
     return Ok(false);
   }
 
-  let v_ahead_new_px = v_ahead_old_px - step;
-  let v_behind_px = v_ahead_old_px - gap - v_ahead_new_px;
-  if v_behind_px < 4 {
+  #[allow(clippy::cast_precision_loss)]
+  let gap_f = gap as f32;
+  let ahead_new_f = ahead_old_f - step_f;
+  let behind_f = ahead_old_f - gap_f - ahead_new_f;
+  if behind_f < 4.0 || ahead_new_f < 4.0 {
     return Ok(false);
   }
 
@@ -620,23 +627,22 @@ fn step_into_adjacent_void(
     }
   }
 
-  #[allow(clippy::cast_precision_loss)]
-  void_ahead.set_tiling_size(v_ahead_new_px as f32 / new_avail);
+  void_ahead.set_tiling_size(ahead_new_f / new_avail);
 
   let v_behind = VoidSlot::new(config.value.gaps.clone());
-  #[allow(clippy::cast_precision_loss)]
-  v_behind.set_tiling_size(v_behind_px as f32 / new_avail);
+  v_behind.set_tiling_size(behind_f / new_avail);
 
   let insert_idx = if move_forward {
     window.index()
   } else {
     window.index() + 1
   };
-  attach_container(
-    &v_behind.into(),
-    &parent.clone().into(),
-    Some(insert_idx),
-  )?;
+  let v_behind_container: Container = v_behind.into();
+  let clamped_idx = insert_idx.min(parent.child_count());
+  parent
+    .borrow_children_mut()
+    .insert(clamped_idx, v_behind_container.clone());
+  *v_behind_container.borrow_parent_mut() = Some(parent.clone().into());
 
   Ok(false)
 }
@@ -891,15 +897,15 @@ mod tests {
     let (mut state, config, workspace) = setup_workspace();
     let ws_c: Container = workspace.clone().into();
     let wide = TilingWindow::mock()
-      .tiling_size(0.7)
       .gaps_config(config.value.gaps.clone())
       .call();
     let narrow = TilingWindow::mock()
-      .tiling_size(0.3)
       .gaps_config(config.value.gaps.clone())
       .call();
     attach_container(&wide.clone().into(), &ws_c, None).unwrap();
     attach_container(&narrow.clone().into(), &ws_c, None).unwrap();
+    wide.set_tiling_size(0.7);
+    narrow.set_tiling_size(0.3);
 
     let start_cursor = Point { x: 600, y: 18 };
     assert!(try_start_single_axis_drag(
@@ -970,5 +976,116 @@ mod tests {
     let updated_b = state.window_by_id(win_b.id()).unwrap();
     assert!(matches!(updated_a.state(), WindowState::Fullscreen(_)));
     assert!(matches!(updated_b.state(), WindowState::Fullscreen(_)));
+  }
+
+  #[test]
+  fn sliding_to_opposite_edge_preserves_window_size_and_total_sum() {
+    let (mut state, config, workspace) = setup_workspace();
+    let ws_c: Container = workspace.clone().into();
+    let win = TilingWindow::mock()
+      .tiling_size(0.5)
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let void_r = VoidSlot::new(config.value.gaps.clone());
+    void_r.set_tiling_size(0.5);
+    attach_container(&win.clone().into(), &ws_c, None).unwrap();
+    attach_container(&void_r.into(), &ws_c, None).unwrap();
+
+    let start_rect = win.to_rect().unwrap();
+    let start_cursor = Point { x: 200, y: 18 };
+    assert!(try_start_single_axis_drag(
+      &win,
+      Some(&start_cursor),
+      &mut state,
+    )
+    .unwrap());
+
+    let mut drag = state.active_single_axis_drag.take().unwrap();
+    drag.has_crossed_threshold = true;
+
+    for target_x in [120, 360, 620, 960] {
+      let cursor = Point { x: 200 + target_x, y: 22 };
+      step_single_axis_grid(
+        &win,
+        &workspace,
+        target_x,
+        &cursor,
+        &mut drag,
+        &mut state,
+        &config,
+      )
+      .unwrap();
+    }
+    state.active_single_axis_drag = Some(drag);
+
+    let end_cursor = Point { x: 1160, y: 22 };
+    finish_single_axis_drag(Some(&end_cursor), &mut state, &config)
+      .unwrap();
+
+    let end_rect = win.to_rect().unwrap();
+    let sum: f32 =
+      workspace.tiling_children().map(|c| c.tiling_size()).sum();
+    assert!((sum - 1.0).abs() < 0.001);
+    let ws_right = workspace.to_rect().unwrap().right;
+    assert!((end_rect.width() - start_rect.width()).abs() <= 1);
+    assert!((end_rect.right - ws_right).abs() <= 2);
+  }
+
+  #[test]
+  fn pulling_single_axis_away_from_neighbor_leaves_neighbor_intact() {
+    let (mut state, config, workspace) = setup_workspace();
+    let ws_c: Container = workspace.clone().into();
+    let void_l = VoidSlot::new(config.value.gaps.clone());
+    let win_a = TilingWindow::mock()
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let win_b = TilingWindow::mock()
+      .gaps_config(config.value.gaps.clone())
+      .call();
+    let void_r = VoidSlot::new(config.value.gaps.clone());
+    attach_container(&void_l.clone().into(), &ws_c, None).unwrap();
+    attach_container(&win_a.clone().into(), &ws_c, None).unwrap();
+    attach_container(&win_b.clone().into(), &ws_c, None).unwrap();
+    attach_container(&void_r.clone().into(), &ws_c, None).unwrap();
+    void_l.set_tiling_size(0.2);
+    win_a.set_tiling_size(0.25);
+    win_b.set_tiling_size(0.25);
+    void_r.set_tiling_size(0.3);
+
+    let a_before = win_a.to_rect().unwrap();
+    let b_before = win_b.to_rect().unwrap();
+
+    let start_cursor = Point { x: b_before.x() + 50, y: 18 };
+    assert!(try_start_single_axis_drag(
+      &win_b,
+      Some(&start_cursor),
+      &mut state,
+    )
+    .unwrap());
+
+    let mut drag = state.active_single_axis_drag.take().unwrap();
+    drag.has_crossed_threshold = true;
+    let moved_cursor = Point { x: start_cursor.x + 80, y: 22 };
+    step_single_axis_grid(
+      &win_b,
+      &workspace,
+      b_before.x() + 80,
+      &moved_cursor,
+      &mut drag,
+      &mut state,
+      &config,
+    )
+    .unwrap();
+    state.active_single_axis_drag = Some(drag);
+
+    finish_single_axis_drag(Some(&moved_cursor), &mut state, &config)
+      .unwrap();
+
+    let sum: f32 =
+      workspace.tiling_children().map(|c| c.tiling_size()).sum();
+    assert!((sum - 1.0).abs() < 0.001);
+    assert_eq!(win_a.to_rect().unwrap(), a_before);
+    let b_after = win_b.to_rect().unwrap();
+    assert!((b_after.width() - b_before.width()).abs() <= 1);
   }
 }
