@@ -194,6 +194,12 @@ impl WmState {
     self.windows().into_iter().find(|w| w.id() == window_id)
   }
 
+  /// Finds a workspace by its container `workspace_id`.
+  #[must_use]
+  pub fn workspace_by_id(&self, workspace_id: Uuid) -> Option<Workspace> {
+    self.workspaces().into_iter().find(|ws| ws.id() == workspace_id)
+  }
+
   /// Returns whether `window_id` has an active live tiling resize state.
   #[must_use]
   pub fn is_live_resize_window(&self, window_id: Uuid) -> bool {

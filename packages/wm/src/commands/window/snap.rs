@@ -4,6 +4,8 @@ use wm_common::{
   ActiveDrag, ActiveDragOperation, FullscreenStateConfig, TilingDirection,
   WindowState,
 };
+#[cfg(target_os = "windows")]
+use wm_platform::{NativeWindowWindowsExt, WS_MAXIMIZEBOX};
 use wm_platform::{Point, Rect};
 
 use super::{
@@ -457,8 +459,8 @@ fn commit_maximize_drop(
 
   if moved_across_ws {
     if let (Some(old_mon), Some(new_mon)) = (
-      old_workspace.as_ref().and_then(|ws| ws.monitor().ok()),
-      target_workspace.monitor().ok(),
+      old_workspace.as_ref().and_then(CommonGetters::monitor),
+      target_workspace.monitor(),
     ) {
       if old_mon.has_dpi_difference(&new_mon.clone().into())? {
         moved_window.set_has_pending_dpi_adjustment(true);
@@ -1488,7 +1490,6 @@ fn window_supports_native_maximize(
 ) -> bool {
   #[cfg(target_os = "windows")]
   if state.dispatcher.has_event_loop() && window.native().id().0 != 0 {
-    use wm_platform::{NativeWindowWindowsExt, WS_MAXIMIZEBOX};
     return window.native().has_window_style(WS_MAXIMIZEBOX);
   }
   let _ = (window, state);
@@ -1512,7 +1513,7 @@ mod tests {
   fn setup_state() -> (WmState, UserConfig, Workspace) {
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
     let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
-    let mut state = WmState::new(Dispatcher::mock(), event_tx, exit_tx);
+    let state = WmState::new(Dispatcher::mock(), event_tx, exit_tx);
     let config = UserConfig::mock();
 
     let workspace = Workspace::mock()

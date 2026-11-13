@@ -1,331 +1,122 @@
-diff --git a/packages/wm-platform/src/platform_impl/windows/mouse_listener.rs b/packages/wm-platform/src/platform_impl/windows/mouse_listener.rs
-index e00c127..4908154 100644
---- a/packages/wm-platform/src/platform_impl/windows/mouse_listener.rs
-+++ b/packages/wm-platform/src/platform_impl/windows/mouse_listener.rs
-@@ -279,21 +279,19 @@ impl MouseListener {
-     is_dragging: bool,
-     last_move_emission: Option<Instant>,
-   ) -> bool {
--    let is_enabled = match event_kind {
--      MouseEventKind::Move => {
--        enabled_events.contains(&MouseEventKind::Move)
--          || (is_dragging
--            && enabled_events.contains(&MouseEventKind::DragMove))
--      }
--      _ => enabled_events.contains(&event_kind),
-+    let is_enabled = if event_kind == MouseEventKind::Move {
-+      let move_ok = enabled_events.contains(&MouseEventKind::Move);
-+      let drag_ok = enabled_events.contains(&MouseEventKind::DragMove);
-+      move_ok || (is_dragging && drag_ok)
-+    } else {
-+      enabled_events.contains(&event_kind)
-     };
+diff --git a/packages/wm/src/commands/window/snap.rs b/packages/wm/src/commands/window/snap.rs
+index 9d33aa3..96dcc8b 100644
+--- a/packages/wm/src/commands/window/snap.rs
++++ b/packages/wm/src/commands/window/snap.rs
+@@ -4,6 +4,8 @@ use wm_common::{
+   ActiveDrag, ActiveDragOperation, FullscreenStateConfig, TilingDirection,
+   WindowState,
+ };
++#[cfg(target_os = "windows")]
++use wm_platform::{NativeWindowWindowsExt, WS_MAXIMIZEBOX};
+ use wm_platform::{Point, Rect};
  
-     if !is_enabled {
-       return false;
-     }
+ use super::{
+@@ -457,8 +459,8 @@ fn commit_maximize_drop(
  
--    // Throttle passive move events to 50ms and drag moves to 8ms (~120Hz)
--    // for smooth tracking. Button events always pass through.
-+    // Throttle passive moves (50ms) and drag moves (8ms), never buttons.
-     match event_kind {
-       MouseEventKind::Move => {
-         let interval = if is_dragging {
-@@ -301,8 +299,7 @@ impl MouseListener {
-         } else {
-           Duration::from_millis(50)
-         };
--        last_move_emission
--          .is_none_or(|timestamp| timestamp.elapsed() >= interval)
-+        last_move_emission.is_none_or(|t| t.elapsed() >= interval)
+   if moved_across_ws {
+     if let (Some(old_mon), Some(new_mon)) = (
+-      old_workspace.as_ref().and_then(|ws| ws.monitor().ok()),
+-      target_workspace.monitor().ok(),
++      old_workspace.as_ref().and_then(CommonGetters::monitor),
++      target_workspace.monitor(),
+     ) {
+       if old_mon.has_dpi_difference(&new_mon.clone().into())? {
+         moved_window.set_has_pending_dpi_adjustment(true);
+@@ -1488,7 +1490,6 @@ fn window_supports_native_maximize(
+ ) -> bool {
+   #[cfg(target_os = "windows")]
+   if state.dispatcher.has_event_loop() && window.native().id().0 != 0 {
+-    use wm_platform::{NativeWindowWindowsExt, WS_MAXIMIZEBOX};
+     return window.native().has_window_style(WS_MAXIMIZEBOX);
+   }
+   let _ = (window, state);
+@@ -1512,7 +1513,7 @@ mod tests {
+   fn setup_state() -> (WmState, UserConfig, Workspace) {
+     let (event_tx, _event_rx) = mpsc::unbounded_channel();
+     let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+-    let mut state = WmState::new(Dispatcher::mock(), event_tx, exit_tx);
++    let state = WmState::new(Dispatcher::mock(), event_tx, exit_tx);
+     let config = UserConfig::mock();
+ 
+     let workspace = Workspace::mock()
+diff --git a/packages/wm/src/commands/window/void_slots.rs b/packages/wm/src/commands/window/void_slots.rs
+index 5bdbec2..03adde8 100644
+--- a/packages/wm/src/commands/window/void_slots.rs
++++ b/packages/wm/src/commands/window/void_slots.rs
+@@ -148,7 +148,10 @@ pub fn swap_tiling_containers(
+       order_a.retain(|id| *id != first.id());
+       if !second.is_void() {
+         match focus_a {
+-          Some(idx) => order_a.insert(idx.min(order_a.len()), second.id()),
++          Some(idx) => {
++            let clamped_idx = idx.min(order_a.len());
++            order_a.insert(clamped_idx, second.id());
++          }
+           None => order_a.push_back(second.id()),
+         }
        }
-       _ => true,
+@@ -158,7 +161,10 @@ pub fn swap_tiling_containers(
+       order_b.retain(|id| *id != second.id());
+       if !first.is_void() {
+         match focus_b {
+-          Some(idx) => order_b.insert(idx.min(order_b.len()), first.id()),
++          Some(idx) => {
++            let clamped_idx = idx.min(order_b.len());
++            order_b.insert(clamped_idx, first.id());
++          }
+           None => order_b.push_back(first.id()),
+         }
+       }
+@@ -219,7 +225,7 @@ pub fn detach_tiling_preferring_non_void_siblings(
      }
-diff --git a/packages/wm/src/commands/general/platform_sync.rs b/packages/wm/src/commands/general/platform_sync.rs
-index e68d04b..133dc7f 100644
---- a/packages/wm/src/commands/general/platform_sync.rs
-+++ b/packages/wm/src/commands/general/platform_sync.rs
-@@ -562,8 +562,8 @@ fn reposition_maximized_window(
+   }
  
-   let is_same_monitor = window.monitor().is_some_and(|monitor| {
-     monitor.to_rect().is_ok_and(|monitor_rect| {
--      monitor_rect
--        .contains_point(&window.native_properties().frame.center_point())
-+      let center = window.native_properties().frame.center_point();
-+      monitor_rect.contains_point(&center)
-     })
+-  if let Ok(split_parent) = parent.as_split().cloned() {
++  if let Some(split_parent) = parent.as_split().cloned() {
+     if !split_parent.has_children() {
+       let grandparent = split_parent.parent();
+       if let Some(gp) = &grandparent {
+@@ -320,7 +326,7 @@ pub fn normalize_workspace_voids(
+         changed = true;
+       }
+ 
+-      if let Ok(split) = dir_container.as_split().cloned() {
++      if let Some(split) = dir_container.as_split().cloned() {
+         if !split.has_children() {
+           if let Some(parent) = split.parent() {
+             parent
+@@ -348,7 +354,7 @@ pub fn normalize_workspace_voids(
+       let same_dir_split = tiling_children.iter().any(|child| {
+         child
+           .as_split()
+-          .is_ok_and(|split| split.tiling_direction() == parent_dir)
++          .is_some_and(|split| split.tiling_direction() == parent_dir)
+       });
+ 
+       if single_split || same_dir_split {
+@@ -418,7 +424,7 @@ pub fn auto_maximize_sole_window(
+   let was_sole_focused = sole_window.has_focus(None);
+   let fullscreen_state = WindowState::Fullscreen(FullscreenStateConfig {
+     maximized: true,
+-    ..config.value.window_behavior.state_defaults.fullscreen
++    ..config.value.window_behavior.state_defaults.fullscreen.clone()
    });
  
-diff --git a/packages/wm/src/commands/window/manage_window.rs b/packages/wm/src/commands/window/manage_window.rs
-index e1bbcc6..704ef1a 100644
---- a/packages/wm/src/commands/window/manage_window.rs
-+++ b/packages/wm/src/commands/window/manage_window.rs
-@@ -287,12 +287,12 @@ fn initial_floating_base_frame(
-       native_window.normal_frame_size()
-     {
-       let borders = &native_properties.shadow_borders;
--      let width = normal_width
--        - borders.left.to_px(0, None)
--        - borders.right.to_px(0, None);
--      let height = normal_height
--        - borders.top.to_px(0, None)
--        - borders.bottom.to_px(0, None);
-+      let border_width =
-+        borders.left.to_px(0, None) + borders.right.to_px(0, None);
-+      let border_height =
-+        borders.top.to_px(0, None) + borders.bottom.to_px(0, None);
-+      let width = normal_width - border_width;
-+      let height = normal_height - border_height;
- 
-       if width >= 250 && height >= 140 {
-         let rect = Rect::from_xy(
-diff --git a/packages/wm/src/commands/window/resize_window.rs b/packages/wm/src/commands/window/resize_window.rs
-index 3254205..9382ec8 100644
---- a/packages/wm/src/commands/window/resize_window.rs
-+++ b/packages/wm/src/commands/window/resize_window.rs
-@@ -29,11 +29,8 @@ pub fn resize_window(
-               clippy::cast_possible_wrap,
-               clippy::cast_possible_truncation
-             )]
--            Some(
--              parent_width
--                - horizontal_gap
--                  * container.tiling_siblings().count() as i32,
--            )
-+            let siblings = container.tiling_siblings().count() as i32;
-+            Some(parent_width - horizontal_gap * siblings)
-           }),
-         _ => window.parent().and_then(|parent| {
-           parent.to_rect().ok().map(|rect| rect.width())
-diff --git a/packages/wm/src/events/handle_mouse_move.rs b/packages/wm/src/events/handle_mouse_move.rs
-index c247a5c..34648a0 100644
---- a/packages/wm/src/events/handle_mouse_move.rs
-+++ b/packages/wm/src/events/handle_mouse_move.rs
-@@ -83,12 +83,7 @@ pub fn handle_mouse_move(
-   } = event
-   {
-     #[cfg(target_os = "windows")]
--    if handle_windows_drag_move(
--      position,
--      pressed_buttons,
--      state,
--      config,
--    )? {
-+    if handle_drag_move(position, pressed_buttons, state, config)? {
-       return Ok(());
-     }
- 
-@@ -216,10 +211,10 @@ fn handle_windows_left_down(
-     return Ok(());
-   }
- 
--  let max_frame = window
--    .native()
--    .frame()
--    .unwrap_or_else(|_| window.native_properties().frame);
-+  let max_frame = match window.native().frame() {
-+    Ok(frame) => frame,
-+    Err(_) => window.native_properties().frame,
-+  };
- 
-   state.pending_maximize_drag = Some(PendingMaximizeDrag {
-     window_id: window.id(),
-@@ -231,7 +226,7 @@ fn handle_windows_left_down(
- }
- 
- #[cfg(target_os = "windows")]
--fn handle_windows_drag_move(
-+fn handle_drag_move(
-   position: &Point,
-   pressed_buttons: &wm_platform::PressedButtons,
-   state: &mut WmState,
-@@ -247,21 +242,18 @@ fn handle_windows_drag_move(
-       return Ok(false);
-     }
- 
--    let Some(window) = state
--      .windows()
--      .into_iter()
--      .find(|w| w.id() == drag.window_id)
--    else {
-+    let Some(window) = state.window_by_id(drag.window_id) else {
-       state.active_manual_drag = None;
-       return Ok(false);
-     };
- 
--    if !window.native().is_valid() {
-+    let native = window.native();
-+    if !native.is_valid() {
-       state.active_manual_drag = None;
-       return Ok(false);
-     }
- 
--    let _ = window.native().move_without_resize(
-+    let _ = native.move_without_resize(
-       position.x - drag.cursor_offset_x,
-       position.y - drag.cursor_offset_y,
-     );
-@@ -288,11 +280,7 @@ fn handle_windows_drag_move(
- 
-   state.pending_maximize_drag = None;
- 
--  let Some(window) = state
--    .windows()
--    .into_iter()
--    .find(|w| w.id() == pending.window_id)
--  else {
-+  let Some(window) = state.window_by_id(pending.window_id) else {
-     return Ok(false);
-   };
- 
-@@ -330,12 +318,12 @@ fn restored_window_size(
-     window.native().normal_frame_size()
-   {
-     let borders = window.native_properties().shadow_borders;
--    let width = normal_width
--      - borders.left.to_px(0, None)
--      - borders.right.to_px(0, None);
--    let height = normal_height
--      - borders.top.to_px(0, None)
--      - borders.bottom.to_px(0, None);
-+    let border_width =
-+      borders.left.to_px(0, None) + borders.right.to_px(0, None);
-+    let border_height =
-+      borders.top.to_px(0, None) + borders.bottom.to_px(0, None);
-+    let width = normal_width - border_width;
-+    let height = normal_height - border_height;
-     if fits_restored(width, height) {
-       return (width, height);
-     }
-@@ -371,8 +359,8 @@ fn start_maximize_drag(
-     (pending.start_cursor.y - pending.max_frame.top).clamp(8, 36);
- 
-   #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
--  let frame_x =
--    position.x - (restored_width as f32 * rel_x).round() as i32;
-+  let offset_x = (restored_width as f32 * rel_x).round() as i32;
-+  let frame_x = position.x - offset_x;
-   let frame_y = position.y - grab_offset_y;
-   let restored_frame =
-     Rect::from_xy(frame_x, frame_y, restored_width, restored_height);
-@@ -425,11 +413,7 @@ fn finish_manual_drag(state: &mut WmState) -> anyhow::Result<()> {
-     return Ok(());
-   };
- 
--  let Some(window) = state
--    .windows()
--    .into_iter()
--    .find(|w| w.id() == drag.window_id)
--  else {
-+  let Some(window) = state.window_by_id(drag.window_id) else {
-     return Ok(());
-   };
- 
-diff --git a/packages/wm/src/events/handle_window_minimized.rs b/packages/wm/src/events/handle_window_minimized.rs
-index 70f9de3..c985699 100644
---- a/packages/wm/src/events/handle_window_minimized.rs
-+++ b/packages/wm/src/events/handle_window_minimized.rs
-@@ -6,7 +6,7 @@ use crate::{
-   commands::{
-     container::set_focused_descendant, window::update_window_state,
-   },
--  traits::WindowGetters,
-+  traits::{CommonGetters, WindowGetters},
-   user_config::UserConfig,
-   wm_state::WmState,
- };
-diff --git a/packages/wm/src/events/handle_window_moved_or_resized.rs b/packages/wm/src/events/handle_window_moved_or_resized.rs
-index 1fdf51b..c757341 100644
---- a/packages/wm/src/events/handle_window_moved_or_resized.rs
-+++ b/packages/wm/src/events/handle_window_moved_or_resized.rs
-@@ -640,11 +640,10 @@ pub fn update_live_resize(
-       neighbor.set_tiling_size(new_neighbor_size);
- 
-       let dragged_id = tiling_window.id();
--      state.pending_sync.queue_containers_to_redraw(
--        parent
--          .descendants()
--          .filter(|c| c.is_tiling_window() && c.id() != dragged_id),
--      );
-+      let siblings = parent
-+        .descendants()
-+        .filter(|c| c.is_tiling_window() && c.id() != dragged_id);
-+      state.pending_sync.queue_containers_to_redraw(siblings);
-     }
-   }
- 
-diff --git a/packages/wm/src/events/handle_window_moved_or_resized_end.rs b/packages/wm/src/events/handle_window_moved_or_resized_end.rs
-index 546e5bc..3dbbb4a 100644
---- a/packages/wm/src/events/handle_window_moved_or_resized_end.rs
-+++ b/packages/wm/src/events/handle_window_moved_or_resized_end.rs
-@@ -133,12 +133,10 @@ fn finish_tiling_window_drag(
-   );
- 
-   let frame = window.native_properties().frame;
--  let is_live_resize = active_drag.operation
--    == Some(ActiveDragOperation::Resize)
--    && state
--      .live_resize_state
--      .as_ref()
--      .is_some_and(|resize| resize.window_id == window.id());
-+  let is_resize =
-+    active_drag.operation == Some(ActiveDragOperation::Resize);
-+  let is_live_resize =
-+    is_resize && state.is_live_resize_window(window.id());
- 
-   if is_live_resize {
-     let container: WindowContainer = window.clone().into();
-@@ -152,8 +150,7 @@ fn finish_tiling_window_drag(
-   } else {
-     state.clear_window_drag_state(window.id());
- 
--    // Update the window's size based on the new frame position. This means
--    // we use the actual window dimensions as the source of truth.
-+    // Update the window's size from its actual frame dimensions.
-     set_window_size(
-       window.clone().into(),
-       Some(LengthValue::from_px(frame.width())),
-@@ -164,13 +161,10 @@ fn finish_tiling_window_drag(
- 
-   window.set_active_drag(None);
- 
--  // Force a redraw of the window to snap it back to its original position.
--  // This is necessary when:
--  // - The window is the only tiling window in the workspace.
--  // - The window is not past the movement threshold for transitioning to
--  //   floating while being dragged.
--  // - Resizing in a direction that doesn't change the window's tiling
--  //   size.
-+  // Redraw the window so it snaps back when:
-+  // - It is the only tiling window in the workspace.
-+  // - The drag stayed below the floating movement threshold.
-+  // - Resizing did not change the container's tiling size.
-   state.pending_sync.queue_container_to_redraw(window.clone());
- 
-   Ok(())
+   let maximized = update_window_state(
 diff --git a/packages/wm/src/wm_state.rs b/packages/wm/src/wm_state.rs
-index bf20daf..78f81e7 100644
+index 86b83e4..96ae614 100644
 --- a/packages/wm/src/wm_state.rs
 +++ b/packages/wm/src/wm_state.rs
-@@ -174,6 +174,21 @@ impl WmState {
-     }
+@@ -194,6 +194,12 @@ impl WmState {
+     self.windows().into_iter().find(|w| w.id() == window_id)
    }
  
-+  /// Finds a managed window by its container `window_id`.
++  /// Finds a workspace by its container `workspace_id`.
 +  #[must_use]
-+  pub fn window_by_id(&self, window_id: Uuid) -> Option<WindowContainer> {
-+    self.windows().into_iter().find(|w| w.id() == window_id)
++  pub fn workspace_by_id(&self, workspace_id: Uuid) -> Option<Workspace> {
++    self.workspaces().into_iter().find(|ws| ws.id() == workspace_id)
 +  }
 +
-+  /// Returns whether `window_id` has an active live tiling resize state.
-+  #[must_use]
-+  pub fn is_live_resize_window(&self, window_id: Uuid) -> bool {
-+    let Some(resize) = &self.live_resize_state else {
-+      return false;
-+    };
-+    resize.window_id == window_id
-+  }
-+
-   /// Populates the initial WM state by creating containers for all
-   /// existing windows and monitors.
-   pub fn populate(
+   /// Returns whether `window_id` has an active live tiling resize state.
+   #[must_use]
+   pub fn is_live_resize_window(&self, window_id: Uuid) -> bool {

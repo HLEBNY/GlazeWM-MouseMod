@@ -148,7 +148,10 @@ pub fn swap_tiling_containers(
       order_a.retain(|id| *id != first.id());
       if !second.is_void() {
         match focus_a {
-          Some(idx) => order_a.insert(idx.min(order_a.len()), second.id()),
+          Some(idx) => {
+            let clamped_idx = idx.min(order_a.len());
+            order_a.insert(clamped_idx, second.id());
+          }
           None => order_a.push_back(second.id()),
         }
       }
@@ -158,7 +161,10 @@ pub fn swap_tiling_containers(
       order_b.retain(|id| *id != second.id());
       if !first.is_void() {
         match focus_b {
-          Some(idx) => order_b.insert(idx.min(order_b.len()), first.id()),
+          Some(idx) => {
+            let clamped_idx = idx.min(order_b.len());
+            order_b.insert(clamped_idx, first.id());
+          }
           None => order_b.push_back(first.id()),
         }
       }
@@ -219,7 +225,7 @@ pub fn detach_tiling_preferring_non_void_siblings(
     }
   }
 
-  if let Ok(split_parent) = parent.as_split().cloned() {
+  if let Some(split_parent) = parent.as_split().cloned() {
     if !split_parent.has_children() {
       let grandparent = split_parent.parent();
       if let Some(gp) = &grandparent {
@@ -320,7 +326,7 @@ pub fn normalize_workspace_voids(
         changed = true;
       }
 
-      if let Ok(split) = dir_container.as_split().cloned() {
+      if let Some(split) = dir_container.as_split().cloned() {
         if !split.has_children() {
           if let Some(parent) = split.parent() {
             parent
@@ -348,7 +354,7 @@ pub fn normalize_workspace_voids(
       let same_dir_split = tiling_children.iter().any(|child| {
         child
           .as_split()
-          .is_ok_and(|split| split.tiling_direction() == parent_dir)
+          .is_some_and(|split| split.tiling_direction() == parent_dir)
       });
 
       if single_split || same_dir_split {
@@ -418,7 +424,7 @@ pub fn auto_maximize_sole_window(
   let was_sole_focused = sole_window.has_focus(None);
   let fullscreen_state = WindowState::Fullscreen(FullscreenStateConfig {
     maximized: true,
-    ..config.value.window_behavior.state_defaults.fullscreen
+    ..config.value.window_behavior.state_defaults.fullscreen.clone()
   });
 
   let maximized = update_window_state(
