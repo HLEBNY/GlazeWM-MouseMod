@@ -618,7 +618,9 @@ pub fn absorb_void_into_sibling(
       .parent()
       .is_some_and(|p| p.id() == parent.id())
   {
-    anyhow::bail!("Void slot and beneficiary must share the given parent.");
+    anyhow::bail!(
+      "Void slot and beneficiary must share the given parent."
+    );
   }
 
   let children: Vec<TilingContainer> = parent.tiling_children().collect();

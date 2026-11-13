@@ -1,0 +1,303 @@
+diff --git a/packages/wm/src/commands/window/snap.rs b/packages/wm/src/commands/window/snap.rs
+index a78d7b9..ac835d6 100644
+--- a/packages/wm/src/commands/window/snap.rs
++++ b/packages/wm/src/commands/window/snap.rs
+@@ -1326,7 +1326,7 @@ fn insert_along_workspace_direction(
+   tiling_window: &TilingWindow,
+   workspace: &Workspace,
+   existing_children: &[TilingContainer],
+-  edge_dir: TilingDirection,
++  edge_dir: &TilingDirection,
+   is_first: bool,
+ ) -> anyhow::Result<()> {
+   let ws_container: Container = workspace.clone().into();
+@@ -1349,7 +1349,7 @@ fn insert_along_workspace_direction(
+ 
+   let ws_rect = workspace.multi_window_workspace_rect()?;
+   let (h_gap, v_gap) = workspace.workspace_inner_gaps()?;
+-  let gap = gap_for_dir(&edge_dir, h_gap, v_gap);
++  let gap = gap_for_dir(edge_dir, h_gap, v_gap);
+   let axis_px = match edge_dir {
+     TilingDirection::Horizontal => ws_rect.width(),
+     TilingDirection::Vertical => ws_rect.height(),
+@@ -1419,7 +1419,7 @@ fn insert_into_populated_workspace(
+           tiling_window,
+           workspace,
+           existing_children,
+-          edge_dir,
++          &edge_dir,
+           is_first,
+         )?;
+       } else {
+@@ -1499,8 +1499,8 @@ impl SimNode {
+   fn from_tiling(container: &TilingContainer) -> Self {
+     let kind = match container {
+       TilingContainer::TilingWindow(_) => SimKind::Window,
+-      TilingContainer::VoidSlot(_) => SimKind::Void,
+-      TilingContainer::SplitContainer(split) => SimKind::Split {
++      TilingContainer::Void(_) => SimKind::Void,
++      TilingContainer::Split(split) => SimKind::Split {
+         direction: split.tiling_direction(),
+         children: split
+           .tiling_children()
+@@ -1559,14 +1559,14 @@ impl SimWorkspace {
+     &self,
+     nodes: &[SimNode],
+     parent_rect: &Rect,
+-    dir: TilingDirection,
++    dir: &TilingDirection,
+     out: &mut Vec<(Uuid, Rect, bool, bool)>,
+   ) {
+     let Ok(sibling_gaps) = i32::try_from(nodes.len().saturating_sub(1))
+     else {
+       return;
+     };
+-    let gap = gap_for_dir(&dir, self.h_gap, self.v_gap);
++    let gap = gap_for_dir(dir, self.h_gap, self.v_gap);
+ 
+     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+     match dir {
+@@ -1580,7 +1580,7 @@ impl SimWorkspace {
+           match &node.kind {
+             SimKind::Split { direction, children } => {
+               out.push((node.id, rect.clone(), false, false));
+-              self.collect_rects(children, &rect, *direction, out);
++              self.collect_rects(children, &rect, direction, out);
+             }
+             SimKind::Window => out.push((node.id, rect, true, false)),
+             SimKind::Void => out.push((node.id, rect, false, true)),
+@@ -1598,7 +1598,7 @@ impl SimWorkspace {
+           match &node.kind {
+             SimKind::Split { direction, children } => {
+               out.push((node.id, rect.clone(), false, false));
+-              self.collect_rects(children, &rect, *direction, out);
++              self.collect_rects(children, &rect, direction, out);
+             }
+             SimKind::Window => out.push((node.id, rect, true, false)),
+             SimKind::Void => out.push((node.id, rect, false, true)),
+@@ -1614,7 +1614,7 @@ impl SimWorkspace {
+     self.collect_rects(
+       &self.children,
+       &self.ws_rect,
+-      self.direction,
++      &self.direction,
+       &mut out,
+     );
+     out
+@@ -1805,7 +1805,7 @@ impl SimWorkspace {
+   }
+ 
+   fn vacate_origin(&mut self, origin_id: Uuid) -> Option<Uuid> {
+-    match sim_inspect_origin(&self.children, self.direction, origin_id)? {
++    match sim_inspect_origin(&self.children, &self.direction, origin_id)? {
+       SimOriginKind::Void => Some(origin_id),
+       SimOriginKind::WinWithVertNeighbor => {
+         Self::detach_preferring_non_void_in(&mut self.children, origin_id);
+@@ -1824,7 +1824,7 @@ impl SimWorkspace {
+ 
+   fn absorb_void_pair_in(
+     nodes: &mut Vec<SimNode>,
+-    dir: TilingDirection,
++    dir: &TilingDirection,
+     parent_rect: &Rect,
+     sliver_id: Uuid,
+     h_gap: i32,
+@@ -1841,7 +1841,7 @@ impl SimWorkspace {
+       );
+     }
+ 
+-    let gap = gap_for_dir(&dir, h_gap, v_gap);
++    let gap = gap_for_dir(dir, h_gap, v_gap);
+     let Ok(sib_gaps) = i32::try_from(nodes.len().saturating_sub(1)) else {
+       return false;
+     };
+@@ -1891,7 +1891,7 @@ impl SimWorkspace {
+       if let SimKind::Split { direction, children } = &mut node.kind {
+         if Self::absorb_void_pair_in(
+           children,
+-          *direction,
++          direction,
+           &child_rect,
+           sliver_id,
+           h_gap,
+@@ -1920,7 +1920,7 @@ impl SimWorkspace {
+       };
+       if !Self::absorb_void_pair_in(
+         &mut self.children,
+-        self.direction,
++        &self.direction,
+         &self.ws_rect,
+         sliver_id,
+         self.h_gap,
+@@ -1963,7 +1963,7 @@ impl SimWorkspace {
+     &mut self,
+     new_win_id: Uuid,
+     slot_id: Uuid,
+-    kind: VoidMatchKind,
++    kind: &VoidMatchKind,
+   ) {
+     sim_apply_void_match(&mut self.children, new_win_id, slot_id, kind);
+   }
+@@ -2005,7 +2005,7 @@ impl SimWorkspace {
+         id: Uuid::new_v4(),
+         size: 0.5,
+         kind: SimKind::Split {
+-          direction: self.direction,
++          direction: self.direction.clone(),
+           children: old_children,
+         },
+       };
+@@ -2093,7 +2093,7 @@ impl SimWorkspace {
+       &mut self.children,
+       leaf_id,
+       new_win_id,
+-      split_dir,
++      &split_dir,
+       insert_first,
+     );
+   }
+@@ -2134,7 +2134,7 @@ fn sim_count_windows(nodes: &[SimNode]) -> usize {
+ 
+ fn sim_inspect_origin(
+   nodes: &[SimNode],
+-  dir: TilingDirection,
++  dir: &TilingDirection,
+   origin_id: Uuid,
+ ) -> Option<SimOriginKind> {
+   for node in nodes {
+@@ -2142,7 +2142,7 @@ fn sim_inspect_origin(
+       if node.is_void() {
+         return Some(SimOriginKind::Void);
+       }
+-      let has_vert = dir == TilingDirection::Vertical
++      let has_vert = *dir == TilingDirection::Vertical
+         && nodes.iter().any(|c| c.id != origin_id && !c.is_void());
+       return Some(if has_vert {
+         SimOriginKind::WinWithVertNeighbor
+@@ -2152,7 +2152,7 @@ fn sim_inspect_origin(
+     }
+     if let SimKind::Split { direction, children } = &node.kind {
+       if let Some(found) =
+-        sim_inspect_origin(children, *direction, origin_id)
++        sim_inspect_origin(children, direction, origin_id)
+       {
+         return Some(found);
+       }
+@@ -2178,7 +2178,7 @@ fn sim_turn_to_void(nodes: &mut [SimNode], origin_id: Uuid) -> bool {
+ 
+ fn sim_absorb_void_at(
+   nodes: &mut Vec<SimNode>,
+-  dir: TilingDirection,
++  dir: &TilingDirection,
+   parent_rect: &Rect,
+   pos: usize,
+   h_gap: i32,
+@@ -2198,7 +2198,7 @@ fn sim_absorb_void_at(
+     return false;
+   };
+ 
+-  let gap = gap_for_dir(&dir, h_gap, v_gap);
++  let gap = gap_for_dir(dir, h_gap, v_gap);
+   let axis_px = match dir {
+     TilingDirection::Horizontal => parent_rect.width(),
+     TilingDirection::Vertical => parent_rect.height(),
+@@ -2229,7 +2229,7 @@ fn sim_apply_void_match(
+   nodes: &mut [SimNode],
+   new_win_id: Uuid,
+   slot_id: Uuid,
+-  kind: VoidMatchKind,
++  kind: &VoidMatchKind,
+ ) -> bool {
+   for node in nodes.iter_mut() {
+     if node.id == slot_id {
+@@ -2249,14 +2249,14 @@ fn sim_apply_void_match(
+             size: 0.5,
+             kind: SimKind::Window,
+           };
+-          let pair = if insert_first {
++          let pair = if *insert_first {
+             vec![win_half, void_half]
+           } else {
+             vec![void_half, win_half]
+           };
+           node.id = Uuid::new_v4();
+           node.kind = SimKind::Split {
+-            direction: split_dir,
++            direction: split_dir.clone(),
+             children: pair,
+           };
+         }
+@@ -2295,7 +2295,7 @@ fn sim_wrap_leaf(
+   nodes: &mut [SimNode],
+   leaf_id: Uuid,
+   new_win_id: Uuid,
+-  split_dir: TilingDirection,
++  split_dir: &TilingDirection,
+   insert_first: bool,
+ ) -> bool {
+   for node in nodes.iter_mut() {
+@@ -2313,7 +2313,7 @@ fn sim_wrap_leaf(
+       };
+       node.id = Uuid::new_v4();
+       node.kind = SimKind::Split {
+-        direction: split_dir,
++        direction: split_dir.clone(),
+         children: if insert_first {
+           vec![win_node, leaf_node]
+         } else {
+@@ -2385,7 +2385,8 @@ fn compute_snap_zone_preview_rect(
+   let mut sim =
+     SimWorkspace::from_workspace(workspace, ws_rect.clone(), h_gap, v_gap);
+ 
+-  let origin_void_id = exclude_slot_id.and_then(|id| sim.vacate_origin(id));
++  let origin_void_id =
++    exclude_slot_id.and_then(|id| sim.vacate_origin(id));
+ 
+   if !sim.has_real_windows() {
+     return Ok(empty_workspace_snap_rect(&ws_rect, zone, h_gap, v_gap));
+@@ -2395,7 +2396,7 @@ fn compute_snap_zone_preview_rect(
+   if let Some((slot_id, kind)) =
+     sim.find_matching_void(zone, origin_void_id, cursor)
+   {
+-    sim.apply_void_match(new_win_id, slot_id, kind);
++    sim.apply_void_match(new_win_id, slot_id, &kind);
+     if let Some(oid) = origin_void_id {
+       sim.cleanup_origin_void_after_match(oid);
+     }
+@@ -2423,7 +2424,7 @@ fn compute_snap_zone_preview_rect(
+   Ok(sim.rect_of(new_win_id).unwrap_or(fallback))
+ }
+ 
+-#[derive(Copy, Clone)]
++#[derive(Clone)]
+ enum VoidMatchKind {
+   Exact,
+   SplitHalf {
+diff --git a/packages/wm/src/commands/window/void_slots.rs b/packages/wm/src/commands/window/void_slots.rs
+index 3eee10f..cdc43d9 100644
+--- a/packages/wm/src/commands/window/void_slots.rs
++++ b/packages/wm/src/commands/window/void_slots.rs
+@@ -618,7 +618,9 @@ pub fn absorb_void_into_sibling(
+       .parent()
+       .is_some_and(|p| p.id() == parent.id())
+   {
+-    anyhow::bail!("Void slot and beneficiary must share the given parent.");
++    anyhow::bail!(
++      "Void slot and beneficiary must share the given parent."
++    );
+   }
+ 
+   let children: Vec<TilingContainer> = parent.tiling_children().collect();
+diff --git a/packages/wm/src/events/handle_window_moved_or_resized.rs b/packages/wm/src/events/handle_window_moved_or_resized.rs
+index be9fbec..f36f71b 100644
+--- a/packages/wm/src/events/handle_window_moved_or_resized.rs
++++ b/packages/wm/src/events/handle_window_moved_or_resized.rs
+@@ -1628,7 +1628,7 @@ mod tests {
+   }
+ 
+   #[test]
+-  fn nested_vert_splitoid_resize_and_sliver_cleanup_remain_valid() {
++  fn nested_split_void_resize_and_sliver_cleanup_remain_valid() {
+     use tokio::sync::mpsc;
+     use wm_common::{TilingDirection, WindowState};
+     use wm_platform::Dispatcher;

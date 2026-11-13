@@ -1628,7 +1628,7 @@ mod tests {
   }
 
   #[test]
-  fn nested_vert_splitoid_resize_and_sliver_cleanup_remain_valid() {
+  fn nested_split_void_resize_and_sliver_cleanup_remain_valid() {
     use tokio::sync::mpsc;
     use wm_common::{TilingDirection, WindowState};
     use wm_platform::Dispatcher;
