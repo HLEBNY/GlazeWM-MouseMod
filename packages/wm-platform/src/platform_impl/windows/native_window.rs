@@ -403,13 +403,19 @@ impl NativeWindow {
     &self,
     z_order: &WindowZOrder,
     rect: &Rect,
-    flags: SET_WINDOW_POS_FLAGS,
+    mut flags: SET_WINDOW_POS_FLAGS,
   ) -> crate::Result<()> {
     let z_order_hwnd = match z_order {
       WindowZOrder::TopMost => HWND_TOPMOST,
       WindowZOrder::Top => HWND_TOP,
       WindowZOrder::Normal => HWND_NOTOPMOST,
       WindowZOrder::AfterWindow(window_id) => HWND(window_id.0),
+      // `SWP_NOZORDER` ignores the insert-after handle entirely and
+      // keeps the window exactly where it currently is.
+      WindowZOrder::Keep => {
+        flags |= SWP_NOZORDER;
+        HWND_TOP
+      }
     };
 
     unsafe {
@@ -930,6 +936,8 @@ impl NativeWindow {
       WindowZOrder::Top => HWND_TOP,
       WindowZOrder::Normal => HWND_NOTOPMOST,
       WindowZOrder::AfterWindow(window_id) => HWND(window_id.0),
+      // Nothing to sync: the window keeps its current z-order.
+      WindowZOrder::Keep => return Ok(()),
     };
 
     let flags = SWP_NOACTIVATE

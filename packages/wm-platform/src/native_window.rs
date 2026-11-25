@@ -52,6 +52,8 @@ pub enum WindowZOrder {
   AfterWindow(WindowId),
   Top,
   TopMost,
+  /// Leaves the window's current position in the z-order untouched.
+  Keep,
 }
 
 /// macOS-specific extension trait for [`NativeWindow`].

@@ -220,6 +220,20 @@ fn redraw_containers(
       .map(|(_, hide_corner)| hide_corner)
       .context("Monitor not found in hide corner map.")?;
 
+    // Emit `HWND_NOTOPMOST` (which also raises the window above the
+    // other non-topmost windows) only when the window is actually
+    // leaving the always-on-top state. A plain redraw must leave the
+    // z-order alone: otherwise redrawing a tiled window while an app
+    // shows its own fullscreen window (e.g. a picture viewer) pulls
+    // the tiled window in front of the viewer.
+    let was_shown_on_top = matches!(
+      window.prev_state(),
+      Some(WindowState::Floating(prev)) if prev.shown_on_top
+    ) || matches!(
+      window.prev_state(),
+      Some(WindowState::Fullscreen(prev)) if prev.shown_on_top
+    );
+
     // Whether the window should be shown above all other windows.
     let z_order = match window.state() {
       WindowState::Floating(config) if config.shown_on_top => {
@@ -228,36 +242,23 @@ fn redraw_containers(
       WindowState::Fullscreen(config) if config.shown_on_top => {
         WindowZOrder::TopMost
       }
-      WindowState::Fullscreen(config) if !config.shown_on_top => {
-        let focused_descendant = workspace
-          .descendant_focus_order()
-          .next()
-          .and_then(|container| container.as_window_container().ok());
-
-        match focused_descendant {
-          Some(focused) if focused.id() != window.id() => {
-            WindowZOrder::AfterWindow(focused.native().id())
-          }
-          _ => WindowZOrder::Normal,
-        }
-      }
+      _ if was_shown_on_top => WindowZOrder::Normal,
       _ if should_bring_to_front => {
         let focused_descendant = workspace
           .descendant_focus_order()
           .next()
           .and_then(|container| container.as_window_container().ok());
 
-        if let Some(focused_descendant) = focused_descendant {
-          if window.id() == focused_descendant.id() {
-            WindowZOrder::Normal
-          } else {
+        match focused_descendant {
+          Some(focused_descendant)
+            if window.id() != focused_descendant.id() =>
+          {
             WindowZOrder::AfterWindow(focused_descendant.native().id())
           }
-        } else {
-          WindowZOrder::Normal
+          _ => WindowZOrder::Normal,
         }
       }
-      _ => WindowZOrder::Normal,
+      _ => WindowZOrder::Keep,
     };
 
     // Set the z-order of the window.
@@ -615,7 +616,13 @@ fn reposition_maximized_window(
   );
 
   let sync_z_order = || -> anyhow::Result<()> {
-    if !matches!(z_order, WindowZOrder::Normal) || was_shown_on_top {
+    let is_z_order_sync = matches!(
+      z_order,
+      WindowZOrder::Top | WindowZOrder::TopMost
+        | WindowZOrder::AfterWindow(_)
+    );
+
+    if is_z_order_sync || was_shown_on_top {
       window.native().set_z_order(z_order)?;
     }
     Ok(())
