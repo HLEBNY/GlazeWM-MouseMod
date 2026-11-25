@@ -790,8 +790,9 @@ impl WmState {
       .filter(|descendant| descendant.id() != removed_window.id())
       .collect::<Vec<_>>();
 
-    // Get focus target that matches the removed window type. This applies
-    // for windows that aren't in a minimized state.
+    // Preserve same-type focus for tiling and fullscreen windows. For
+    // floating windows, prefer the most recently focused window instead:
+    // a floating dialog or viewer may have opened over a maximized app.
     let focus_target_of_type = descendant_focus_order
       .iter()
       .filter_map(|descendant| descendant.as_window_container().ok())
@@ -799,7 +800,6 @@ impl WmState {
         matches!(
           (descendant.state(), removed_window.state()),
           (WindowState::Tiling, WindowState::Tiling)
-            | (WindowState::Floating(_), WindowState::Floating(_))
             | (WindowState::Fullscreen(_), WindowState::Fullscreen(_))
         )
       })
