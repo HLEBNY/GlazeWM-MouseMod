@@ -113,8 +113,9 @@ fn sync_focus(
 /// Finds windows that should be brought to the top of their workspace's
 /// z-order.
 ///
-/// Windows are brought to front if they match the focused window's state
-/// (floating/tiling) and any of these conditions are met:
+/// Tiling windows are brought forward as a group. Floating windows are
+/// brought forward individually so focusing one does not expose the rest.
+/// Reordering happens when any of these conditions are met:
 ///  * Focus has changed to a different window.
 ///  * Focused window's state has changed (e.g. tiling -> floating).
 ///  * Focused window has moved to a different workspace.
@@ -138,8 +139,8 @@ fn windows_to_bring_to_front(
     )
     .unique_by(|workspace| workspace.id());
 
-  // Bring forward windows that match the focused state. Only do this for
-  // tiling/floating windows.
+  // Keep tiling windows grouped, but raise only the focused floating
+  // window. Other floating windows may be behind a maximized window.
   let windows_to_bring_to_front = workspaces_to_reorder
     .flat_map(|workspace| {
       let focused_descendant = workspace
@@ -152,13 +153,11 @@ fn windows_to_bring_to_front(
           .descendants()
           .filter_map(|descendant| descendant.as_window_container().ok())
           .filter(|window| {
-            let is_floating_or_tiling = matches!(
-              window.state(),
-              WindowState::Floating(_) | WindowState::Tiling
-            );
-
-            is_floating_or_tiling
-              && window.state().is_same_state(&focused_descendant.state())
+            should_raise_window(
+              &window.state(),
+              &focused_descendant.state(),
+              window.id() == focused_descendant.id(),
+            )
           })
           .collect(),
         None => vec![],
@@ -167,6 +166,18 @@ fn windows_to_bring_to_front(
     .collect::<Vec<_>>();
 
   Ok(windows_to_bring_to_front)
+}
+
+fn should_raise_window(
+  window_state: &WindowState,
+  focused_state: &WindowState,
+  is_focused: bool,
+) -> bool {
+  match (window_state, focused_state) {
+    (WindowState::Tiling, WindowState::Tiling) => true,
+    (WindowState::Floating(_), WindowState::Floating(_)) => is_focused,
+    _ => false,
+  }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -717,4 +728,36 @@ fn apply_transparency_effect(
   };
 
   _ = window.native().set_transparency(transparency);
+}
+
+#[cfg(test)]
+mod z_order_tests {
+  use wm_common::WindowState;
+
+  use super::should_raise_window;
+
+  #[test]
+  fn only_focused_floating_window_is_raised() {
+    let floating = WindowState::Floating(Default::default());
+    assert!(should_raise_window(&floating, &floating, true));
+    assert!(!should_raise_window(&floating, &floating, false));
+  }
+
+  #[test]
+  fn tiling_windows_still_raise_as_a_group() {
+    assert!(should_raise_window(
+      &WindowState::Tiling,
+      &WindowState::Tiling,
+      false,
+    ));
+  }
+
+  #[test]
+  fn fullscreen_and_mixed_states_do_not_raise_a_group() {
+    let floating = WindowState::Floating(Default::default());
+    let fullscreen = WindowState::Fullscreen(Default::default());
+    assert!(!should_raise_window(&floating, &fullscreen, false));
+    assert!(!should_raise_window(&floating, &WindowState::Tiling, false));
+    assert!(!should_raise_window(&fullscreen, &floating, false));
+  }
 }
